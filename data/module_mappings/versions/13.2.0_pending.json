@@ -1,0 +1,94 @@
+{
+  "Edit": {
+    "suggested": "Editor",
+    "confirmed": false
+  },
+  "Timeline_Speed": {
+    "suggested": "Timeline",
+    "confirmed": false
+  },
+  "AI Audio Tool(AI Voice Changer)": {
+    "suggested": "AI Voice Changer",
+    "confirmed": false
+  },
+  "Timeline(Video Enhancer)": {
+    "suggested": "Video Enhancer",
+    "confirmed": false
+  },
+  "Timeline_Audio Tools": {
+    "suggested": "Audio Tool",
+    "confirmed": false
+  },
+  "AI Audio Tools": {
+    "suggested": "Audio Tool",
+    "confirmed": false
+  },
+  "Timeline(audio)": {
+    "suggested": "Timeline",
+    "confirmed": false
+  },
+  "Music/Sound FX": {
+    "suggested": "Sound FX",
+    "confirmed": false
+  },
+  "Timeline(Crop)": {
+    "suggested": "Timeline",
+    "confirmed": false
+  },
+  "Shortcut(Text to Image)": {
+    "suggested": "Text to Image",
+    "confirmed": false
+  },
+  "Timeline_audio": {
+    "suggested": "Timeline",
+    "confirmed": false
+  },
+  "Music(AI Audio Tool)": {
+    "suggested": "Audio Tool",
+    "confirmed": false
+  },
+  "AI Voice Changer(Speech Enhance)": {
+    "suggested": "AI Voice Changer",
+    "confirmed": false
+  },
+  "Shortcut(Voice Changer)": {
+    "suggested": "AI Voice Changer",
+    "confirmed": false
+  },
+  "Transition(Trending)": {
+    "suggested": "Transition",
+    "confirmed": false
+  },
+  "Timelin_export": {
+    "suggested": "Timeline",
+    "confirmed": false
+  },
+  "Adjustment": {
+    "suggested": "Adjust",
+    "confirmed": false
+  },
+  "Mosaic": {
+    "suggested": "Music",
+    "confirmed": false
+  },
+  "AI Audio Tool (AI Denoise)": {
+    "suggested": "HQ Audio Denoise",
+    "confirmed": false
+  },
+  "Auto Tools": {
+    "suggested": "Audio Tool",
+    "confirmed": false
+  },
+  "Shortcut(Video Enhancer)": {
+    "suggested": "Video Enhancer",
+    "confirmed": false
+  },
+  "Timeline_Exprot": {
+    "suggested": "Timeline",
+    "confirmed": false
+  },
+  "Timeline_IAP": {
+    "suggested": "Timeline",
+    "confirmed": false
+  }
+}

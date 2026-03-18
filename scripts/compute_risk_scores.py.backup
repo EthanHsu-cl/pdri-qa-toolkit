@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""PDR-I Risk Register Generator v2.1
+Usage: python compute_risk_scores.py <parsed.csv> <risk_register.csv>"""
+import sys, pandas as pd, numpy as np
+from pathlib import Path
+
+def compute_risk(input_csv, output_csv):
+    df = pd.read_csv(input_csv)
+    print(f"Loaded {len(df)} bugs")
+    df = df[df["parsed_module"].notna()].copy()
+    tag_cols = [c for c in df.columns if c.startswith("tag_")]
+    agg = df.groupby("parsed_module").agg(
+        category=("module_category","first"), total_bugs=("parsed_module","size"),
+        severity_weighted_total=("severity_weight","sum"),
+        critical_count=("severity_num",lambda x:(x==1).sum()),
+        major_count=("severity_num",lambda x:(x==2).sum()),
+        normal_count=("severity_num",lambda x:(x==3).sum()),
+        minor_count=("severity_num",lambda x:(x==4).sum()),
+    ).reset_index().rename(columns={"parsed_module":"module"})
+    for tc in tag_cols:
+        if tc in df.columns:
+            t = df.groupby("parsed_module")[tc].sum().reset_index()
+            t.columns = ["module", tc.replace("tag_","")+"_count"]
+            agg = agg.merge(t, on="module", how="left")
+    se_col = [c for c in agg.columns if "side_effect" in c.lower()]
+    if se_col: agg["regression_rate"] = (agg[se_col[0]]/agg["total_bugs"]).round(4)
+    at_col = [c for c in agg.columns if "at_found" in c.lower()]
+    if at_col: agg["automation_catch_rate"] = (agg[at_col[0]]/agg["total_bugs"]).round(4)
+    for metric in ["repro_rate","days_to_close","builds_to_fix"]:
+        if metric in df.columns:
+            m = df.groupby("parsed_module")[metric].agg(["mean","median"]).reset_index()
+            m.columns = ["module",f"avg_{metric}",f"median_{metric}"]
+            agg = agg.merge(m, on="module", how="left")
+    if "Status" in df.columns:
+        for status in ["Open","Closed","Postpone"]:
+            s = df[df["Status"].str.contains(status,case=False,na=False)].groupby("parsed_module").size().reset_index()
+            s.columns = ["module",f"{status.lower()}_count"]
+            agg = agg.merge(s, on="module", how="left")
+    if "Creator" in df.columns:
+        r = df.groupby("parsed_module")["Creator"].nunique().reset_index()
+        r.columns = ["module","unique_reporters"]
+        agg = agg.merge(r, on="module", how="left")
+    agg = agg.fillna(0)
+    agg["probability_score_auto"] = pd.qcut(agg["total_bugs"].rank(method="first"),q=5,labels=[1,2,3,4,5]).astype(int)
+    agg["impact_score"] = 0; agg["detectability_score"] = 0
+    agg["risk_score_final"] = 0; agg["quadrant"] = ""
+    agg = agg.sort_values("severity_weighted_total", ascending=False)
+    agg.to_csv(output_csv, index=False, encoding="utf-8-sig")
+    print(f"RISK REGISTER: {len(agg)} modules")
+    for _,r in agg.head(10).iterrows():
+        print(f"  {r['module']:30s} wt={r['severity_weighted_total']:>6.0f} crit={r['critical_count']:>3.0f}")
+    print(f"Saved to: {output_csv}")
+
+def main():
+    if len(sys.argv)<3: print("Usage: python compute_risk_scores.py <parsed.csv> <output.csv>"); sys.exit(1)
+    compute_risk(sys.argv[1], sys.argv[2])
+if __name__=="__main__": main()

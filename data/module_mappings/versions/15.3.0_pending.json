@@ -1,0 +1,42 @@
+{
+  "Auto Edit(Camping)": {
+    "suggested": "Auto Caption",
+    "confirmed": false
+  },
+  "Photo(GIF)": {
+    "suggested": "Photo",
+    "confirmed": false
+  },
+  "Image to Video (Dance Group)": {
+    "suggested": "Image to Video",
+    "confirmed": false
+  },
+  "Image to Video(Squish)": {
+    "suggested": "Image to Video",
+    "confirmed": false
+  },
+  "Credit IAP": {
+    "suggested": "Credit",
+    "confirmed": false
+  },
+  "Image to Video(Single Person)": {
+    "suggested": "Image to Video",
+    "confirmed": false
+  },
+  "Image to Video(2 Solo Photos)": {
+    "suggested": "Image to Video",
+    "confirmed": false
+  },
+  "Text(In Animation)": {
+    "suggested": "Animation",
+    "confirmed": false
+  },
+  "Image to Video (Flee)": {
+    "suggested": "Image to Video",
+    "confirmed": false
+  },
+  "Image to Video (Nap)": {
+    "suggested": "Image to Video",
+    "confirmed": false
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "Mosaic": {
+    "suggested": "Music",
+    "confirmed": false
+  },
+  "Account": {
+    "suggested": "About",
+    "confirmed": false
+  }
+}

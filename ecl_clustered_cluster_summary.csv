@@ -1,0 +1,26 @@
+﻿cluster_id,cluster_label,count,modules,avg_sev
+12,button | icon | preview,3313,"AI Storytelling, Text to Video, Launch, Project (AI Storytelling), Voice-Over Style",2.0501056444310293
+19,video | demo video | demo,607,"Auto Captions, GAI, Freeze Frame, Timeline, AI Storytelling",1.9950576606260297
+3,page | button | tapping,556,"Artowrk-Text to video, Text to Video, Voice-Over Style, Sign in, AI Storytelling",2.0215827338129495
+4,text | button | text image,551,"Project, AI Storytelling, MGT, AI Art, Timeline",2.1052631578947367
+7,effect | music | transition,406,"Title (Cool Effect), Music, AI Music Generator (History), Transition, Face Reshape",2.061576354679803
+6,ai | video | art,406,"Character Motion Swap, AI Art, AI Storytelling, AI Storytelling (Music), AI Storytelling, Voice Cloning",2.0073891625615765
+16,localized | string | dialog localized,372,"AI Storytelling, AI Storytelling (Voice-Over), Credit, Voice Clone, IAP, Image to Video",2.0161290322580645
+0,tapping | ap | button,367,"Text to Video, AI Storytelling, Launcher (AI Smart Tools), AI Storytelling (recent task), Talking Avatar (Select Voice)",1.673024523160763
+5,display | does display | does,302,"AI Storytelling, Music (iStock), Replace background, AI Art, Timeline",2.1490066225165565
+23,template | text | result thumbnail,287,"Auto Captions, Image to Video, AI Storytelling, Intro Video, AI Art",1.9930313588850175
+9,panel | entering | tapping,272,"Timeline (Title), Talking Avatar, Sticker, My Voices, AI Storytelling",2.1323529411764706
+1,bft autotest | pdr ios | bft,269,,2.0
+24,ui guideline | ui | guideline,267,"Text to Speech, Sticker(Search), Sticker, AI Storytelling, Character Motion Swap(Trim)",2.0898876404494384
+2,incorrect | order | text,265,"AI Storytelling, Menu (Preferences), Launcher (Trending), AI Storytelling (recent task), My Voices",2.079245283018868
+22,menu | tool | track,242,"Timeline, AI Storytelling (Wayfair_SpringStree_Full), Text to Video(Recent Task), Motion, Transition",2.0165289256198347
+8,new | new tag | tag,232,"Timeline (Sticker), Timeline, Title (Animation), Launcher(Shortcut), AI Storytelling",2.038793103448276
+13,pro | free | free trial,192,"Mixpanel, AI Storytelling, My Voices, My Voice, Pro, Motion, Animation",2.0625
+10,unsync spec | spec | unsync,187,"Auto Edit(Family_03_video), Mixpanel, Credit System, Launcher, AI Art",2.0
+17,truncated | background truncated | background,184,"AI Storytelling, Text to Speech, Character Motion Swap, Title (Animation), Image to Video",2.125
+14,sync | doesn sync | sync guideline,170,"Sticker(Search), Send Feedback, Opening Intro, Shortcut, Project",2.0941176470588236
+11,match | match guideline | does match,148,"AI Storytelling, Music Library (iStock), AI Storytelling (Music), Music Library, My Voices",2.2364864864864864
+18,unable | unable complete | complete,138,"Motion Swap, Cloud Storage, Music [iPad], Audio Mixing, Image to Video",2.0217391304347827
+15,parameter | set | monetize_subscription_success,125,"Maxpanel, AI Storytelling, voiceover_audio, Effects (Effect Layer)[Flip Open/Flash Open/Circle Open], Mixpanel, Mixpanel(AI Magic - Character Motion Swap), Mixpanel(Character Motion Swap)",2.0
+20,different previous | previous | different,75,"AI Art, Image to Video, Timeline, Fx layer, Overlay, Text, Fx Layer, Music(Mate), Sound FX, MGT",2.0533333333333332
+21,red | red dot | dot,58,"AI Storytelling, Motion Swap, Settings > Notice, Transition, Timeline, More",2.1206896551724137

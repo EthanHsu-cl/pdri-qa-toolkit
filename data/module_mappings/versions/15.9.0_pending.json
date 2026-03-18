@@ -1,0 +1,46 @@
+{
+  "HQ Denoise / Speech Enhancer": {
+    "suggested": "Speech Enhancer",
+    "confirmed": false
+  },
+  "Transition (Split)": {
+    "suggested": "Transition",
+    "confirmed": false
+  },
+  "AI Anime": {
+    "suggested": "AI Anime Video",
+    "confirmed": false
+  },
+  "Shortcut (AI Video Upscaler)": {
+    "suggested": "AI Video Upscaler",
+    "confirmed": false
+  },
+  "Text (Animation)": {
+    "suggested": "Animation",
+    "confirmed": false
+  },
+  "Transition (Glitch)": {
+    "suggested": "Transition",
+    "confirmed": false
+  },
+  "Shortcut - Auto Captions": {
+    "suggested": "Auto Captions",
+    "confirmed": false
+  },
+  "Intro/Outro(Music)": {
+    "suggested": "Intro/Outro",
+    "confirmed": false
+  },
+  "Tempo Effects": {
+    "suggested": "Video Effects",
+    "confirmed": false
+  },
+  "Image to Video (Category)": {
+    "suggested": "Image to Video",
+    "confirmed": false
+  },
+  "Image to Video (Media Picker)": {
+    "suggested": "Image to Video",
+    "confirmed": false
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "Intro/Outro(MGT)": {
+    "suggested": "Intro/Outro",
+    "confirmed": false
+  },
+  "Text(Backdrop)": {
+    "suggested": "Backdrop",
+    "confirmed": false
+  },
+  "Color Board(Color Selector)": {
+    "suggested": "Color Selector",
+    "confirmed": false
+  },
+  "Pan & Zoom(Custom)": {
+    "suggested": "Pan & Zoom",
+    "confirmed": false
+  },
+  "Background(Pattern)": {
+    "suggested": "Background",
+    "confirmed": false
+  }
+}

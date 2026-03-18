@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""Auto-generated test for: Auto Edit[Travel_01_video, Travel_01_Content]
+Category: Editor Core | Quadrant: Q1 - Test Last | Risk: 6 (I:3 x P:1 x D:2)
+TODO: Replace placeholder selectors."""
+import pytest
+import allure
+
+@allure.suite("Editor Core")
+@allure.sub_suite("Auto Edit[Travel_01_video, Travel_01_Content]")
+@allure.tag("Q1")
+@pytest.mark.q1
+class TestAutoEditTravel01VideoTravel01Content:
+    """Q1 - Test Last tests for Auto Edit[Travel_01_video, Travel_01_Content]."""
+
+    @allure.title("Auto Edit[Travel_01_video, Travel_01_Content] - Screen Launch")
+    @allure.severity(allure.severity_level.TRIVIAL)
+    def test_screen_launches(self, driver):
+        pass
+
+    @allure.title("Auto Edit[Travel_01_video, Travel_01_Content] - Basic Functionality")
+    @allure.severity(allure.severity_level.TRIVIAL)
+    def test_basic_functionality(self, driver):
+        pass
+
+    @allure.title("Auto Edit[Travel_01_video, Travel_01_Content] - Visual Regression")
+    @allure.severity(allure.severity_level.NORMAL)
+    @pytest.mark.visual
+    def test_visual_regression(self, driver, visual_check):
+        # TODO: Navigate then call visual_check("auto_edit_travel_01_video_travel_01_content")
+        pass

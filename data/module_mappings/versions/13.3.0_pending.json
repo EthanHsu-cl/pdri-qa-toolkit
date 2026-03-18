@@ -1,0 +1,34 @@
+{
+  "Shortcut(Video Enhancer)": {
+    "suggested": "Video Enhancer",
+    "confirmed": false
+  },
+  "Timeline(Cutout)": {
+    "suggested": "Timeline",
+    "confirmed": false
+  },
+  "Shortcut(Text to Image)": {
+    "suggested": "Text to Image",
+    "confirmed": false
+  },
+  "AI Audio Tools": {
+    "suggested": "Audio Tool",
+    "confirmed": false
+  },
+  "AI Voice Changer(Effect)": {
+    "suggested": "AI Voice Changer",
+    "confirmed": false
+  },
+  "Timeline(Trim)": {
+    "suggested": "Timeline",
+    "confirmed": false
+  },
+  "Filter layer": {
+    "suggested": "Filter",
+    "confirmed": false
+  },
+  "Video Effect layer": {
+    "suggested": "Video Effects",
+    "confirmed": false
+  }
+}

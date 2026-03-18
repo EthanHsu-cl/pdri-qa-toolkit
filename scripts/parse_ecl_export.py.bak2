@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""PDR-I ECL Export Parser v2.1
+Usage: python parse_ecl_export.py <input.xlsx> <output.csv>
+"""
+import re, sys, os
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+MODULE_ALIASES = {
+    "HQ Auido Denoise": "HQ Audio Denoise",
+    "Boay Effects": "Body Effects",
+    "Speech Enhacner": "Speech Enhancer",
+    "AI Anime Vide": "AI Anime Video",
+    "AI Voice Change": "AI Voice Changer",
+    "Auto Caption": "Auto Captions",
+    "Facial Mosiac": "Facial Mosaic",
+    "Voice-over": "Voice-Over",
+    "voice-Over": "Voice-Over",
+    "Voiceover": "Voice-Over",
+    "Text To Video": "Text to Video",
+    "Text To Image": "Text to Image",
+    "Image To Video": "Image to Video",
+    "text to video": "Text to Video",
+    "text to image": "Text to Image",
+    "image to video": "Image to Video",
+    "Ai Storytelling": "AI Storytelling",
+    "AI storytelling": "AI Storytelling",
+    "Ai Art": "AI Art",
+    "AI art": "AI Art",
+    "auto edit": "Auto Edit",
+    "Auto edit": "Auto Edit",
+    "export": "Export",
+    "Colour Board": "Color Board",
+}
+
+MODULE_CATEGORIES = {
+    "AI Features": ['AI Storytelling', 'AI Art', 'AI Smart Tools', 'Image to Video', 'Character Motion Swap', 'Text to Video', 'AI Anime Video', 'AI Magic', 'Talking Avatar', 'AI Images', 'Text to Image', 'AI Style Transfer'],
+    "Editor Core": ['Project', 'Auto Edit', 'Auto Edit Project', 'Recent Projects', 'New Project', 'Split', 'Duplicate', 'Trim', 'Adjust Speed', 'Speed', 'Standard Speed', 'Speed Curve', 'Super Slow Motion', 'Transform', 'Crop & Rotate', 'Pan & Zoom', 'Fill', 'Fit', 'Flip', 'Transform Keyframe', 'Reduce Track Height', 'Aspect Ratio', 'Reverse', 'Freeze Frame', 'Range', 'Replace'],
+    "Audio": ['Audio', 'Music', 'AI Music Generator', 'Voice-Over', 'Sound FX', 'Extract Audio', 'Text to Speech', 'HQ Audio Denoise', 'Denoise', 'Speech Enhancer', 'AI Voice Changer', 'Audio Ducking', 'Audio Mixing', 'Beats Marker', 'Volume', 'Audio Tool'],
+    "Text & Captions": ['Text', 'Add Text', 'Auto Captions', 'Edit Text', 'Captions List', 'Bilingual Subtitles', 'Animation', 'Template', 'Style', 'Font', 'Backdrop'],
+    "Visual Effects": ['Effects', 'Filter', 'Video Effects', 'Effect Overlay', 'Body Effects', 'Highlight', 'Sticker', 'Motion', 'Blending', 'Opacity', 'Border & Shadow', 'Mosaic & Blur'],
+    "Color & Adjust": ['Adjust', 'AI Color', 'Brightness', 'Contrast', 'Saturation', 'HSL', 'Hue', 'Temp', 'Tint', 'Sharpness', 'Color Board', 'Color Selector'],
+    "Background & Cutout": ['Background', 'Add Background', 'Cutout', 'Replace Background', 'Replace BG', 'Chroma Key', 'Mask'],
+    "Enhance & Fix": ['Enhance', 'Video Enhancer', 'Photo Enhance', 'Video Enhance', 'Fix Shake', 'AI Video Upscaler', 'Video Upscaler', 'Facial Mosaic', 'Auto Mosaic', 'Skin Smoother', 'Portrait', 'People Background', 'Motion Tracking'],
+    "Export & Output": ['Export', 'Produced Video', 'Video Intro', 'Video Outro'],
+    "UI & Settings": ['Settings', 'Preference', 'Tutorials & Tips', 'VIP Benefit page', 'Trending', 'Camera', 'Video', 'Photo', 'Overlay', 'Transition', 'Templates', 'Duration', 'Credit', 'More', 'My Artwork'],
+}
+
+# ← ADD THIS BLOCK HERE (after MODULE_CATEGORIES = {...})
+MODULE_CATEGORIES.update({
+    # Analytics/Tracking
+    "Mixpanel": "Analytics",
+    "Appsflyer": "Analytics", 
+    "Flurry Log": "Analytics",
+
+    # IAP/Promotions 
+    "IAP": "IAP",
+    "IAP (7-day Free Trial)": "IAP",
+    "Pro+": "IAP",
+    "Pro+(7-day Free Trial)": "IAP",
+    "Anniversary Sale": "IAP",
+    "Xmas": "IAP",
+    "Halloween": "IAP",
+    "Halloween IAP": "IAP",
+    "JP Golden Week": "IAP",
+
+    # Launcher variants
+    "Launcher (AI Creation)": "Launcher",
+    "Launcher (Shortcut)": "Launcher",
+    "Launcher (What's New)": "Launcher",
+    "Launcher Shortcut": "Launcher",
+
+    # Cloud Storage
+    "Cloud Storage": "Cloud",
+    "My Cloud": "Cloud",
+    "Cloud Storage (My Cloud)": "Cloud",
+
+    # AI Features
+    "AI Sketch": "AI Features",
+    "AI Cartoon": "AI Features", 
+    "AI Scene": "AI Features",
+    "AI Effect": "AI Features",
+
+    # Media Picker
+    "Add Media": "Media Picker",
+    "Media Picker": "Media Picker",
+
+    # Timeline variants
+    "Timeline (AI Creation)": "Editor Core",
+    "Timeline (Mosaic)": "Editor Core",
+
+    # Settings/Menu
+    "Settings": "UI & Settings",
+    "Menu": "UI & Settings",
+    
+    # Demo/Preview
+    "Preview": "Preview",
+    "Demo": "Demo",
+    
+    # Templates
+    "MGT": "Templates",
+    "MGT(Sparkle)": "Templates",
+    
+    # AI Features
+    "Talking Avatar": "AI Features",
+    "GAI": "AI Features",
+})
+
+_MODULE_TO_CATEGORY = {}
+for cat, modules in MODULE_CATEGORIES.items():
+    for mod in modules:
+        _MODULE_TO_CATEGORY[mod.lower()] = cat
+
+KNOWN_TAGS = ["EDF","UX","MX","MUI","Side Effect","AT Found","Function","Stability","Performance","Regression","Crash","ANR","UI","Localization","IAP"]
+SEVERITY_MAP = {"1":(1,10,"1-Critical"),"2":(2,5,"2-Major"),"3":(3,2,"3-Normal"),"4":(4,1,"4-Minor")}
+
+DESC_PATTERN = re.compile(
+    r'^(?P<product>[A-Z0-9-]+)\s+'
+    r'(?P<version>[\d.]+(?:\s*\([\d.]+\))?)\s*'
+    r'-\s*'
+    r'(?P<tags>(?:\[[^\]]*\]\s*)*)'
+    r'(?P<module>[^:]+?):\s*'
+    r'(?P<description>.+)$',
+    re.IGNORECASE
+)
+TAG_PATTERN = re.compile(r'\[([^\]]+)\]')
+
+def normalize_module(raw):
+    mod = raw.strip()
+    for alias, canonical in MODULE_ALIASES.items():
+        if mod.lower() == alias.lower():
+            return canonical
+    return mod
+
+def get_category(module_name):
+    cat = _MODULE_TO_CATEGORY.get(module_name.lower())
+    if cat: return cat
+    for cat_name, modules in MODULE_CATEGORIES.items():
+        for m in modules:
+            if m.lower() in module_name.lower() or module_name.lower() in m.lower():
+                return cat_name
+    return "Uncategorized"
+
+def parse_severity(sev_str):
+    if pd.isna(sev_str): return 3, 2, "3-Normal"
+    d = re.search(r'(\d)', str(sev_str).strip())
+    if d: return SEVERITY_MAP.get(d.group(1), (3,2,"3-Normal"))
+    return 3, 2, "3-Normal"
+
+def parse_repro(repro_str):
+    if pd.isna(repro_str): return 0.5
+    s = str(repro_str).strip().lower()
+    m = re.search(r'(\d+)\s*(?:out\s*of|/)(\d+)', s)
+    if m: return int(m.group(1)) / max(int(m.group(2)), 1)
+    if "always" in s or "every" in s: return 1.0
+    if "random" in s: return 0.3
+    if "once" in s or "rare" in s: return 0.1
+    return 0.5
+
+def parse_ecl_export(input_path, output_path):
+    ext = Path(input_path).suffix.lower()
+    df = pd.read_excel(input_path) if ext in ['.xlsx','.xls'] else pd.read_csv(input_path)
+    print(f"Loaded {len(df)} bugs")
+    sd_col = None
+    for col in df.columns:
+        if "short" in col.lower() and "desc" in col.lower(): sd_col = col; break
+    if sd_col is None: sd_col = "Short Description"
+    if sd_col not in df.columns:
+        print(f"ERROR: Column '{sd_col}' not found. Available: {list(df.columns)}"); sys.exit(1)
+    print("Parsing Short Descriptions...")
+    parsed = {k: [] for k in ["parsed_product","parsed_version","parsed_tags","parsed_module","parsed_description","module_category"]}
+    tag_cols = {t.lower().replace(" ","_"): [] for t in KNOWN_TAGS}
+    for _, row in df.iterrows():
+        desc = str(row.get(sd_col, ""))
+        m = DESC_PATTERN.match(desc)
+        if m:
+            parsed["parsed_product"].append(m.group("product").strip())
+            parsed["parsed_version"].append(m.group("version").strip())
+            tags_raw = TAG_PATTERN.findall(m.group("tags"))
+            parsed["parsed_tags"].append(tags_raw)
+            mod = normalize_module(m.group("module"))
+            parsed["parsed_module"].append(mod)
+            parsed["parsed_description"].append(m.group("description").strip())
+            parsed["module_category"].append(get_category(mod))
+            for tk in tag_cols:
+                tag_cols[tk].append(any(t.lower().replace(" ","_")==tk for t in tags_raw))
+        else:
+            for k in parsed: parsed[k].append(None if k!="parsed_tags" else [])
+            parsed["parsed_description"][-1] = desc
+            for tk in tag_cols: tag_cols[tk].append(False)
+    for k, v in parsed.items(): df[k] = v
+    for tk, tv in tag_cols.items(): df[f"tag_{tk}"] = tv
+    sev_col = next((c for c in df.columns if c.lower()=="severity"), None)
+    if sev_col:
+        sev_data = df[sev_col].apply(parse_severity)
+        df["severity_num"] = sev_data.apply(lambda x: x[0])
+        df["severity_weight"] = sev_data.apply(lambda x: x[1])
+        df["severity_label"] = sev_data.apply(lambda x: x[2])
+    repro_col = next((c for c in df.columns if "repro" in c.lower() and "prob" in c.lower()), None)
+    if repro_col: df["repro_rate"] = df[repro_col].apply(parse_repro)
+    for dc in ["Create Date","Closed Date"]:
+        if dc in df.columns: df[dc] = pd.to_datetime(df[dc], errors="coerce")
+    if "Create Date" in df.columns and "Closed Date" in df.columns:
+        df["days_to_close"] = (df["Closed Date"] - df["Create Date"]).dt.days
+    build_col = next((c for c in df.columns if c.lower().strip() in ["build#","build"]), None)
+    close_build_col = next((c for c in df.columns if c.lower().strip() in ["close build#","close build"]), None)
+    if build_col and close_build_col:
+        df["builds_to_fix"] = (pd.to_numeric(df[close_build_col],errors="coerce") - pd.to_numeric(df[build_col],errors="coerce")).clip(lower=0)
+    parsed_ok = df["parsed_module"].notna().sum()
+    total = len(df)
+    print(f"\nPARSING SUMMARY\nTotal bugs: {total}\nSuccessfully parsed: {parsed_ok} ({parsed_ok/total*100:.1f}%)")
+    print(f"Unique modules: {df['parsed_module'].dropna().nunique()}")
+    print(f"\nTop 10 modules:")
+    for mod, cnt in df["parsed_module"].value_counts().head(10).items():
+        print(f"  {mod:30s} {cnt:>5}")
+    uncat = df[df["module_category"]=="Uncategorized"]["parsed_module"].dropna().unique()
+    if len(uncat) > 0:
+        print(f"\nUNCATEGORIZED MODULES:")
+        for m in sorted(uncat): print(f"  - {m}")
+    df.to_csv(output_path, index=False, encoding="utf-8-sig")
+    print(f"\nSaved to: {output_path}")
+
+def main():
+    if len(sys.argv) < 3: print("Usage: python parse_ecl_export.py <input.xlsx> <output.csv>"); sys.exit(1)
+    parse_ecl_export(sys.argv[1], sys.argv[2])
+
+if __name__ == "__main__": main()
