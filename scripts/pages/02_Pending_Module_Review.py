@@ -100,80 +100,83 @@ edited = st.data_editor(
 )
 
 # ---------------------------------------------------------------------
-# Bulk selection helpers (stable, no direct widget state writes)
+# Bulk selection helpers
 # ---------------------------------------------------------------------
 
 df_pending = edited
 df_pending["__row_id"] = df_pending["__row_id"].astype(int)
 
 row_ids = df_pending["__row_id"].tolist()
-key_selected = "pending_selected_ids"
+all_indices = list(df_pending.index)
 
-if key_selected not in st.session_state:
-    st.session_state[key_selected] = []
+# This will store *indices* directly used by the multiselect widget
+MULTI_KEY = "pending_multiselect_indices"
+if MULTI_KEY not in st.session_state:
+    st.session_state[MULTI_KEY] = []
+
+# Derived: row_id -> index
+id_to_index = {
+    int(rid): idx for idx, rid in df_pending["__row_id"].items()
+}
+index_to_id = {
+    idx: int(rid) for idx, rid in df_pending["__row_id"].items()
+}
 
 # Available versions + majors
 versions_available = sorted(df_pending["Version"].astype(str).unique().tolist())
 major_versions = sorted({v.split(".")[0] for v in versions_available})
 
+# Callback helpers to mutate widget state directly
+def select_all_rows():
+    st.session_state[MULTI_KEY] = all_indices
+
+def clear_all_rows():
+    st.session_state[MULTI_KEY] = []
+
+def add_major_rows():
+    major = st.session_state.get("pending_major_ver", "—")
+    if major == "—":
+        return
+    prefix = major + "."
+    major_ids = df_pending[
+        df_pending["Version"].astype(str).str.startswith(prefix)
+    ]["__row_id"].tolist()
+    major_indices = [id_to_index[rid] for rid in major_ids if rid in id_to_index]
+    current = set(st.session_state.get(MULTI_KEY, []))
+    st.session_state[MULTI_KEY] = sorted(current.union(major_indices))
+
 col_all, col_major, col_clear = st.columns([1, 2, 1])
 
 with col_all:
-    if st.button("Select ALL rows", key="btn_all"):
-        # Select all row_ids
-        st.session_state[key_selected] = row_ids
+    st.button("Select ALL rows", key="btn_all", on_click=select_all_rows)
 
 with col_major:
-    major = st.selectbox(
+    st.selectbox(
         "Bulk add by major (16.x, 15.x, ...)",
         options=["—"] + major_versions,
         index=0,
         key="pending_major_ver",
     )
-    if st.button("Add this major", key="btn_major"):
-        if major != "—":
-            prefix = major + "."
-            major_ids = df_pending[
-                df_pending["Version"].astype(str).str.startswith(prefix)
-            ]["__row_id"].tolist()
-            current = set(st.session_state[key_selected])
-            st.session_state[key_selected] = sorted(current.union(major_ids))
+    st.button("Add this major", key="btn_major", on_click=add_major_rows)
 
 with col_clear:
-    if st.button("Clear ALL selection", key="btn_clear"):
-        st.session_state[key_selected] = []
-
-# Map row_id -> current index
-id_to_index = {
-    int(rid): idx for idx, rid in df_pending["__row_id"].items()
-}
-
-# Compute indices from stored IDs
-indices_from_ids = [
-    id_to_index[rid]
-    for rid in st.session_state[key_selected]
-    if rid in id_to_index
-]
-
+    st.button("Clear ALL selection", key="btn_clear", on_click=clear_all_rows)
 
 def _format_label(i: int) -> str:
     return f"{df_pending.loc[i, 'Version']} – {df_pending.loc[i, 'Raw Module']}"
 
-# Use selection from session_state as the default, always
-multiselect_default = indices_from_ids
-
+# Multiselect: its value is driven purely by st.session_state[MULTI_KEY]
 selected_indices = st.multiselect(
     "Rows to promote",
-    options=list(df_pending.index),
-    default=multiselect_default,
+    options=all_indices,
+    # remove this line:
+    # default=st.session_state[MULTI_KEY],
     format_func=_format_label,
-    key="pending_multiselect",
+    key=MULTI_KEY,
 )
 
-# After widget, update our own selection state from its current value
-st.session_state[key_selected] = [
-    int(df_pending.loc[i, "__row_id"]) for i in selected_indices
-]
+# Derived stable IDs for downstream logic
+selected_row_ids = [index_to_id[i] for i in selected_indices]
 
 # ---------------------------------------------------------------------
 # Promote selected mappings

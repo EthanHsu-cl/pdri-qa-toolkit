@@ -1,14 +1,1 @@
-{
-  "Text(Animation)": {
-    "suggested": "Animation",
-    "confirmed": false
-  },
-  "Menu>Produced video": {
-    "suggested": "Produced Video",
-    "confirmed": false
-  },
-  "Adjustment": {
-    "suggested": "Adjust",
-    "confirmed": false
-  }
-}
+{}
