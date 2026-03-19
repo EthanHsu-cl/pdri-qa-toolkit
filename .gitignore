@@ -64,6 +64,8 @@ Thumbs.db
 **/predictions.csv
 **/risk_register_scored.csv
 **/risk_register.csv
+*.csv
+data/module_mappings/
 
 # Generated test results and logs
 **/*.log
