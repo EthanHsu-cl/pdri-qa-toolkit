@@ -16,7 +16,7 @@ parts/
 sdist/
 var/
 wheels/
-pip-wheel-metadata/
+pip-wheel-meta**/
 share/python-wheels/
 *.egg-info/
 .installed.cfg
@@ -59,14 +59,14 @@ Thumbs.db
 .streamlit/
 
 # Local data (keep tracking but can be regenerated)
-data/ecl_clustered.csv
-data/ecl_parsed.csv
-data/predictions.csv
-data/risk_register_scored.csv
-data/risk_register.csv
+**/ecl_clustered.csv
+**/ecl_parsed.csv
+**/predictions.csv
+**/risk_register_scored.csv
+**/risk_register.csv
 
 # Generated test results and logs
-*.log
+**/*.log
 test_results/
 
 # Temporary files

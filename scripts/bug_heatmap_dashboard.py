@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""PDR-I Bug Heatmap Dashboard v2.3
+"""PDR-I Bug Heatmap Dashboard v2.4
+
+Changes from v2.3:
+  - Issue 9: Fixed tab reset-to-first on widget interaction — replaced st.tabs()
+             with sidebar radio navigation persisted via session_state.
 
 Changes from v2.2:
   - Issue 2: Status filter defaults to ACTIVE bugs only (sidebar toggle to include inactive)
@@ -9,20 +13,18 @@ Changes from v2.2:
              plus clearer P/S interpretation and mismatch metrics.
 
 Usage:
-  streamlit run scripts/bug_heatmap_dashboard.py \
+  streamlit run scripts/bug_heatmap_dashboard.py \\
     --server.address 0.0.0.0 --server.port 8501
 """
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import json
 from pathlib import Path
+
 
 st.set_page_config(page_title="PDR-I QA Dashboard", layout="wide", page_icon="🔥")
 
-if "active_tab" not in st.session_state:
-    st.session_state["active_tab"] = "🗺️ Module × Severity"
 
 # ---------------------------------------------------------------------
 # Constants
@@ -31,13 +33,12 @@ if "active_tab" not in st.session_state:
 ECL_BUG_URL = "https://ecl.cyberlink.com/Ebug/EbugHandle/HandleMainEbug.asp?BugCode={bug_code}"
 
 QUADRANT_COLORS = {
-    "Q4": "#ef4444",  # red
-    "Q3": "#f97316",  # orange
-    "Q2": "#eab308",  # yellow
-    "Q1": "#22c55e",  # green
+    "Q4": "#ef4444",
+    "Q3": "#f97316",
+    "Q2": "#eab308",
+    "Q1": "#22c55e",
 }
 
-# Issue 8: RD priority labels (5 = N/A)
 PRIORITY_LABEL_MAP = {
     1: "1-Fix Now",
     2: "2-Must Fix",
@@ -47,7 +48,6 @@ PRIORITY_LABEL_MAP = {
 }
 PRIORITY_ORDER = ["1-Fix Now", "2-Must Fix", "3-Better Fix", "4-No Matter", "5-N/A"]
 
-# Issue 2: Status classification (inactive but still counted)
 INACTIVE_STATUSES = {
     "close",
     "need more info",
@@ -66,6 +66,20 @@ INACTIVE_STATUSES = {
     "fae close",
 }
 
+TAB_NAMES = [
+    "🗺️ Module × Severity",
+    "📅 Version Timeline",
+    "🏷️ Tag Analysis",
+    "⚖️ P/S Alignment",
+    "👥 Team Coverage",
+    "📊 KPI Dashboard",
+    "🔥 Risk Heatmap",
+]
+
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
 
 def is_active(status_val) -> bool:
     if pd.isna(status_val):
@@ -83,13 +97,26 @@ def load_csv(fp: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------
+# Sidebar – Navigation (Issue 9: replaces st.tabs for persistent state)
+# ---------------------------------------------------------------------
+
+st.sidebar.subheader("📑 Navigation")
+
+active_tab = st.sidebar.radio(
+    "View",
+    TAB_NAMES,
+    key="active_tab",
+    label_visibility="collapsed",
+)
+
+# ---------------------------------------------------------------------
 # Sidebar – load data
 # ---------------------------------------------------------------------
 
-st.sidebar.title("🔥 PDR-I QA Dashboard v2.3")
+st.sidebar.title("🔥 PDR-I QA Dashboard v2.4")
 st.sidebar.markdown("**Step 1 — Bug data** (required)")
 
-ds = st.sidebar.radio("Bug data source", ["Upload CSV", "File Path"], key="ds_bugs")
+ds = st.sidebar.radio("Bug data source", ["Upload CSV", "File Path"], key="ds_bugs", index=1)
 
 if ds == "Upload CSV":
     up = st.sidebar.file_uploader("Upload ecl_parsed.csv", type="csv", key="up_bugs")
@@ -131,19 +158,18 @@ if "severity_weight" not in df.columns:
 if "module_category" not in df.columns:
     df["module_category"] = "Uncategorized"
 
-# Priority label if parser not yet updated
 if "priority_label" not in df.columns and "Priority" in df.columns:
     df["priority_num"] = pd.to_numeric(df["Priority"], errors="coerce").fillna(5).astype(int)
     df["priority_label"] = df["priority_num"].map(PRIORITY_LABEL_MAP).fillna("5-N/A")
 elif "priority_label" not in df.columns:
     df["priority_label"] = "5-N/A"
 
-# status_active (Issue 2)
 if "status_active" not in df.columns:
     if "Status" in df.columns:
         df["status_active"] = df["Status"].apply(is_active)
     else:
         df["status_active"] = True
+
 
 # ---------------------------------------------------------------------
 # Sidebar – risk data
@@ -153,7 +179,7 @@ st.sidebar.markdown("---")
 st.sidebar.markdown("**Step 2 — Risk scores** (optional, enriches all charts)")
 
 rds = st.sidebar.radio(
-    "Risk data source", ["Upload CSV", "File Path", "None"], key="ds_risk", index=2
+    "Risk data source", ["Upload CSV", "File Path", "None"], key="ds_risk", index=1
 )
 risk_df = None
 if rds == "Upload CSV":
@@ -193,14 +219,13 @@ if risk_df is not None:
     ]
     df = df.merge(risk_df[risk_cols], on="parsed_module", how="left")
     df["quadrant"] = df.get("quadrant", pd.Series(["Q1"] * len(df))).fillna("Q1")
-    df["risk_score_final"] = df.get("risk_score_final", pd.Series([0.0] * len(df))).fillna(
-        0.0
-    )
+    df["risk_score_final"] = df.get("risk_score_final", pd.Series([0.0] * len(df))).fillna(0.0)
     risk_available = True
 else:
     df["quadrant"] = "Unknown"
     df["risk_score_final"] = 0.0
     risk_available = False
+
 
 # ---------------------------------------------------------------------
 # Sidebar – filters
@@ -209,7 +234,6 @@ else:
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔍 Filters")
 
-# Active/inactive toggle (Issue 2)
 include_inactive = st.sidebar.checkbox(
     "Include closed/inactive bugs (Close, NAB, Won't Fix, etc.)",
     value=False,
@@ -255,28 +279,13 @@ if risk_available:
 active_label = "active " if not include_inactive else ""
 st.sidebar.markdown(f"**Showing {len(df):,} {active_label}bugs**")
 
-# ---------------------------------------------------------------------
-# Tabs
-# ---------------------------------------------------------------------
-
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-    [
-        "🗺️ Module × Severity",
-        "📅 Version Timeline",
-        "🏷️ Tag Analysis",
-        "⚖️ P/S Alignment",
-        "👥 Team Coverage",
-        "📊 KPI Dashboard",
-        "🔥 Risk Heatmap",
-    ]
-)
 
 
-# ---------------------------------------------------------------------
-# TAB 1 – Module × Severity (Issues 3 & 6)
-# ---------------------------------------------------------------------
+# =====================================================================
+# TAB 1 – Module × Severity
+# =====================================================================
 
-with tab1:
+if active_tab == "🗺️ Module × Severity":
     st.header("Module × Severity Heatmap")
 
     vl = st.radio("View", ["Category", "Module (top 30)"], horizontal=True, key="t1v")
@@ -293,14 +302,12 @@ with tab1:
         fill_value=0,
     )
 
-    # Ensure_cols for all severities
     for lbl in ["1-Critical", "2-Major", "3-Normal", "4-Minor"]:
         if lbl not in pv.columns:
             pv[lbl] = 0
     pv = pv[["1-Critical", "2-Major", "3-Normal", "4-Minor"]]
 
     if vl.startswith("M"):
-        # Issue 6: use total weight Series correctly (no KeyError)
         total_weight = pv.sum(axis=1)
         top_modules = total_weight.nlargest(30).index
         pv = pv.loc[top_modules]
@@ -325,7 +332,6 @@ with tab1:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # Issue 3 – Drill-down table with ECL links (Option A)
     st.markdown("---")
     st.subheader("🔗 Bug Drill-Down")
     st.caption("Select a module/category and severity to list bugs with ECL links.")
@@ -344,26 +350,15 @@ with tab1:
 
     drill_df = df[df[gc] == drill_group].copy()
     if drill_sev != "All":
-        sev_num_map = {
-            "1-Critical": 1,
-            "2-Major": 2,
-            "3-Normal": 3,
-            "4-Minor": 4,
-        }
+        sev_num_map = {"1-Critical": 1, "2-Major": 2, "3-Normal": 3, "4-Minor": 4}
         drill_df = drill_df[drill_df["severity_num"] == sev_num_map[drill_sev]]
 
     if len(drill_df) == 0:
         st.info("No bugs match this selection.")
     else:
         display_cols_wanted = [
-            "BugCode",
-            "Short Description",
-            "Status",
-            "severity_label",
-            "priority_label",
-            "parsed_version",
-            "Creator",
-            "parsed_module",
+            "BugCode", "Short Description", "Status", "severity_label",
+            "priority_label", "parsed_version", "Creator", "parsed_module",
         ]
         display_cols = [c for c in display_cols_wanted if c in drill_df.columns]
         drill_display = drill_df[display_cols].copy()
@@ -378,9 +373,7 @@ with tab1:
             st.dataframe(
                 drill_display,
                 column_config={
-                    "ECL Link": st.column_config.LinkColumn(
-                        "ECL Link", display_text="Open 🔗"
-                    )
+                    "ECL Link": st.column_config.LinkColumn("ECL Link", display_text="Open 🔗")
                 },
                 use_container_width=True,
                 hide_index=True,
@@ -388,24 +381,23 @@ with tab1:
         else:
             st.dataframe(drill_display, use_container_width=True, hide_index=True)
 
-        st.caption(
-            f"Showing {len(drill_display)} bugs for **{drill_group}** / **{drill_sev}**"
-        )
+        st.caption(f"Showing {len(drill_display)} bugs for **{drill_group}** / **{drill_sev}**")
 
     with st.expander("Raw pivot data"):
         st.dataframe(pv, use_container_width=True)
 
-# ---------------------------------------------------------------------
-# TAB 2 – Version Timeline (also uses safe nlargest)
-# ---------------------------------------------------------------------
 
-with tab2:
+# =====================================================================
+# TAB 2 – Version Timeline
+# =====================================================================
+
+elif active_tab == "📅 Version Timeline":
     st.header("Module × Version Timeline")
+
     if "parsed_version" in df.columns:
-        vl2 = st.radio(
-            "View", ["Category", "Module (top 25)"], horizontal=True, key="t2v"
-        )
+        vl2 = st.radio("View", ["Category", "Module (top 25)"], horizontal=True, key="t2v")
         gc2 = "module_category" if vl2.startswith("C") else "parsed_module"
+
         tl = df.pivot_table(
             index=gc2,
             columns="parsed_version",
@@ -414,10 +406,12 @@ with tab2:
             fill_value=0,
         )
         tl = tl[sorted(tl.columns)]
+
         if vl2.startswith("M"):
             total_weight2 = tl.sum(axis=1)
             top_mods2 = total_weight2.nlargest(25).index
             tl = tl.loc[top_mods2]
+
         fig2 = px.imshow(
             tl,
             labels=dict(x="Version", y=gc2, color="Weighted"),
@@ -430,26 +424,27 @@ with tab2:
     else:
         st.warning("No `parsed_version` column found.")
 
-# ---------------------------------------------------------------------
-# TAB 3 – Tag Analysis (AT coverage, Regression Bug Rate)
-# ---------------------------------------------------------------------
 
-with tab3:
+# =====================================================================
+# TAB 3 – Tag Analysis
+# =====================================================================
+
+elif active_tab == "🏷️ Tag Analysis":
     st.header("Tag Distribution")
+
     tc = [c for c in df.columns if c.startswith("tag_")]
     if tc:
-        vl3 = st.radio(
-            "View", ["Category", "Module (top 25)"], horizontal=True, key="t3v"
-        )
+        vl3 = st.radio("View", ["Category", "Module (top 25)"], horizontal=True, key="t3v")
         gc3 = "module_category" if vl3.startswith("C") else "parsed_module"
+
         tp = df.groupby(gc3)[tc].sum()
-        tp.columns = [
-            c.replace("tag_", "").replace("_", " ").title() for c in tp.columns
-        ]
+        tp.columns = [c.replace("tag_", "").replace("_", " ").title() for c in tp.columns]
+
         if vl3.startswith("M"):
             total_tags = tp.sum(axis=1)
             top_mods3 = total_tags.nlargest(25).index
             tp = tp.loc[top_mods3]
+
         fig3 = px.imshow(
             tp,
             labels=dict(x="Tag", y=gc3, color="Count"),
@@ -465,9 +460,12 @@ with tab3:
         if se:
             total_per_mod = df.groupby(gc3).size()
             se_count = df[df[se[0]] == True].groupby(gc3).size()
-            se_rate = (se_count / total_per_mod * 100).fillna(0).sort_values(
-                ascending=False
-            ).head(15)
+            se_rate = (
+                (se_count / total_per_mod * 100)
+                .fillna(0)
+                .sort_values(ascending=False)
+                .head(15)
+            )
             fig_se = px.bar(
                 se_rate.reset_index(),
                 x=gc3,
@@ -483,7 +481,10 @@ with tab3:
         if at:
             total_per_mod = df.groupby(gc3).size()
             at_count = (
-                df[df[at[0]] == True].groupby(gc3).size().reindex(total_per_mod.index, fill_value=0)
+                df[df[at[0]] == True]
+                .groupby(gc3)
+                .size()
+                .reindex(total_per_mod.index, fill_value=0)
             )
             at_rate = (at_count / total_per_mod * 100).fillna(0)
 
@@ -507,7 +508,7 @@ with tab3:
                 color_continuous_scale=["red", "orange", "green"],
                 range_color=[0, 50],
                 hover_data=["Total Bugs", "AT Found Bugs"],
-                title="AT Found Rate by Module (Green ≥30%, Orange 10–29%, Red <10)",
+                title="AT Found Rate by Module (Green ≥30%, Orange 10–29%, Red <10%)",
             )
             fig_at.update_layout(height=400, xaxis_tickangle=-30)
             st.plotly_chart(fig_at, use_container_width=True)
@@ -523,11 +524,12 @@ with tab3:
     else:
         st.warning("No tag columns found — re-run parse_ecl_export.py")
 
-# ---------------------------------------------------------------------
-# TAB 4 – Priority vs Severity Alignment (Issue 8)
-# ---------------------------------------------------------------------
 
-with tab4:
+# =====================================================================
+# TAB 4 – Priority vs Severity Alignment
+# =====================================================================
+
+elif active_tab == "⚖️ P/S Alignment":
     st.header("⚖️ Priority vs Severity Alignment")
 
     with st.expander("📖 How to read this chart", expanded=True):
@@ -595,32 +597,21 @@ with tab4:
         )
 
         if len(critical_mismatch) > 0:
-            with st.expander(
-                f"🔴 View Critical Mismatches ({len(critical_mismatch)} bugs)"
-            ):
+            with st.expander(f"🔴 View Critical Mismatches ({len(critical_mismatch)} bugs)"):
                 show_cols = [
-                    c
-                    for c in [
-                        "BugCode",
-                        "Short Description",
-                        "severity_label",
-                        "priority_label",
-                        "Status",
-                        "parsed_module",
-                        "parsed_version",
+                    c for c in [
+                        "BugCode", "Short Description", "severity_label", "priority_label",
+                        "Status", "parsed_module", "parsed_version",
                     ]
                     if c in critical_mismatch.columns
                 ]
                 bug_code_col = next(
-                    (c for c in critical_mismatch.columns if "bugcode" in c.lower()),
-                    None,
+                    (c for c in critical_mismatch.columns if "bugcode" in c.lower()), None
                 )
                 disp = critical_mismatch[show_cols].copy()
                 if bug_code_col:
                     disp["ECL Link"] = critical_mismatch[bug_code_col].apply(
-                        lambda x: ECL_BUG_URL.format(bug_code=x)
-                        if pd.notna(x)
-                        else ""
+                        lambda x: ECL_BUG_URL.format(bug_code=x) if pd.notna(x) else ""
                     )
                     st.dataframe(
                         disp,
@@ -639,12 +630,14 @@ with tab4:
             "Need `priority_label` (or `Priority`) and `severity_num` columns. Re-run parse_ecl_export.py v2.3."
         )
 
-# ---------------------------------------------------------------------
-# TAB 5 – Team Coverage
-# ---------------------------------------------------------------------
 
-with tab5:
+# =====================================================================
+# TAB 5 – Team Coverage
+# =====================================================================
+
+elif active_tab == "👥 Team Coverage":
     st.header("Tester × Module Coverage")
+
     if "Creator" in df.columns and "module_category" in df.columns:
         cv = df.pivot_table(
             index="Creator",
@@ -671,12 +664,14 @@ with tab5:
     else:
         st.warning("Need `Creator` and `module_category` columns.")
 
-# ---------------------------------------------------------------------
-# TAB 6 – KPI Dashboard (renamed Regression Bug Rate)
-# ---------------------------------------------------------------------
 
-with tab6:
+# =====================================================================
+# TAB 6 – KPI Dashboard
+# =====================================================================
+
+elif active_tab == "📊 KPI Dashboard":
     st.header("Quality KPIs")
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Bugs (filtered)", f"{len(df):,}")
     c2.metric("Critical Bugs (S1)", f"{int((df['severity_num'] == 1).sum()):,}")
@@ -720,21 +715,14 @@ with tab6:
             wk = vd.set_index("Create Date").resample("W").size().reset_index()
             wk.columns = ["Week", "Count"]
             st.plotly_chart(
-                px.line(wk, x="Week", y="Count", markers=True).update_layout(
-                    height=300
-                ),
+                px.line(wk, x="Week", y="Count", markers=True).update_layout(height=300),
                 use_container_width=True,
             )
 
     st.subheader("Severity Distribution")
     sd = df["severity_num"].value_counts().sort_index()
     sd.index = sd.index.map(
-        {
-            1: "S1-Critical",
-            2: "S2-Major",
-            3: "S3-Normal",
-            4: "S4-Minor",
-        }
+        {1: "S1-Critical", 2: "S2-Major", 3: "S3-Normal", 4: "S4-Minor"}
     )
     st.plotly_chart(
         px.pie(
@@ -745,11 +733,12 @@ with tab6:
         use_container_width=True,
     )
 
-# ---------------------------------------------------------------------
-# TAB 7 – Risk Heatmap (unchanged logic, improved scatter)
-# ---------------------------------------------------------------------
 
-with tab7:
+# =====================================================================
+# TAB 7 – Risk Heatmap
+# =====================================================================
+
+elif active_tab == "🔥 Risk Heatmap":
     st.header("🔥 Risk-Based Bug Heatmap")
 
     if not risk_available:
@@ -781,9 +770,7 @@ with tab7:
         risk_score=("risk_score_final", "mean"),
     ).reset_index()
 
-    tm_agg = tm_agg[
-        tm_agg["parsed_module"].notna() & (tm_agg["bug_count"] > 0)
-    ]
+    tm_agg = tm_agg[tm_agg["parsed_module"].notna() & (tm_agg["bug_count"] > 0)]
     q_lookup = df.groupby("parsed_module")["quadrant"].first().to_dict()
     tm_agg["quadrant"] = tm_agg["parsed_module"].map(q_lookup).fillna("Q1")
 
@@ -795,16 +782,12 @@ with tab7:
             color="risk_score",
             color_continuous_scale="YlOrRd",
             labels={
-                "bug_count": "Bugs",
-                "risk_score": "Risk Score",
-                "module_category": "Category",
-                "parsed_module": "Module",
+                "bug_count": "Bugs", "risk_score": "Risk Score",
+                "module_category": "Category", "parsed_module": "Module",
             },
             hover_data={
-                "bug_count": True,
-                "risk_score": ":.1f",
-                "critical_count": True,
-                "quadrant": True,
+                "bug_count": True, "risk_score": ":.1f",
+                "critical_count": True, "quadrant": True,
             },
         )
     elif color_opt == "Quadrant":
@@ -815,10 +798,8 @@ with tab7:
             color="quadrant",
             color_discrete_map=QUADRANT_COLORS,
             labels={
-                "bug_count": "Bugs",
-                "quadrant": "Quadrant",
-                "module_category": "Category",
-                "parsed_module": "Module",
+                "bug_count": "Bugs", "quadrant": "Quadrant",
+                "module_category": "Category", "parsed_module": "Module",
             },
             hover_data={"bug_count": True, "risk_score": ":.1f", "critical_count": True},
         )
@@ -830,10 +811,8 @@ with tab7:
             color="critical_count",
             color_continuous_scale="Reds",
             labels={
-                "bug_count": "Bugs",
-                "critical_count": "Critical Bugs",
-                "module_category": "Category",
-                "parsed_module": "Module",
+                "bug_count": "Bugs", "critical_count": "Critical Bugs",
+                "module_category": "Category", "parsed_module": "Module",
             },
         )
     else:
@@ -844,10 +823,8 @@ with tab7:
             color="sev_weight",
             color_continuous_scale="YlOrRd",
             labels={
-                "bug_count": "Bugs",
-                "sev_weight": "Severity Weight",
-                "module_category": "Category",
-                "parsed_module": "Module",
+                "bug_count": "Bugs", "sev_weight": "Severity Weight",
+                "module_category": "Category", "parsed_module": "Module",
             },
         )
 
@@ -875,20 +852,21 @@ with tab7:
         st.plotly_chart(fig_sb, use_container_width=True)
 
     with st.expander("📋 Category Summary"):
-        cats = tm_agg.groupby("module_category").agg(
-            Modules=("parsed_module", "nunique"),
-            Total_Bugs=("bug_count", "sum"),
-            Severity_Weight=("sev_weight", "sum"),
-            Avg_Risk=("risk_score", "mean"),
-            Q4_Modules=("quadrant", lambda x: (x == "Q4").sum()),
-        ).sort_values("Avg_Risk", ascending=False).reset_index()
+        cats = (
+            tm_agg.groupby("module_category")
+            .agg(
+                Modules=("parsed_module", "nunique"),
+                Total_Bugs=("bug_count", "sum"),
+                Severity_Weight=("sev_weight", "sum"),
+                Avg_Risk=("risk_score", "mean"),
+                Q4_Modules=("quadrant", lambda x: (x == "Q4").sum()),
+            )
+            .sort_values("Avg_Risk", ascending=False)
+            .reset_index()
+        )
         cats.columns = [
-            "Category",
-            "Modules",
-            "Total Bugs",
-            "Severity Weight",
-            "Avg Risk Score",
-            "Q4 Modules",
+            "Category", "Modules", "Total Bugs",
+            "Severity Weight", "Avg Risk Score", "Q4 Modules",
         ]
         st.dataframe(cats, use_container_width=True, hide_index=True)
 

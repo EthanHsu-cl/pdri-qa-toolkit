@@ -1,14 +1,1 @@
-{
-  "PIP Motion": {
-    "suggested": "Motion",
-    "confirmed": false
-  },
-  "Speed (Speed Curve)": {
-    "suggested": "Speed Curve",
-    "confirmed": false
-  },
-  "Intro Video (Text)": {
-    "suggested": "Video Intro",
-    "confirmed": false
-  }
-}
+{}

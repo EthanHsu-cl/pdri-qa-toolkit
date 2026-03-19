@@ -1,18 +1,1 @@
-{
-  "Auto Edit(Text)": {
-    "suggested": "Auto Edit",
-    "confirmed": false
-  },
-  "Effects(Highlight)": {
-    "suggested": "Highlight",
-    "confirmed": false
-  },
-  "Mosaic": {
-    "suggested": "Music",
-    "confirmed": false
-  },
-  "Add Background, blur": {
-    "suggested": "Add Background",
-    "confirmed": false
-  }
-}
+{}

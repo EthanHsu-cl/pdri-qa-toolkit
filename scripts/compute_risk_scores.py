@@ -18,9 +18,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-
 def _compute_risk_core(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute per-module risk metrics from a bug-level df (already filtered)."""
     df = df[df["parsed_module"].notna()].copy()
     tag_cols = [c for c in df.columns if c.startswith("tag_")]
 
@@ -39,13 +37,11 @@ def _compute_risk_core(df: pd.DataFrame) -> pd.DataFrame:
         .rename(columns={"parsed_module": "module"})
     )
 
-    # Tag-based counters
     for tc in tag_cols:
         t = df.groupby("parsed_module")[tc].sum().reset_index()
         t.columns = ["module", tc.replace("tag_", "") + "_count"]
         agg = agg.merge(t, on="module", how="left")
 
-    # Regression & automation rates
     se_col = [c for c in agg.columns if "side_effect" in c.lower()]
     if se_col:
         agg["regression_rate"] = (agg[se_col[0]] / agg["total_bugs"]).round(4)
@@ -54,7 +50,6 @@ def _compute_risk_core(df: pd.DataFrame) -> pd.DataFrame:
     if at_col:
         agg["automation_catch_rate"] = (agg[at_col[0]] / agg["total_bugs"]).round(4)
 
-    # Averages (if available)
     for metric in ["repro_rate", "days_to_close", "builds_to_fix"]:
         if metric in df.columns:
             m = (
@@ -65,7 +60,6 @@ def _compute_risk_core(df: pd.DataFrame) -> pd.DataFrame:
             m.columns = ["module", f"avg_{metric}", f"median_{metric}"]
             agg = agg.merge(m, on="module", how="left")
 
-    # Status breakdown
     if "Status" in df.columns:
         for status in ["Open", "Closed", "Postpone"]:
             s = (
@@ -77,7 +71,6 @@ def _compute_risk_core(df: pd.DataFrame) -> pd.DataFrame:
             s.columns = ["module", f"{status.lower()}_count"]
             agg = agg.merge(s, on="module", how="left")
 
-    # Unique reporters
     if "Creator" in df.columns:
         r = df.groupby("parsed_module")["Creator"].nunique().reset_index()
         r.columns = ["module", "unique_reporters"]
@@ -85,14 +78,23 @@ def _compute_risk_core(df: pd.DataFrame) -> pd.DataFrame:
 
     agg = agg.fillna(0)
 
-    # Probability score auto from bug count rank
-    agg["probability_score_auto"] = pd.qcut(
-        agg["total_bugs"].rank(method="first"),
-        q=5,
-        labels=[1, 2, 3, 4, 5],
-    ).astype(int)
+    # Probability score: quintile rank, safe for small slices
+    n = len(agg)
+    if n >= 5:
+        agg["probability_score_auto"] = pd.qcut(
+            agg["total_bugs"].rank(method="first"),
+            q=5,
+            labels=[1, 2, 3, 4, 5],
+            duplicates="drop",
+        ).astype(float).fillna(1).astype(int)
+    else:
+        agg["probability_score_auto"] = (
+            agg["total_bugs"]
+            .rank(method="first")
+            .apply(lambda r: max(1, min(5, int(np.ceil(r / n * 5)))))
+            .astype(int)
+        )
 
-    # Placeholders for AI scoring
     agg["impact_score"] = 0
     agg["detectability_score"] = 0
     agg["risk_score_final"] = 0
