@@ -25,13 +25,17 @@ import pandas as pd, numpy as np
 import urllib.request
 
 
+# All keys are explicitly lowercase — lookup uses .lower() so case never matters
 IMPACT_OVERRIDES = {
-    "export":5,"produced video":5,"ai storytelling":5,"auto edit":5,"project":5,
-    "new project":5,"auto edit project":4,"image to video":4,"text to video":4,
-    "ai art":4,"ai music generator":4,"auto captions":4,"video enhance":4,
-    "camera":4,"trim":4,"split":3,"settings":1,"preference":1,
-    "tutorials & tips":1,"credit":1,"more":1,"my artwork":1,
-    "trending":2,"vip benefit page":3,
+    "export": 5, "produced video": 5, "ai storytelling": 5, "auto edit": 5, "project": 5,
+    "new project": 5, "auto edit project": 4, "image to video": 4, "text to video": 4,
+    "ai art": 4, "ai music generator": 4, "auto captions": 4, "video enhance": 4,
+    "video enhancer": 4, "ai video upscaler": 4, "camera": 4, "trim": 4,
+    "split": 3, "timeline": 3, "pip": 3, "text to speech": 3, "voice cloning": 3,
+    "settings": 1, "preference": 1, "tutorials & tips": 1, "credit": 1,
+    "more": 1, "my artwork": 1, "trending": 2, "vip benefit page": 3,
+    "sign in": 2, "notification": 2, "analytics": 1, "mixpanel": 1,
+    "setup": 1, "demo": 1, "shortcut": 2,
 }
 
 
@@ -84,31 +88,37 @@ def score_ollama(row, model="llama3.1"):
         headers={"Content-Type": "application/json"},
     )
 
-    try:
-        resp = urllib.request.urlopen(req, timeout=120)
-        raw = resp.read().decode(errors="replace")
-        envelope = json.loads(raw)
-        text = envelope.get("response", "").strip()
-
+    max_retries = 2
+    for attempt in range(max_retries + 1):
         try:
-            obj = json.loads(text)
-        except json.JSONDecodeError:
-            m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-            if not m:
-                raise
-            obj = json.loads(m.group(0))
+            resp = urllib.request.urlopen(req, timeout=120)
+            raw = resp.read().decode(errors="replace")
+            envelope = json.loads(raw)
+            text = envelope.get("response", "").strip()
 
-        impact = int(obj.get("impact", 3))
-        detect = int(obj.get("detectability", 3))
-        reason = str(obj.get("reasoning", ""))
+            try:
+                obj = json.loads(text)
+            except json.JSONDecodeError:
+                m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+                if not m:
+                    raise
+                obj = json.loads(m.group(0))
 
-        impact = max(1, min(5, impact))
-        detect = max(1, min(5, detect))
-        return impact, detect, "ollama", reason
+            impact = int(obj.get("impact", 3))
+            detect = int(obj.get("detectability", 3))
+            reason = str(obj.get("reasoning", ""))
 
-    except Exception as e:
-        print(f" Ollama failed for {mod} (model={model}): {e}")
-        return score_heuristic(row)
+            impact = max(1, min(5, impact))
+            detect = max(1, min(5, detect))
+            return impact, detect, "ollama", reason
+
+        except Exception as e:
+            if attempt < max_retries:
+                print(f" Ollama attempt {attempt+1} failed for {mod}: {e} — retrying...")
+                time.sleep(2)
+            else:
+                print(f" Ollama failed for {mod} after {max_retries+1} attempts (model={model}): {e} — falling back to heuristic")
+                return score_heuristic(row)
 
 
 def score_openai(row):
@@ -194,6 +204,21 @@ def score_file(in_csv: str, out_csv: str, provider: str, model: str):
     df.to_csv(out_csv, index=False, encoding="utf-8-sig")
     print(f"  Saved to: {out_csv}")
 
+    # Summary breakdown by scoring method
+    method_counts = df["scoring_method"].value_counts()
+    for method, count in method_counts.items():
+        print(f"  {method:12s}: {count} modules")
+
+    # Print RISK SCORING RESULTS
+    print("\nRISK SCORING RESULTS")
+    for q_label in ["Q4 - Test First", "Q3 - Test Second", "Q2 - Test Third", "Q1 - Test Last"]:
+        qdf = df[df["quadrant"] == q_label].head(5)
+        if len(qdf):
+            print(f"{q_label} ({(df['quadrant'] == q_label).sum()} modules):")
+            for _, r in qdf.iterrows():
+                p = int(r.get("probability_score_auto", 3))
+                print(f"  {r['module']:30s} Score:{r['risk_score_final']:>5.0f}  I:{int(r['impact_score'])} P:{p} D:{int(r['detectability_score'])}")
+
 
 def main():
     p = argparse.ArgumentParser()
@@ -210,15 +235,21 @@ def main():
     # 1) Score combined file
     score_file(a.input_csv, a.output_csv, a.provider, a.model)
 
-    # 2) Score each per-version risk_register_<ver>.csv
-    pattern = os.path.join(base_dir, "risk_register_*.csv")
-    for path in sorted(glob.glob(pattern)):
+    # 2) Score each per-version risk_register_<ver>.csv from the versions subfolder
+    ver_dir = os.path.join(base_dir, "risk_register_versions")
+    scored_ver_dir = os.path.join(base_out_dir, "risk_register_versions")
+    os.makedirs(scored_ver_dir, exist_ok=True)
+
+    pattern = os.path.join(ver_dir, "risk_register_*.csv")
+    ver_files = sorted(glob.glob(pattern))
+    if ver_files:
+        print(f"\nScoring {len(ver_files)} per-version files from {ver_dir}/")
+        print(f"Scored outputs -> {scored_ver_dir}/")
+    for path in ver_files:
         name = os.path.basename(path)
-        if name == os.path.basename(a.input_csv):
-            continue  # skip the combined file
         ver_part = name.replace("risk_register_", "").replace(".csv", "")
         out_name = f"risk_register_scored_{ver_part}.csv"
-        out_path = os.path.join(base_out_dir, out_name)
+        out_path = os.path.join(scored_ver_dir, out_name)
         score_file(path, out_path, a.provider, a.model)
 
 

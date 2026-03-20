@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
-"""PDR-I Bug Heatmap Dashboard v2.10
+"""PDR-I Bug Heatmap Dashboard v2.14
 
-Changes from v2.9:
-  - Issue 15: Tab 7 treemap click no longer causes jarring zoom+page-swap animation.
-      (a) Plotly treemap zoom animation killed via transition_duration=0 + uniform_text.
-      (b) Full-page navigation replaced with side-by-side split layout:
-          left 60% = treemap (stays visible), right 40% = bug detail panel.
-      (c) No st.rerun() on click — session_state update alone triggers Streamlit's
-          natural partial re-render which updates only the right panel.
-      (d) Back button removed (no longer needed — treemap always visible).
+Changes from v2.13:
+  - Reverted responsive layout — always uses left/right [6,4] split.
+  - Removed JS width-detection snippet (components.html import gone).
+  - Removed wide_layout / vertical logic and render_detail_panel helper.
 
-Changes from v2.8:
-  - Issue 12: Fixed ECL URL → HandleMainEbug2.asp
-  - Issue 13: Tab 7 treemap click wired to drill-down
+Changes from v2.12:
+  - dynamic treemap height (min 700, max 1100, scales with module count).
+  - right panel scrollable div capped at treemap height.
 
 Usage:
   streamlit run scripts/bug_heatmap_dashboard.py \\
@@ -91,7 +87,7 @@ def is_active(status_val) -> bool:
 
 @st.cache_data
 def load_csv(fp: str) -> pd.DataFrame:
-    df = pd.read_csv(fp)
+    df = pd.read_csv(fp, low_memory=False)
     for dc in ["Create Date", "Closed Date"]:
         if dc in df.columns:
             df[dc] = pd.to_datetime(df[dc], errors="coerce")
@@ -106,20 +102,26 @@ def render_bug_table(frame: pd.DataFrame) -> None:
     display_cols = [c for c in display_cols_wanted if c in frame.columns]
     disp = frame[display_cols].copy()
     bug_code_col = next((c for c in frame.columns if "bugcode" in c.lower()), None)
-    if bug_code_col:
-        disp["ECL Link"] = frame[bug_code_col].apply(
+    if bug_code_col and bug_code_col in disp.columns:
+        # Replace BugCode cell values with the full ECL URL.
+        # display_text regex extracts the BugCode from the URL so the cell
+        # shows e.g. "DRI261841-0001" but is clickable and opens ECL.
+        disp[bug_code_col] = frame[bug_code_col].apply(
             lambda x: ECL_BUG_URL.format(bug_code=x) if pd.notna(x) else ""
         )
         st.dataframe(
             disp,
             column_config={
-                "ECL Link": st.column_config.LinkColumn("ECL Link", display_text="Open 🔗")
+                bug_code_col: st.column_config.LinkColumn(
+                    "BugCode",
+                    display_text=r"BugCode=([^&]+)",
+                )
             },
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )
     else:
-        st.dataframe(disp, use_container_width=True, hide_index=True)
+        st.dataframe(disp, width='stretch', hide_index=True)
 
 
 # ---------------------------------------------------------------------
@@ -146,7 +148,7 @@ active_tab = st.sidebar.radio(
 # Sidebar – load data
 # ---------------------------------------------------------------------
 
-st.sidebar.title("🔥 PDR-I QA Dashboard v2.10")
+st.sidebar.title("🔥 PDR-I QA Dashboard v2.14")
 st.sidebar.markdown("**Step 1 — Bug data** (required)")
 
 ds = st.sidebar.radio("Bug data source", ["Upload CSV", "File Path"], key="ds_bugs", index=1)
@@ -154,7 +156,7 @@ ds = st.sidebar.radio("Bug data source", ["Upload CSV", "File Path"], key="ds_bu
 if ds == "Upload CSV":
     up = st.sidebar.file_uploader("Upload ecl_parsed.csv", type="csv", key="up_bugs")
     if up:
-        df = pd.read_csv(up)
+        df = pd.read_csv(up, low_memory=False)
         for dc in ["Create Date", "Closed Date"]:
             if dc in df.columns:
                 df[dc] = pd.to_datetime(df[dc], errors="coerce")
@@ -222,7 +224,7 @@ risk_df = None
 if rds == "Upload CSV":
     up_r = st.sidebar.file_uploader("Upload risk_register_scored.csv", type="csv", key="up_risk")
     if up_r:
-        risk_df = pd.read_csv(up_r)
+        risk_df = pd.read_csv(up_r, low_memory=False)
 elif rds == "File Path":
     rfp = st.sidebar.text_input(
         "Risk CSV path", value="data/risk_register_scored.csv", key="fp_risk"
@@ -236,7 +238,17 @@ if risk_df is not None:
         st.sidebar.warning("⚠️ Risk CSV missing required columns — ignoring.")
         risk_df = None
     else:
-        st.sidebar.success(f"✅ Risk data loaded: {len(risk_df)} modules")
+        n_unique = risk_df["parsed_module"].nunique()
+        n_rows = len(risk_df)
+        extra = f" ({n_rows} rows across versions)" if n_rows > n_unique else ""
+        st.sidebar.success(f"✅ Risk data loaded: {n_unique} unique modules{extra}")
+        with st.sidebar.expander("🔍 Debug: inspect risk file"):
+            st.write(f"Columns: {list(risk_df.columns)}")
+            st.write(f"Row count: {len(risk_df)}")
+            st.write(f"Unique parsed_module values: {risk_df['parsed_module'].nunique()}")
+            if 'parsed_version' in risk_df.columns:
+                st.write(f"Unique versions in risk file: {sorted(risk_df['parsed_version'].dropna().unique().tolist())}")
+            st.dataframe(risk_df[["parsed_module"] + (['parsed_version'] if 'parsed_version' in risk_df.columns else [])].head(20))
 
 if risk_df is not None:
     risk_cols = [
@@ -245,7 +257,15 @@ if risk_df is not None:
             "impact_score_ai", "detectability_score_ai",
         ] if c in risk_df.columns
     ]
-    df = df.merge(risk_df[risk_cols], on="parsed_module", how="left")
+    # Deduplicate risk data to one row per module before merging.
+    # risk_register_scored.csv may contain one row per module per version;
+    # keeping the highest risk_score_final ensures the most conservative estimate.
+    risk_df_dedup = (
+        risk_df[risk_cols]
+        .sort_values("risk_score_final", ascending=False)
+        .drop_duplicates(subset=["parsed_module"], keep="first")
+    )
+    df = df.merge(risk_df_dedup, on="parsed_module", how="left")
     df["quadrant"] = df.get("quadrant", pd.Series(["Q1"] * len(df))).fillna("Q1")
     df["risk_score_final"] = df.get("risk_score_final", pd.Series([0.0] * len(df))).fillna(0.0)
     risk_available = True
@@ -308,6 +328,29 @@ st.sidebar.markdown(f"**Showing {len(df):,} {active_label}bugs**")
 if active_tab == "🗺️ Module × Severity":
     st.header("Module × Severity Heatmap")
 
+    with st.expander("📖 How to read this chart", expanded=False):
+        st.markdown("""
+**What this shows:** Each row is a module (or category), each column is a severity level.
+Cell colour and number = sum of **severity-weighted** bug counts:
+
+| Severity | Weight | Meaning |
+|----------|--------|---------|
+| S1 — Critical | ×10 | App crash, data loss, showstopper |
+| S2 — Major    | ×5  | Key feature broken, no workaround |
+| S3 — Normal   | ×2  | Feature impaired, workaround exists |
+| S4 — Minor    | ×1  | Cosmetic, low impact |
+
+Weighting means a module with 2 critical bugs ranks higher than one with 20 minor bugs.
+
+**`[Q4]` / `[Q3]` badges** appear next to module names when risk data is loaded (sidebar Step 2).
+They show the module's test priority quadrant — see the Risk Heatmap tab for full detail.
+
+**Click any cell** to instantly filter the drill-down table below to that module + severity.
+
+---
+**Where this data comes from:** Bugs are parsed from the ECL Excel export by `parse_ecl_export.py`. Severity is extracted from the ECL `Severity` column and mapped to S1-S4, with weights S1=10, S2=5, S3=2, S4=1 applied at parse time. The `[Q4]`/`[Q3]` quadrant badges come from `risk_register_scored.csv` loaded in sidebar Step 2 — produced by the I x P x D scoring pipeline described in the Risk Heatmap tab.
+""")
+
     vl = st.radio("View", ["Category", "Module (top 30)"], horizontal=True, key="t1v")
     gc = "module_category" if vl.startswith("C") else "parsed_module"
 
@@ -352,7 +395,7 @@ if active_tab == "🗺️ Module × Severity":
 
     event = st.plotly_chart(
         fig,
-        use_container_width=True,
+        width='stretch',
         on_select="rerun",
         selection_mode=["points"],
         key="heatmap_click",
@@ -392,7 +435,7 @@ if active_tab == "🗺️ Module × Severity":
         st.caption(f"Showing {len(drill_df)} bugs for **{drill_group}** / **{drill_sev}**")
 
     with st.expander("Raw pivot data"):
-        st.dataframe(pv, use_container_width=True)
+        st.dataframe(pv, width='stretch')
 
 
 # =====================================================================
@@ -401,6 +444,23 @@ if active_tab == "🗺️ Module × Severity":
 
 elif active_tab == "📅 Version Timeline":
     st.header("Module × Version Timeline")
+
+    with st.expander("📖 How to read this chart", expanded=False):
+        st.markdown("""
+**What this shows:** Severity-weighted bug counts per module (rows) per version (columns).
+
+**How to use it:**
+- A column that suddenly turns dark red = a bad release for that module — likely a regression.
+- A row that stays consistently warm across all versions = a chronic problem area.
+- Compare the last 3 versions (default filter) to spot recent regressions quickly.
+
+**Severity weighting** is the same as Tab 1: Critical×10, Major×5, Normal×2, Minor×1.
+
+**Tip:** Switch the filter in the sidebar to "All versions" to see the full history.
+
+---
+**Where this data comes from:** `parsed_version` is extracted from the ECL `Version` field by `parse_ecl_export.py`. Severity weighting (S1=10, S2=5, S3=2, S4=1) is stored as `severity_weight` per bug at parse time. `compute_risk_scores.py` also produces one `risk_register_<version>.csv` per version so the full I x P x D scoring can be run per-release if needed.
+""")
 
     if "parsed_version" in df.columns:
         vl2 = st.radio("View", ["Category", "Module (top 25)"], horizontal=True, key="t2v")
@@ -422,7 +482,7 @@ elif active_tab == "📅 Version Timeline":
             text_auto=True,
         )
         fig2.update_layout(height=max(400, len(tl) * 28))
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width='stretch')
     else:
         st.warning("No `parsed_version` column found.")
 
@@ -433,6 +493,41 @@ elif active_tab == "📅 Version Timeline":
 
 elif active_tab == "🏷️ Tag Analysis":
     st.header("Tag Distribution")
+
+    with st.expander("📖 How to read this chart", expanded=False):
+        st.markdown("""
+**Tags** are parsed from the `[TAGS]` prefix in each bug's Short Description.
+For example: `PDR-I 16.2.5 - [EDF][UX] AI Storytelling: subtitle misplaced` → tags `edf`, `ux`.
+
+**Common tags and what they mean:**
+
+| Tag | Meaning |
+|-----|---------|
+| `Side Effect` | Regression bug — something that worked before broke after a code change |
+| `AT Found` | Caught by automated testing (good signal — AT is working) |
+| `EDF` | Engineering Design Flaw — root cause is an architectural/design issue |
+| `UX` | User experience issue |
+| `MUI` | Multi-UI / platform consistency issue |
+
+**Regression Bug Rate (Side Effect %):** Modules with a high rate need extra regression coverage.
+A module at 30%+ side-effect rate means nearly 1 in 3 bugs is a regression — test it every build.
+
+**AT Found Rate:** Percentage of bugs caught by automated tests.
+- Green (≥30%) — good automation coverage
+- Orange (10–29%) — partial coverage, room to improve
+- Red (<10%) — automation blind spot, bugs are slipping through to manual
+
+**Automation Blind Spots** at the bottom lists modules with 0% AT coverage — highest priority for new automation.
+
+---
+**Where tags come from:** `parse_ecl_export.py` reads `[TAG]` prefixes in each bug's Short Description and creates boolean columns: `tag_side_effect`, `tag_at_found`, `tag_edf`, `tag_ux`, `tag_mui`, etc.
+
+These feed directly into the risk scoring pipeline:
+- `regression_rate` = `side_effect_count / total_bugs` — computed in `compute_risk_scores.py`
+- `automation_catch_rate` = `at_found_count / total_bugs` — also from `compute_risk_scores.py`
+
+Both rates feed into **Detectability (D)** in `ai_risk_scorer.py`: a module with 0% AT coverage gets D+1 (harder to detect), pushing its overall I x P x D risk score up.
+""")
 
     tc = [c for c in df.columns if c.startswith("tag_")]
     if tc:
@@ -452,7 +547,7 @@ elif active_tab == "🏷️ Tag Analysis":
             text_auto=True,
         )
         fig3.update_layout(height=max(400, len(tp) * 28))
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width='stretch')
 
         st.subheader("Regression Bug Rate [Side Effect]")
         se = [c for c in tc if "side_effect" in c.lower()]
@@ -469,7 +564,7 @@ elif active_tab == "🏷️ Tag Analysis":
                 title="Top 15 by Regression Bug Rate (%)",
             )
             fig_se.update_layout(height=350, xaxis_tickangle=-30)
-            st.plotly_chart(fig_se, use_container_width=True)
+            st.plotly_chart(fig_se, width='stretch')
 
         st.subheader("Automation Coverage [AT Found Rate]")
         at = [c for c in tc if "at_found" in c.lower()]
@@ -496,12 +591,12 @@ elif active_tab == "🏷️ Tag Analysis":
                 title="AT Found Rate by Module (Green ≥30%, Orange 10–29%, Red <10%)",
             )
             fig_at.update_layout(height=400, xaxis_tickangle=-30)
-            st.plotly_chart(fig_at, use_container_width=True)
+            st.plotly_chart(fig_at, width='stretch')
 
             blind_spots = at_df[at_df["AT Found Rate (%)"] == 0]
             st.subheader(f"🔴 Automation Blind Spots ({len(blind_spots)} modules with 0% AT coverage)")
             if len(blind_spots):
-                st.dataframe(blind_spots, use_container_width=True, hide_index=True)
+                st.dataframe(blind_spots, width='stretch', hide_index=True)
             else:
                 st.success("All modules have AT coverage!")
     else:
@@ -547,7 +642,7 @@ elif active_tab == "⚖️ P/S Alignment":
                 labels={"x": "QA Severity", "y": "RD Priority", "color": "Bug Count"},
             )
             fig4.update_layout(height=350)
-            st.plotly_chart(fig4, use_container_width=True)
+            st.plotly_chart(fig4, width='stretch')
 
             st.markdown("---")
             col1, col2, col3 = st.columns(3)
@@ -583,6 +678,20 @@ elif active_tab == "⚖️ P/S Alignment":
 elif active_tab == "👥 Team Coverage":
     st.header("Tester × Module Coverage")
 
+    with st.expander("📖 How to read this chart", expanded=False):
+        st.markdown("""
+**What this shows:** How many bugs each tester has filed per module category.
+A cell with a high number means that tester has deep experience in that area.
+
+**Knowledge Silos** (flagged below the chart) = a category where only **one** tester has filed bugs.
+This is a bus-factor risk — if that person is unavailable, test coverage for that area drops to zero.
+
+**How to act on this:**
+- Pair the sole expert with a second tester for knowledge transfer.
+- Prioritise those categories for test documentation / runbook creation.
+- Consider cross-training during lower-pressure sprints.
+""")
+
     if "Creator" in df.columns and "module_category" in df.columns:
         cv = df.pivot_table(
             index="Creator", columns="module_category",
@@ -590,7 +699,7 @@ elif active_tab == "👥 Team Coverage":
         )
         fig5 = px.imshow(cv, color_continuous_scale="Greens", aspect="auto", text_auto=True)
         fig5.update_layout(height=max(400, len(cv) * 35))
-        st.plotly_chart(fig5, use_container_width=True)
+        st.plotly_chart(fig5, width='stretch')
 
         st.subheader("Knowledge Silos")
         silos = [cat for cat in cv.columns if (cv[cat] > 0).sum() <= 1]
@@ -609,6 +718,29 @@ elif active_tab == "👥 Team Coverage":
 
 elif active_tab == "📊 KPI Dashboard":
     st.header("Quality KPIs")
+
+    with st.expander("📖 What these KPIs mean", expanded=False):
+        st.markdown("""
+| KPI | What it measures | Why it matters |
+|-----|-----------------|----------------|
+| **Total Bugs** | Active bugs matching current sidebar filters | Filtered baseline — change version/status filters to slice |
+| **Critical Bugs (S1)** | Severity-1 (crash / data loss) open bugs | Any S1 in the release is a potential showstopper |
+| **Avg Days to Close** | Mean calendar days from bug creation to Close status | Measures RD fix velocity; rising trend = backlog pressure |
+| **Regression Bug Rate** | % of bugs tagged `[Side Effect]` | How often new code breaks existing functionality |
+| **Q4 Modules** | Modules scored ≥60 on I×P×D risk scale | Must be tested every single build |
+| **Q3 Modules** | Modules scored 30–59 | Test every sprint / major build |
+| **Avg Risk Score** | Mean I×P×D across all filtered modules | Overall health signal; rising = increasing risk exposure |
+
+**Weekly Bug Trend:** A healthy project shows a declining or flat trend late in a release cycle.
+A spike mid-cycle usually indicates a large merge or new feature landing.
+
+---
+**Where these numbers come from:**
+- Bug counts, severity, and weekly trend: `ecl_parsed.csv` from `parse_ecl_export.py`
+- Q4/Q3 module counts and Avg Risk Score: `risk_register_scored.csv` from `ai_risk_scorer.py`
+- Regression Bug Rate: mean of the `tag_side_effect` boolean column, parsed from `[Side Effect]` tags in ECL
+- Avg Days to Close: computed at parse time from `Create Date` and `Closed Date` in the ECL export
+""")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Bugs (filtered)", f"{len(df):,}")
@@ -647,7 +779,7 @@ elif active_tab == "📊 KPI Dashboard":
             wk.columns = ["Week", "Count"]
             st.plotly_chart(
                 px.line(wk, x="Week", y="Count", markers=True).update_layout(height=300),
-                use_container_width=True,
+                width='stretch',
             )
 
     st.subheader("Severity Distribution")
@@ -658,16 +790,12 @@ elif active_tab == "📊 KPI Dashboard":
             values=sd.values, names=sd.index,
             color_discrete_sequence=["#f44336", "#f57c00", "#fbc02d", "#4caf50"],
         ).update_layout(height=350),
-        use_container_width=True,
+        width='stretch',
     )
 
 
 # =====================================================================
-# TAB 7 – Risk Heatmap  (split layout: treemap left, bug panel right)
-# v2.11 fixes:
-#   - margin t=50 stops category breadcrumb text being clipped
-#   - category click (zoom-out) explicitly clears selection
-#   - removed toggle: module click always sets, never deselects
+# TAB 7 – Risk Heatmap  (always left/right [6,4] split)
 # =====================================================================
 
 elif active_tab == "🔥 Risk Heatmap":
@@ -696,25 +824,143 @@ elif active_tab == "🔥 Risk Heatmap":
     all_modules    = sorted(tm_agg["parsed_module"].dropna().unique().tolist())
     all_categories = sorted(tm_agg["module_category"].dropna().unique().tolist())
 
-    # Color picker above split so it doesn't cause layout shift
+    with st.expander("📖 How the Risk Score works — full pipeline explained", expanded=False):
+        st.markdown("""
+The risk scores shown in this tab are produced by a **3-step pipeline** run before launching the
+dashboard. Here is exactly what each step does and how every number was calculated.
+
+---
+
+### Step 1 — Parse ECL bugs → `ecl_parsed.csv`
+**Script:** `parse_ecl_export.py`
+
+Reads the raw ECL Excel export and extracts structured fields from each bug's Short Description.
+Example: `PDR-I 16.2.5 - [EDF][UX] AI Storytelling: subtitle misplaced`
+
+Key outputs per bug row:
+- `parsed_module` — normalised module name (64 typo aliases resolved, e.g. *HQ Auido Denoise* → *HQ Audio Denoise*)
+- `module_category` — one of 20 top-level categories (222 flat overrides + partial matching)
+- `severity_num` / `severity_weight` — S1=10 pts, S2=5 pts, S3=2 pts, S4=1 pt
+- `tag_side_effect`, `tag_at_found`, `tag_edf`, `tag_ux` etc. — boolean columns from `[TAG]` prefixes
+- `days_to_close`, `builds_to_fix`, `repro_rate` — computed from ECL date and build fields
+
+---
+
+### Step 2 — Aggregate per-module metrics → `risk_register.csv`
+**Script:** `compute_risk_scores.py`
+
+Groups all bugs by module and computes:
+
+| Column | How it is calculated |
+|--------|---------------------|
+| `total_bugs` | Count of all bugs for this module |
+| `severity_weighted_total` | Sum of per-bug weights (S1x10 + S2x5 + S3x2 + S4x1) |
+| `critical_count` / `major_count` | Count of S1 / S2 severity bugs |
+| `regression_rate` | side_effect_count / total_bugs — fraction that are regressions |
+| `automation_catch_rate` | at_found_count / total_bugs — fraction caught by automated tests |
+| `avg_repro_rate` | Mean reproduce probability across all bugs in this module |
+| `avg_days_to_close` | Mean calendar days from bug creation to Close status |
+| `unique_reporters` | Number of distinct testers who have filed bugs here |
+| **`probability_score_auto`** | **Quintile rank of total_bugs across all modules, scored 1–5.** Top 20% most bug-prone = 5, bottom 20% = 1. This is the P in I x P x D. |
+
+Also produces one `risk_register_<version>.csv` per ECL version for per-build analysis.
+
+---
+
+### Step 3 — Score Impact and Detectability → `risk_register_scored.csv`
+**Script:** `ai_risk_scorer.py`   Provider: heuristic / Ollama LLM / OpenAI
+
+#### I — Impact (1–5): How severe is it when this module breaks?
+
+Assigned from a domain knowledge table built by the QA team:
+
+| Score | Example modules | Rationale |
+|-------|----------------|-----------|
+| 5 | Export, AI Storytelling, Auto Edit, Project, Produced Video | Core output — failure = complete feature loss for user |
+| 4 | Image/Text to Video, AI Music Generator, Auto Captions, Camera, Trim | Key features that directly affect the deliverable |
+| 3 | Most mid-tier features | Notable impact but a workaround exists |
+| 2 | Trending, peripheral UI | Low user-visible impact |
+| 1 | Settings, Preferences, Tutorials, Credit pages | Cosmetic or internal only |
+
+**Auto-boost rules applied on top of the table:**
+- `critical_count >= 10` → Impact +1 (capped at 5)
+- `critical_count >= 5` and Impact < 4 → Impact raised to 4
+
+With **Ollama or OpenAI**, the LLM receives module name, category, bug counts, and regression
+rate, reasons about business impact, and returns a score 1–5 with written justification.
+
+#### P — Probability (1–5): How likely is this module to have bugs in the next build?
+
+This is `probability_score_auto` from Step 2 — the quintile rank of historical bug density.
+It is **never overridden by AI**; it is always purely data-driven from ECL history.
+
+#### D — Detectability (1–5): How hard is it to catch bugs before release?
+
+Heuristic calculation (higher = harder to catch = more dangerous to miss):
+
+| Condition | Effect on D |
+|-----------|-------------|
+| Base value | 3 |
+| Automation catch rate > 10% | -1 (AT is finding these bugs) |
+| Automation catch rate > 30% | -1 again (strong AT coverage) |
+| Automation catch rate = 0% | +1 (no automated safety net at all) |
+| Avg reproduce rate < 50% | +1 (intermittent bugs are hard to confirm) |
+| Regression rate > 15% | +1 (side effects are unpredictable) |
+| Final value | clamped to [1, 5] |
+
+With Ollama or OpenAI, the LLM reasons about module complexity and test coverage instead.
+
+---
+
+### Final formula
+
+```
+Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
+```
+
+| Quadrant | Score threshold | Testing cadence |
+|----------|----------------|-----------------|
+| Q4 — Test First  | >= 60 | Every build, every sprint |
+| Q3 — Test Second | 30-59 | Every sprint / major build |
+| Q2 — Standard    | 10-29 | Every release candidate |
+| Q1 — Low Risk    | < 10  | Full release cycle only |
+
+---
+
+### What each visual element shows
+
+| Element | Data source | What it represents |
+|---------|-------------|-------------------|
+| **Block size** | `ecl_parsed.csv` | Bug count for this module |
+| **Colour — Risk Score** | `risk_register_scored.csv` | Final I x P x D value |
+| **Colour — Quadrant** | `risk_register_scored.csv` | Q1–Q4 assignment |
+| **Colour — Critical Count** | `ecl_parsed.csv` | Number of S1 (crash-level) bugs |
+| **Colour — Severity Weight** | `ecl_parsed.csv` | Weighted bug sum S1x10 + S2x5 + S3x2 + S4x1 |
+| **Right detail panel** | Both files joined | Total bugs, critical count, risk score for selected module |
+| **Q4 bar chart** | `risk_register_scored.csv` | Q4 modules ranked by risk score, highest first |
+| **Risk vs Probability scatter** | `risk_register_scored.csv` | I x P x D vs P — shows which are both high-risk AND historically bug-prone |
+
+> **Tip:** Heuristic scores are a strong starting point but should be reviewed with the team.
+> Open `risk_register_scored.csv` in a spreadsheet, adjust any `impact_score` or
+> `detectability_score` values the team disagrees with, then re-run
+> `ai_risk_scorer.py --provider heuristic` to recompute final scores and quadrants.
+""")
+
     color_opt = st.radio(
         "Color by",
         ["Risk Score (LLM)", "Quadrant", "Critical Count", "Severity Weight"],
         horizontal=True, key="tmc",
     )
 
-    # ── Split layout ─────────────────────────────────────────────────
-    col_map, col_detail = st.columns([6, 4])
+    dynamic_height = min(1100, max(700, len(all_modules) * 12))
+
+    col_map, col_detail = st.columns([6, 4], gap="medium")
 
     # ── LEFT: Treemap ────────────────────────────────────────────────
     with col_map:
         current_sel = st.session_state["tm_selected_module"]
         if current_sel:
-            st.caption(
-                f"🔍 **{current_sel}** selected  ·  "
-                f"Click another module to switch  ·  "
-                f"Click the category bar to return to full view"
-            )
+            st.caption(f"🔍 **{current_sel}** selected · click another module to switch")
         else:
             st.caption("Click a module block to view its bugs →")
 
@@ -755,9 +1001,7 @@ elif active_tab == "🔥 Risk Heatmap":
             )
 
         fig_tm.update_layout(
-            height=750,
-            # t=50 gives Plotly's zoom breadcrumb label enough vertical room
-            # to avoid being clipped by the block bounding box
+            height=dynamic_height,
             margin=dict(t=50, l=5, r=5, b=5),
             transition_duration=0,
         )
@@ -768,18 +1012,12 @@ elif active_tab == "🔥 Risk Heatmap":
 
         tm_event = st.plotly_chart(
             fig_tm,
-            use_container_width=True,
+            width='stretch',
             on_select="rerun",
             selection_mode=["points"],
             key="treemap_click",
         )
 
-        # ── Click handler ─────────────────────────────────────────────
-        # Plotly treemap emits on_select in three cases:
-        #   1. Leaf module click    → pts[0]["label"] in all_modules → SET
-        #   2. Category bar click   → pts[0]["label"] not in all_modules → CLEAR
-        #   3. Breadcrumb nav bar   → pts is EMPTY (no data point) → CLEAR
-        # Cases 2 & 3 are both "zoom out" gestures → always clear.
         if tm_event and hasattr(tm_event, "selection"):
             sel = tm_event.selection
             pts = sel.points if hasattr(sel, "points") else sel.get("points", [])
@@ -789,39 +1027,34 @@ elif active_tab == "🔥 Risk Heatmap":
                     pt.get("label") if isinstance(pt, dict)
                     else getattr(pt, "label", None)
                 )
-                if clicked_label and clicked_label in all_modules:
-                    # Leaf module → set
+                if (clicked_label
+                        and clicked_label in all_modules
+                        and clicked_label not in all_categories):
                     cat_row = tm_agg[tm_agg["parsed_module"] == clicked_label]
                     st.session_state["tm_selected_module"] = clicked_label
                     st.session_state["tm_selected_category"] = (
                         cat_row["module_category"].values[0] if len(cat_row) else ""
                     )
-                else:
-                    # Category bar or null label → clear
-                    st.session_state["tm_selected_module"]   = None
-                    st.session_state["tm_selected_category"] = None
-            else:
-                # Empty pts = breadcrumb nav bar clicked → clear
-                st.session_state["tm_selected_module"]   = None
-                st.session_state["tm_selected_category"] = None
-
-
 
     # ── RIGHT: Bug detail panel ──────────────────────────────────────
     with col_detail:
+        st.markdown(
+            f"<div style='max-height:{dynamic_height}px; overflow-y:auto; padding-right:6px;'>",
+            unsafe_allow_html=True,
+        )
+
         selected     = st.session_state["tm_selected_module"]
         selected_cat = st.session_state.get("tm_selected_category", "")
 
         if not selected:
             st.markdown("### 📋 Bug Details")
             st.info("👈 Click a module in the treemap to see its bugs here.")
-
             st.markdown("**Top 5 modules by bug count:**")
             top5 = tm_agg.nlargest(5, "bug_count")[
                 ["parsed_module", "bug_count", "critical_count", "risk_score", "quadrant"]
             ].copy()
             top5.columns = ["Module", "Bugs", "Critical", "Risk Score", "Quadrant"]
-            st.dataframe(top5, use_container_width=True, hide_index=True)
+            st.dataframe(top5, width='stretch', hide_index=True)
 
         else:
             risk_row    = tm_agg[tm_agg["parsed_module"] == selected]
@@ -862,6 +1095,8 @@ elif active_tab == "🔥 Risk Heatmap":
                 render_bug_table(module_bugs)
                 st.caption(f"{len(module_bugs)} bug(s) · severity: **{detail_sev}**")
 
+        st.markdown("</div>", unsafe_allow_html=True)
+
     # ── Supporting charts below ───────────────────────────────────────
     st.markdown("---")
     with st.expander("🌞 Sunburst View"):
@@ -878,7 +1113,7 @@ elif active_tab == "🔥 Risk Heatmap":
                 color_continuous_scale="YlOrRd",
             )
         fig_sb.update_layout(height=600, margin=dict(t=10, l=10, r=10, b=10))
-        st.plotly_chart(fig_sb, use_container_width=True)
+        st.plotly_chart(fig_sb, width='stretch')
 
     with st.expander("📋 Category Summary"):
         cats = (
@@ -893,7 +1128,7 @@ elif active_tab == "🔥 Risk Heatmap":
         )
         cats.columns = ["Category", "Modules", "Total Bugs",
                         "Severity Weight", "Avg Risk Score", "Q4 Modules"]
-        st.dataframe(cats, use_container_width=True, hide_index=True)
+        st.dataframe(cats, width='stretch', hide_index=True)
 
     st.subheader("🔴 Q4 Modules — Test Every Build")
     q4 = tm_agg[tm_agg["quadrant"] == "Q4"].sort_values("risk_score", ascending=False)
@@ -905,7 +1140,7 @@ elif active_tab == "🔥 Risk Heatmap":
             title="Q4 Modules by Risk Score",
         )
         fig_q4.update_layout(height=400, xaxis_tickangle=-30)
-        st.plotly_chart(fig_q4, use_container_width=True)
+        st.plotly_chart(fig_q4, width='stretch')
     else:
         st.info("No Q4 modules in current filter.")
 
@@ -946,4 +1181,4 @@ elif active_tab == "🔥 Risk Heatmap":
                 annotation_text=label, annotation_position="right",
             )
         fig_scatter.update_layout(height=500)
-        st.plotly_chart(fig_scatter, use_container_width=True)
+        st.plotly_chart(fig_scatter, width='stretch')

@@ -9,9 +9,16 @@ warnings.filterwarnings("ignore")
 
 def build_features(df, build_col="Build#", mod_col="parsed_module"):
     df = df.copy()
+    total_before = len(df)
     df[build_col] = pd.to_numeric(df[build_col], errors="coerce")
+    non_numeric = df[build_col].isna().sum()
     df = df.dropna(subset=[build_col, mod_col])
     df[build_col] = df[build_col].astype(int)
+    if non_numeric > 0:
+        print(f"  WARNING: {non_numeric}/{total_before} rows dropped — "
+              f"'{build_col}' values could not be parsed as numbers "
+              f"(e.g. version strings like '16.3.0.2847'). "
+              f"Prediction will use {len(df)} remaining rows.")
     agg = df.groupby([mod_col,build_col]).agg(
         bug_count=("severity_weight","size"), sev_w=("severity_weight","sum"),
         crit=("severity_num",lambda x:(x==1).sum()), major=("severity_num",lambda x:(x==2).sum())

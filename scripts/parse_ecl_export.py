@@ -174,6 +174,9 @@ MODULE_ALIASES.update(
     }
 )
 
+# Lowercase shadow for O(1) case-insensitive alias lookup (built once at import)
+_MODULE_ALIASES_LOWER = {k.lower(): v for k, v in MODULE_ALIASES.items()}
+
 MODULE_CATEGORIES = {
     "AI Features": [
         "AI Storytelling",
@@ -619,16 +622,27 @@ class VersionMappingStore:
         return self._confirmed_cache[version]
 
     def lookup(self, raw: str, version: str) -> Optional[str]:
-        """Lookup order: permanent → all confirmed versions."""
+        """Lookup order: permanent -> all confirmed versions.
+        Confirmed files are loaded once and cached — avoids repeated disk scans
+        across 10k+ bug rows.
+        """
         if raw in self._permanent:
             return self._permanent[raw]
 
-        all_conf = {}
-        for p in sorted(self.versions_dir.glob("*_confirmed.json")):
-            all_conf.update(self._load_json(p))
-        if raw in all_conf:
-            return all_conf[raw]
+        # Build merged confirmed cache once; invalidated only when a new
+        # confirmed entry is written (see _save_json path in normalize_module)
+        if not hasattr(self, "_all_confirmed_cache"):
+            self._all_confirmed_cache = {}
+            for p in sorted(self.versions_dir.glob("*_confirmed.json")):
+                self._all_confirmed_cache.update(self._load_json(p))
+        if raw in self._all_confirmed_cache:
+            return self._all_confirmed_cache[raw]
         return None
+
+    def _invalidate_confirmed_cache(self):
+        """Call after writing any confirmed file to force a cache rebuild."""
+        if hasattr(self, "_all_confirmed_cache"):
+            del self._all_confirmed_cache
 
     def add_pending(self, raw: str, suggested: str, version: str):
         p_path = self.versions_dir / f"{version}_pending.json"
@@ -654,19 +668,28 @@ class VersionMappingStore:
 def normalize_module(raw: str, version: str = "unknown",
                      store: VersionMappingStore = None,
                      fuzzy_threshold: int = 85) -> str:
-    """Normalize raw module string → canonical.
+    """Normalize raw module string -> canonical.
 
-    1. Exact alias
-    2. Mapping store (permanent + confirmed versions)
-    3. Fuzzy match (>= threshold → auto-confirm, 65–threshold → pending)
-    4. Raw string (Uncategorized; flagged for dashboard)
+    1. Strip parenthetical sub-variants e.g. "Auto Edit(Pet 02)" -> "Auto Edit"
+    2. Exact alias
+    3. Mapping store (permanent + confirmed versions)
+    4. Fuzzy match (>= threshold -> auto-confirm, 65-threshold -> pending)
+    5. Raw string (Uncategorized; flagged for dashboard)
     """
     mod = raw.strip()
 
-    # Aliases first
-    for alias, canonical in MODULE_ALIASES.items():
-        if mod.lower() == alias.lower():
-            return canonical
+    # Step 1 - strip sub-variant parentheticals for grouping/matching purposes.
+    # The raw value (e.g. "Auto Edit(Pet 02)") is preserved in parsed_module_raw.
+    # The stripped value (e.g. "Auto Edit") is used for all downstream aggregation.
+    # Only strips if something remains, so "(unknown)" style names are left intact.
+    stripped = re.sub(r'\s*\([^)]*\)', '', mod).strip()
+    if stripped:
+        mod = stripped
+
+    # Aliases: single O(1) dict lookup (case-insensitive via lowercase shadow built at import time)
+    alias_result = _MODULE_ALIASES_LOWER.get(mod.lower())
+    if alias_result:
+        return alias_result
 
     # Mapping store
     if store is not None:
@@ -687,6 +710,7 @@ def normalize_module(raw: str, version: str = "unknown",
                     confirmed[mod] = match
                     store._save_json(confirmed_path, confirmed)
                     store._confirmed_cache[version] = confirmed
+                    store._invalidate_confirmed_cache()
             return match
         elif score >= 65 and store is not None:
             store.add_pending(mod, match, version)
@@ -765,7 +789,8 @@ def parse_ecl_export(
         "parsed_product": [],
         "parsed_version": [],
         "parsed_tags": [],
-        "parsed_module": [],
+        "parsed_module_raw": [],   # original string from ECL e.g. "Auto Edit(Pet 02)"
+        "parsed_module": [],       # normalised + sub-variant stripped e.g. "Auto Edit"
         "parsed_description": [],
         "module_category": [],
     }
@@ -785,12 +810,14 @@ def parse_ecl_export(
             parsed["parsed_version"].append(m.group("version").strip())
             tags_raw = TAG_PATTERN.findall(m.group("tags"))
             parsed["parsed_tags"].append(tags_raw)
+            raw_mod = m.group("module").strip()
             mod = normalize_module(
-                m.group("module"),
+                raw_mod,
                 version=version_hint,
                 store=store,
                 fuzzy_threshold=fuzzy_threshold,
             )
+            parsed["parsed_module_raw"].append(raw_mod)
             parsed["parsed_module"].append(mod)
             parsed["parsed_description"].append(m.group("description").strip())
             parsed["module_category"].append(get_category(mod))
@@ -802,6 +829,7 @@ def parse_ecl_export(
             parsed["parsed_product"].append(None)
             parsed["parsed_version"].append(None)
             parsed["parsed_tags"].append([])
+            parsed["parsed_module_raw"].append(None)
             parsed["parsed_module"].append(None)
             parsed["parsed_description"].append(desc)
             parsed["module_category"].append("Uncategorized")
