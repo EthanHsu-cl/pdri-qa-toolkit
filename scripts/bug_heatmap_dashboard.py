@@ -31,10 +31,10 @@ st.set_page_config(page_title="PDR-I QA Dashboard", layout="wide", page_icon="�
 ECL_BUG_URL = "https://ecl.cyberlink.com/Ebug/eBugHandle/HandleMainEbug2.asp?BugCode={bug_code}"
 
 QUADRANT_COLORS = {
-    "Q4": "#ef4444",
-    "Q3": "#f97316",
-    "Q2": "#eab308",
-    "Q1": "#22c55e",
+    "P1 - Critical": "#ef4444",
+    "P2 - High":     "#f97316",
+    "P3 - Medium":   "#eab308",
+    "P4 - Low":      "#22c55e",
 }
 
 PRIORITY_LABEL_MAP = {
@@ -92,6 +92,22 @@ def load_csv(fp: str) -> pd.DataFrame:
         if dc in df.columns:
             df[dc] = pd.to_datetime(df[dc], errors="coerce")
     return df
+
+
+def normalise_module(name: str) -> str:
+    """Strip parenthetical sub-variants from module names.
+    e.g. "Auto Edit(Pet 02)" -> "Auto Edit"
+         "AI Storytelling (Describe your clips)" -> "AI Storytelling"
+    Also collapses multiple spaces and strips whitespace.
+    """
+    import re
+    if not isinstance(name, str):
+        return name
+    # Remove anything in parentheses (including the parens)
+    name = re.sub(r'\s*\([^)]*\)', '', name)
+    # Collapse multiple spaces
+    name = re.sub(r' +', ' ', name).strip()
+    return name
 
 
 def render_bug_table(frame: pd.DataFrame) -> None:
@@ -205,14 +221,24 @@ if "status_active" not in df.columns:
     else:
         df["status_active"] = True
 
+# Normalise module names — strip sub-variant parentheticals
+# e.g. "Auto Edit(Pet 02)" -> "Auto Edit"
+if "parsed_module" in df.columns:
+    df["parsed_module"] = df["parsed_module"].apply(
+        lambda x: normalise_module(x) if pd.notna(x) else x
+    )
+
 sl_map = {1: "1-Critical", 2: "2-Major", 3: "3-Normal", 4: "4-Minor"}
 if "severity_label" not in df.columns:
     df["severity_label"] = df["severity_num"].map(sl_map)
 
 
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Sidebar – risk data
 # ---------------------------------------------------------------------
+# Source info is stored here; the actual merge happens AFTER the version
+# filter so we can pick the right scored file dynamically.
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Step 2 — Risk scores** (optional, enriches all charts)")
@@ -220,59 +246,30 @@ st.sidebar.markdown("**Step 2 — Risk scores** (optional, enriches all charts)"
 rds = st.sidebar.radio(
     "Risk data source", ["Upload CSV", "File Path", "None"], key="ds_risk", index=1
 )
-risk_df = None
+
+risk_base_path: str = ""
+risk_ver_dir:   str = ""
+risk_uploaded       = None
+
 if rds == "Upload CSV":
-    up_r = st.sidebar.file_uploader("Upload risk_register_scored.csv", type="csv", key="up_risk")
+    up_r = st.sidebar.file_uploader(
+        "Upload risk_register_scored_all.csv", type="csv", key="up_risk"
+    )
     if up_r:
-        risk_df = pd.read_csv(up_r, low_memory=False)
+        risk_uploaded = up_r
 elif rds == "File Path":
     rfp = st.sidebar.text_input(
-        "Risk CSV path", value="data/risk_register_scored.csv", key="fp_risk"
+        "Risk CSV path (combined all-versions file)",
+        value="data/risk_register_scored_all.csv", key="fp_risk",
     )
     if Path(rfp).exists():
-        risk_df = load_csv(rfp)
+        risk_base_path = rfp
+        risk_ver_dir   = str(Path(rfp).parent / "risk_register_versions")
+    elif rfp:
+        st.sidebar.caption("File not found.")
 
-if risk_df is not None:
-    risk_ok = all(c in risk_df.columns for c in ["parsed_module", "risk_score_final", "quadrant"])
-    if not risk_ok:
-        st.sidebar.warning("⚠️ Risk CSV missing required columns — ignoring.")
-        risk_df = None
-    else:
-        n_unique = risk_df["parsed_module"].nunique()
-        n_rows = len(risk_df)
-        extra = f" ({n_rows} rows across versions)" if n_rows > n_unique else ""
-        st.sidebar.success(f"✅ Risk data loaded: {n_unique} unique modules{extra}")
-        with st.sidebar.expander("🔍 Debug: inspect risk file"):
-            st.write(f"Columns: {list(risk_df.columns)}")
-            st.write(f"Row count: {len(risk_df)}")
-            st.write(f"Unique parsed_module values: {risk_df['parsed_module'].nunique()}")
-            if 'parsed_version' in risk_df.columns:
-                st.write(f"Unique versions in risk file: {sorted(risk_df['parsed_version'].dropna().unique().tolist())}")
-            st.dataframe(risk_df[["parsed_module"] + (['parsed_version'] if 'parsed_version' in risk_df.columns else [])].head(20))
-
-if risk_df is not None:
-    risk_cols = [
-        c for c in [
-            "parsed_module", "quadrant", "risk_score_final",
-            "impact_score_ai", "detectability_score_ai",
-        ] if c in risk_df.columns
-    ]
-    # Deduplicate risk data to one row per module before merging.
-    # risk_register_scored.csv may contain one row per module per version;
-    # keeping the highest risk_score_final ensures the most conservative estimate.
-    risk_df_dedup = (
-        risk_df[risk_cols]
-        .sort_values("risk_score_final", ascending=False)
-        .drop_duplicates(subset=["parsed_module"], keep="first")
-    )
-    df = df.merge(risk_df_dedup, on="parsed_module", how="left")
-    df["quadrant"] = df.get("quadrant", pd.Series(["Q1"] * len(df))).fillna("Q1")
-    df["risk_score_final"] = df.get("risk_score_final", pd.Series([0.0] * len(df))).fillna(0.0)
-    risk_available = True
-else:
-    df["quadrant"] = "Unknown"
-    df["risk_score_final"] = 0.0
-    risk_available = False
+if rds != "None" and not risk_base_path and risk_uploaded is None:
+    st.sidebar.info("No risk file found yet — Tab 7 will unlock once loaded.")
 
 
 # ---------------------------------------------------------------------
@@ -296,7 +293,67 @@ if "parsed_version" in df.columns:
     sel_v = st.sidebar.multiselect("Version", vers, default=default_vers)
     if sel_v:
         df = df[df["parsed_version"].isin(sel_v)]
+else:
+    sel_v = []
 
+# Version-aware risk file selection
+# Rule: 1 version selected  -> try per-version scored file first
+#       0 or 2+ selected    -> use combined _all file
+def _load_risk_df(base_path, ver_dir, sel_versions, uploaded):
+    if uploaded is not None:
+        return pd.read_csv(uploaded, low_memory=False)
+    if not base_path:
+        return None
+    if len(sel_versions) == 1:
+        ver_safe = str(sel_versions[0]).replace(" ", "_")
+        ver_path = Path(ver_dir) / f"risk_register_scored_{ver_safe}.csv"
+        if ver_path.exists():
+            return load_csv(str(ver_path))
+        st.sidebar.caption(
+            f"No per-version score file for {sel_versions[0]} — using combined scores."
+        )
+    return load_csv(base_path)
+
+risk_df = _load_risk_df(risk_base_path, risk_ver_dir, sel_v, risk_uploaded)
+
+if risk_df is not None:
+    risk_ok = all(c in risk_df.columns for c in ["parsed_module", "risk_score_final", "quadrant"])
+    if not risk_ok:
+        st.sidebar.warning("Risk CSV missing required columns — ignoring.")
+        risk_df = None
+
+if risk_df is not None:
+    risk_cols = [c for c in [
+        "parsed_module", "quadrant", "risk_score_final",
+        "impact_score", "detectability_score",
+        "impact_score_ai", "detectability_score_ai",
+        "probability_score_auto",
+    ] if c in risk_df.columns]
+
+    risk_df["parsed_module"] = risk_df["parsed_module"].apply(
+        lambda x: normalise_module(x) if pd.notna(x) else x
+    )
+    risk_df_dedup = (
+        risk_df[risk_cols]
+        .sort_values("risk_score_final", ascending=False)
+        .drop_duplicates(subset=["parsed_module"], keep="first")
+    )
+    df = df.merge(risk_df_dedup, on="parsed_module", how="left")
+    df["quadrant"] = df.get("quadrant", pd.Series(["P4 - Low"] * len(df))).fillna("P4 - Low")
+    df["risk_score_final"] = df.get("risk_score_final", pd.Series([0.0] * len(df))).fillna(0.0)
+    risk_available = True
+
+    n_unique    = risk_df_dedup["parsed_module"].nunique()
+    ver_context = (
+        f"version {sel_v[0]}" if len(sel_v) == 1
+        else f"{len(sel_v)} versions selected" if sel_v
+        else "all versions"
+    )
+    st.sidebar.success(f"Risk scores: {n_unique} modules ({ver_context})")
+else:
+    df["quadrant"]        = "Unknown"
+    df["risk_score_final"] = 0.0
+    risk_available         = False
 if "Status" in df.columns:
     stats = sorted(df["Status"].dropna().unique().tolist())
     sel_s = st.sidebar.multiselect("Status", stats, default=stats)
@@ -313,7 +370,7 @@ if "severity_num" in df.columns:
 
 if risk_available:
     all_q = sorted(df["quadrant"].dropna().unique().tolist())
-    sel_q = st.sidebar.multiselect("Quadrant", all_q, default=all_q)
+    sel_q = st.sidebar.multiselect("Priority", all_q, default=all_q)
     if sel_q:
         df = df[df["quadrant"].isin(sel_q)]
 
@@ -342,13 +399,13 @@ Cell colour and number = sum of **severity-weighted** bug counts:
 
 Weighting means a module with 2 critical bugs ranks higher than one with 20 minor bugs.
 
-**`[Q4]` / `[Q3]` badges** appear next to module names when risk data is loaded (sidebar Step 2).
-They show the module's test priority quadrant — see the Risk Heatmap tab for full detail.
+**`[P1]` / `[P2]` badges** appear next to module names when risk data is loaded (sidebar Step 2).
+They show the module's test priority — see the Risk Heatmap tab for full detail.
 
 **Click any cell** to instantly filter the drill-down table below to that module + severity.
 
 ---
-**Where this data comes from:** Bugs are parsed from the ECL Excel export by `parse_ecl_export.py`. Severity is extracted from the ECL `Severity` column and mapped to S1-S4, with weights S1=10, S2=5, S3=2, S4=1 applied at parse time. The `[Q4]`/`[Q3]` quadrant badges come from `risk_register_scored.csv` loaded in sidebar Step 2 — produced by the I x P x D scoring pipeline described in the Risk Heatmap tab.
+**Where this data comes from:** Bugs are parsed from the ECL Excel export by `parse_ecl_export.py`. Severity is extracted from the ECL `Severity` column and mapped to S1-S4, with weights S1=10, S2=5, S3=2, S4=1 applied at parse time. The `[P1]`/`[P2]` priority badges come from `risk_register_scored.csv` loaded in sidebar Step 2 — produced by the I x P x D scoring pipeline described in the Risk Heatmap tab.
 """)
 
     vl = st.radio("View", ["Category", "Module (top 30)"], horizontal=True, key="t1v")
@@ -727,8 +784,8 @@ elif active_tab == "📊 KPI Dashboard":
 | **Critical Bugs (S1)** | Severity-1 (crash / data loss) open bugs | Any S1 in the release is a potential showstopper |
 | **Avg Days to Close** | Mean calendar days from bug creation to Close status | Measures RD fix velocity; rising trend = backlog pressure |
 | **Regression Bug Rate** | % of bugs tagged `[Side Effect]` | How often new code breaks existing functionality |
-| **Q4 Modules** | Modules scored ≥60 on I×P×D risk scale | Must be tested every single build |
-| **Q3 Modules** | Modules scored 30–59 | Test every sprint / major build |
+| **P1 Modules** | Modules scored ≥60 on I×P×D risk scale | Must be tested every single build |
+| **P2 Modules** | Modules scored 30–59 | Test every sprint / major build |
 | **Avg Risk Score** | Mean I×P×D across all filtered modules | Overall health signal; rising = increasing risk exposure |
 
 **Weekly Bug Trend:** A healthy project shows a declining or flat trend late in a release cycle.
@@ -737,7 +794,7 @@ A spike mid-cycle usually indicates a large merge or new feature landing.
 ---
 **Where these numbers come from:**
 - Bug counts, severity, and weekly trend: `ecl_parsed.csv` from `parse_ecl_export.py`
-- Q4/Q3 module counts and Avg Risk Score: `risk_register_scored.csv` from `ai_risk_scorer.py`
+- P1/P2 module counts and Avg Risk Score: `risk_register_scored.csv` from `ai_risk_scorer.py`
 - Regression Bug Rate: mean of the `tag_side_effect` boolean column, parsed from `[Side Effect]` tags in ECL
 - Avg Days to Close: computed at parse time from `Create Date` and `Closed Date` in the ECL export
 """)
@@ -766,8 +823,8 @@ A spike mid-cycle usually indicates a large merge or new feature landing.
         st.markdown("---")
         cr1, cr2, cr3 = st.columns(3)
         q_counts = df.groupby("quadrant").size()
-        cr1.metric("Q4 Modules (Test First)",  int(q_counts.get("Q4", 0)))
-        cr2.metric("Q3 Modules (Test Second)", int(q_counts.get("Q3", 0)))
+        cr1.metric("P1 Modules (Critical)",  int(q_counts.get("P1 - Critical", 0)))
+        cr2.metric("P2 Modules (High)", int(q_counts.get("P2 - High", 0)))
         cr3.metric("Avg Risk Score", f"{df['risk_score_final'].mean():.1f}")
 
     st.markdown("---")
@@ -819,7 +876,7 @@ elif active_tab == "🔥 Risk Heatmap":
     tm_agg = tm_agg[tm_agg["parsed_module"].notna() & (tm_agg["bug_count"] > 0)]
     tm_agg["quadrant"] = tm_agg["parsed_module"].map(
         df.groupby("parsed_module")["quadrant"].first().to_dict()
-    ).fillna("Q1")
+    ).fillna("P4 - Low")
 
     all_modules    = sorted(tm_agg["parsed_module"].dropna().unique().tolist())
     all_categories = sorted(tm_agg["module_category"].dropna().unique().tolist())
@@ -918,12 +975,12 @@ With Ollama or OpenAI, the LLM reasons about module complexity and test coverage
 Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
 ```
 
-| Quadrant | Score threshold | Testing cadence |
+| Priority | Score threshold | Testing cadence |
 |----------|----------------|-----------------|
-| Q4 — Test First  | >= 60 | Every build, every sprint |
-| Q3 — Test Second | 30-59 | Every sprint / major build |
-| Q2 — Standard    | 10-29 | Every release candidate |
-| Q1 — Low Risk    | < 10  | Full release cycle only |
+| P1 — Critical  | >= 60 | Every build, every sprint |
+| P2 — High      | 30-59 | Every sprint / major build |
+| P3 — Medium    | 10-29 | Every release candidate |
+| P4 — Low       | < 10  | Full release cycle only |
 
 ---
 
@@ -933,22 +990,37 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
 |---------|-------------|-------------------|
 | **Block size** | `ecl_parsed.csv` | Bug count for this module |
 | **Colour — Risk Score** | `risk_register_scored.csv` | Final I x P x D value |
-| **Colour — Quadrant** | `risk_register_scored.csv` | Q1–Q4 assignment |
+| **Colour — Priority** | `risk_register_scored.csv` | P1–P4 assignment |
 | **Colour — Critical Count** | `ecl_parsed.csv` | Number of S1 (crash-level) bugs |
 | **Colour — Severity Weight** | `ecl_parsed.csv` | Weighted bug sum S1x10 + S2x5 + S3x2 + S4x1 |
 | **Right detail panel** | Both files joined | Total bugs, critical count, risk score for selected module |
-| **Q4 bar chart** | `risk_register_scored.csv` | Q4 modules ranked by risk score, highest first |
+| **P1 bar chart** | `risk_register_scored.csv` | P1 modules ranked by risk score, highest first |
 | **Risk vs Probability scatter** | `risk_register_scored.csv` | I x P x D vs P — shows which are both high-risk AND historically bug-prone |
 
 > **Tip:** Heuristic scores are a strong starting point but should be reviewed with the team.
 > Open `risk_register_scored.csv` in a spreadsheet, adjust any `impact_score` or
 > `detectability_score` values the team disagrees with, then re-run
-> `ai_risk_scorer.py --provider heuristic` to recompute final scores and quadrants.
+> `ai_risk_scorer.py --provider heuristic` to recompute final scores and priorities.
 """)
+
+    # Version context banner
+    if len(sel_v) == 1:
+        st.info(
+            f"Showing version **{sel_v[0]}** only. "
+            "Risk scores loaded from per-version file where available. "
+            "Clear the filter or select multiple versions to see all-version combined scores."
+        )
+    elif sel_v:
+        st.info(
+            f"Showing {len(sel_v)} versions: {chr(44).join(str(v) for v in sel_v)}. "
+            "Risk scores are from the combined all-versions file."
+        )
+    else:
+        st.info("Showing all versions combined. Risk scores are from the combined all-versions file.")
 
     color_opt = st.radio(
         "Color by",
-        ["Risk Score (LLM)", "Quadrant", "Critical Count", "Severity Weight"],
+        ["Risk Score (LLM)", "Priority", "Critical Count", "Severity Weight"],
         horizontal=True, key="tmc",
     )
 
@@ -974,12 +1046,12 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
                 hover_data={"bug_count": True, "risk_score": ":.1f",
                             "critical_count": True, "quadrant": True},
             )
-        elif color_opt == "Quadrant":
+        elif color_opt == "Priority":
             fig_tm = px.treemap(
                 tm_agg, path=["module_category", "parsed_module"],
                 values="bug_count", color="quadrant",
                 color_discrete_map=QUADRANT_COLORS,
-                labels={"bug_count": "Bugs", "quadrant": "Quadrant",
+                labels={"bug_count": "Bugs", "quadrant": "Priority",
                         "module_category": "Category", "parsed_module": "Module"},
                 hover_data={"bug_count": True, "risk_score": ":.1f", "critical_count": True},
             )
@@ -1053,7 +1125,7 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
             top5 = tm_agg.nlargest(5, "bug_count")[
                 ["parsed_module", "bug_count", "critical_count", "risk_score", "quadrant"]
             ].copy()
-            top5.columns = ["Module", "Bugs", "Critical", "Risk Score", "Quadrant"]
+            top5.columns = ["Module", "Bugs", "Critical", "Risk Score", "Priority"]
             st.dataframe(top5, width='stretch', hide_index=True)
 
         else:
@@ -1073,8 +1145,8 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
             )
 
             quadrant_val = risk_row["quadrant"].values[0] if len(risk_row) else "—"
-            qcolor = {"Q4": "🔴", "Q3": "🟠", "Q2": "🟡", "Q1": "🟢"}.get(quadrant_val, "⚪")
-            st.markdown(f"Quadrant: {qcolor} **{quadrant_val}**")
+            qcolor = {"P1 - Critical": "🔴", "P2 - High": "🟠", "P3 - Medium": "🟡", "P4 - Low": "🟢"}.get(quadrant_val, "⚪")
+            st.markdown(f"Priority: {qcolor} **{quadrant_val}**")
 
             st.markdown("---")
 
@@ -1100,7 +1172,7 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
     # ── Supporting charts below ───────────────────────────────────────
     st.markdown("---")
     with st.expander("🌞 Sunburst View"):
-        if color_opt == "Quadrant":
+        if color_opt == "Priority":
             fig_sb = px.sunburst(
                 tm_agg, path=["module_category", "parsed_module"],
                 values="bug_count", color="quadrant",
@@ -1122,27 +1194,27 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
                 Total_Bugs=("bug_count", "sum"),
                 Severity_Weight=("sev_weight", "sum"),
                 Avg_Risk=("risk_score", "mean"),
-                Q4_Modules=("quadrant", lambda x: (x == "Q4").sum()),
+                P1_Modules=("quadrant", lambda x: (x == "P1 - Critical").sum()),
             )
             .sort_values("Avg_Risk", ascending=False).reset_index()
         )
         cats.columns = ["Category", "Modules", "Total Bugs",
-                        "Severity Weight", "Avg Risk Score", "Q4 Modules"]
+                        "Severity Weight", "Avg Risk Score", "P1 Modules"]
         st.dataframe(cats, width='stretch', hide_index=True)
 
-    st.subheader("🔴 Q4 Modules — Test Every Build")
-    q4 = tm_agg[tm_agg["quadrant"] == "Q4"].sort_values("risk_score", ascending=False)
+    st.subheader("🔴 P1 Modules — Test Every Build")
+    q4 = tm_agg[tm_agg["quadrant"] == "P1 - Critical"].sort_values("risk_score", ascending=False)
     if len(q4):
         fig_q4 = px.bar(
             q4.head(20), x="parsed_module", y="risk_score", color="module_category",
             labels={"parsed_module": "Module", "risk_score": "Risk Score",
                     "module_category": "Category"},
-            title="Q4 Modules by Risk Score",
+            title="P1 Modules by Risk Score",
         )
         fig_q4.update_layout(height=400, xaxis_tickangle=-30)
         st.plotly_chart(fig_q4, width='stretch')
     else:
-        st.info("No Q4 modules in current filter.")
+        st.info("No P1 modules in current filter.")
 
     if risk_df is not None and "probability_score_auto" in risk_df.columns:
         st.subheader("Risk Score vs Probability")

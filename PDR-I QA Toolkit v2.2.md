@@ -508,10 +508,11 @@ Results are published to Allure automatically. Each test shows:
 
 ```bash
 source .venv/bin/activate
-python scripts/parse_ecl_export.py data/ecl_export.xlsx data/ecl_parsed.csv
-python scripts/compute_risk_scores.py data/ecl_parsed.csv data/risk_register.csv
-ollama serve & python scripts/ai_risk_scorer.py data/risk_register.csv data/risk_register_scored.csv --provider ollama --model llama3.1
-python scripts/auto_tag_tests.py data/risk_register_scored.csv --generate-skeletons tests/generated/ --summary
+python scripts/parse_ecl_export.py data/ecl_export.xlsx data/ecl_parsed.csv && \
+python scripts/compute_risk_scores.py data/ecl_parsed.csv data/risk_register_all.csv && \
+ollama serve &>/dev/null & sleep 5 && \
+python scripts/ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv --provider ollama --model llama3.1 && \
+python scripts/auto_tag_tests.py data/risk_register_scored_all.csv --generate-skeletons tests/generated/ --summary && \
 streamlit run scripts/bug_heatmap_dashboard.py --server.address 0.0.0.0 --server.port 8501
 # Upload ecl_parsed.csv (Step 1) then risk_register_scored.csv (Step 2) in sidebar
 ```

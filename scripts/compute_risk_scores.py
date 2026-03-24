@@ -37,13 +37,10 @@ def _compute_risk_core(df: pd.DataFrame) -> pd.DataFrame:
         .rename(columns={"parsed_module": "module"})
     )
 
-    # Single groupby for all tag columns at once instead of one per tag
-    if tag_cols:
-        tag_sums = df.groupby("parsed_module")[tag_cols].sum().reset_index()
-        tag_sums.columns = (
-            ["module"] + [c.replace("tag_", "") + "_count" for c in tag_cols]
-        )
-        agg = agg.merge(tag_sums, on="module", how="left")
+    for tc in tag_cols:
+        t = df.groupby("parsed_module")[tc].sum().reset_index()
+        t.columns = ["module", tc.replace("tag_", "") + "_count"]
+        agg = agg.merge(t, on="module", how="left")
 
     se_col = [c for c in agg.columns if "side_effect" in c.lower()]
     if se_col:
@@ -64,38 +61,15 @@ def _compute_risk_core(df: pd.DataFrame) -> pd.DataFrame:
             agg = agg.merge(m, on="module", how="left")
 
     if "Status" in df.columns:
-        # Single pivot for all status buckets instead of 3 separate groupby+merge calls
-        def _status_bucket(s):
-            sl = str(s).lower()
-            if "open" in sl:      return "open"
-            if "closed" in sl or "close" in sl: return "closed"
-            if "postpone" in sl:  return "postpone"
-            return None
-
-        df["_status_bucket"] = df["Status"].apply(_status_bucket)
-        status_pivot = (
-            df[df["_status_bucket"].notna()]
-            .groupby(["parsed_module", "_status_bucket"])
-            .size()
-            .unstack(fill_value=0)
-            .reset_index()
-        )
-        status_pivot.columns.name = None
-        status_pivot = status_pivot.rename(columns={
-            "parsed_module": "module",
-            "open": "open_count",
-            "closed": "closed_count",
-            "postpone": "postpone_count",
-        })
-        # Ensure all three columns exist even if a bucket had zero rows
-        for col in ["open_count", "closed_count", "postpone_count"]:
-            if col not in status_pivot.columns:
-                status_pivot[col] = 0
-        agg = agg.merge(
-            status_pivot[["module", "open_count", "closed_count", "postpone_count"]],
-            on="module", how="left"
-        )
-        df.drop(columns=["_status_bucket"], inplace=True)
+        for status in ["Open", "Closed", "Postpone"]:
+            s = (
+                df[df["Status"].str.contains(status, case=False, na=False)]
+                .groupby("parsed_module")
+                .size()
+                .reset_index()
+            )
+            s.columns = ["module", f"{status.lower()}_count"]
+            agg = agg.merge(s, on="module", how="left")
 
     if "Creator" in df.columns:
         r = df.groupby("parsed_module")["Creator"].nunique().reset_index()
@@ -131,7 +105,7 @@ def _compute_risk_core(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_risk_all_and_per_version(input_csv: str, output_csv_all: str):
-    df = pd.read_csv(input_csv)
+    df = pd.read_csv(input_csv, low_memory=False)
     print(f"Loaded {len(df)} bugs from {input_csv}")
 
     if "parsed_version" not in df.columns:
@@ -149,14 +123,14 @@ def compute_risk_all_and_per_version(input_csv: str, output_csv_all: str):
         )
     print(f"Saved combined register to: {output_csv_all}")
 
-    # 2) Per-version risk registers — stored in data/risk_register_versions/
+    # 2) Per-version risk registers -- stored under data/risk_register_versions/
     versions = sorted(df["parsed_version"].dropna().unique())
     out_path = Path(output_csv_all)
     base_dir = out_path.parent
-    ver_dir = base_dir / "risk_register_versions"
+    ver_dir  = base_dir / "risk_register_versions"
     ver_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\nPer-version risk registers → {ver_dir}/")
+    print(f"\nPer-version risk registers -> {ver_dir}/")
     for ver in versions:
         df_ver = df[df["parsed_version"] == ver].copy()
         if df_ver.empty:
@@ -164,10 +138,10 @@ def compute_risk_all_and_per_version(input_csv: str, output_csv_all: str):
         agg_ver = _compute_risk_core(df_ver)
         ver_safe = str(ver).replace(" ", "_")
         ver_out = ver_dir / f"risk_register_{ver_safe}.csv"
-        agg_ver["parsed_version"] = ver  # keep version for later AI filter
+        agg_ver["parsed_version"] = ver  # keep version for later AI scoring
         agg_ver.to_csv(ver_out, index=False, encoding="utf-8-sig")
         print(
-            f"  {ver:15s} -> {len(agg_ver):4d} modules  -> {ver_dir.name}/{ver_out.name}"
+            f"  {ver:15s} -> {len(agg_ver):4d} modules  -> risk_register_versions/{ver_out.name}"
         )
 
 

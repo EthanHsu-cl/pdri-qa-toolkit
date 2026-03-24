@@ -174,7 +174,19 @@ MODULE_ALIASES.update(
     }
 )
 
-# Lowercase shadow for O(1) case-insensitive alias lookup (built once at import)
+# Only 4 aliases are hardcoded — ones that automatic rules in normalize_module
+# cannot handle: leading/trailing punctuation and pure acronyms.
+# Everything else (sub-variants, comma lists, > separators, typos, locale/device
+# suffixes) is resolved automatically by normalize_module's strip + split logic,
+# or falls through to fuzzy matching -> pending.json for one-time confirmation.
+MODULE_ALIASES.update({
+    "]Launcher":    "Launcher",        # leading bracket corrupts name
+    "IAP)":         "IAP",             # trailing bracket, nothing before it
+    "IAP/B Group)": "IAP",             # mixed punctuation
+    "STT":          "Text to Speech",  # pure acronym, no word overlap
+})
+
+# Lowercase shadow for O(1) alias lookup — rebuilt after all updates
 _MODULE_ALIASES_LOWER = {k.lower(): v for k, v in MODULE_ALIASES.items()}
 
 MODULE_CATEGORIES = {
@@ -623,14 +635,12 @@ class VersionMappingStore:
 
     def lookup(self, raw: str, version: str) -> Optional[str]:
         """Lookup order: permanent -> all confirmed versions.
-        Confirmed files are loaded once and cached — avoids repeated disk scans
-        across 10k+ bug rows.
+        Confirmed files loaded once and cached to avoid repeated disk
+        scans across 10k+ bug rows.
         """
         if raw in self._permanent:
             return self._permanent[raw]
 
-        # Build merged confirmed cache once; invalidated only when a new
-        # confirmed entry is written (see _save_json path in normalize_module)
         if not hasattr(self, "_all_confirmed_cache"):
             self._all_confirmed_cache = {}
             for p in sorted(self.versions_dir.glob("*_confirmed.json")):
@@ -643,7 +653,6 @@ class VersionMappingStore:
         """Call after writing any confirmed file to force a cache rebuild."""
         if hasattr(self, "_all_confirmed_cache"):
             del self._all_confirmed_cache
-
     def add_pending(self, raw: str, suggested: str, version: str):
         p_path = self.versions_dir / f"{version}_pending.json"
         pending = self._load_json(p_path)
@@ -671,33 +680,55 @@ def normalize_module(raw: str, version: str = "unknown",
     """Normalize raw module string -> canonical.
 
     1. Strip parenthetical sub-variants e.g. "Auto Edit(Pet 02)" -> "Auto Edit"
-    2. Exact alias
+    2. O(1) alias lookup via lowercase shadow dict
     3. Mapping store (permanent + confirmed versions)
     4. Fuzzy match (>= threshold -> auto-confirm, 65-threshold -> pending)
     5. Raw string (Uncategorized; flagged for dashboard)
     """
     mod = raw.strip()
 
-    # Step 1 - strip sub-variant parentheticals for grouping/matching purposes.
-    # The raw value (e.g. "Auto Edit(Pet 02)") is preserved in parsed_module_raw.
-    # The stripped value (e.g. "Auto Edit") is used for all downstream aggregation.
-    # Only strips if something remains, so "(unknown)" style names are left intact.
+    # Step 1: normalise compound module strings automatically.
+    #
+    # (a) Strip parenthetical sub-variants:
+    #     "Auto Edit(Pet 02)"          -> "Auto Edit"
+    #     "AI Storytelling (Music)"    -> "AI Storytelling"
+    #     "Text(Neon_01)"              -> "Text"
     stripped = re.sub(r'\s*\([^)]*\)', '', mod).strip()
     if stripped:
         mod = stripped
 
-    # Aliases: single O(1) dict lookup (case-insensitive via lowercase shadow built at import time)
+    # (b) Take first token of comma-separated multi-module strings:
+    #     "Text, title, MGT"           -> "Text"
+    #     "Add Media, Media picker"    -> "Add Media"
+    #     "Launcher, Shortcut"         -> "Launcher"
+    #     "Audio, Music, My Music"     -> "Audio"
+    if "," in mod:
+        first = mod.split(",")[0].strip()
+        if first:  # guard against leading-comma edge cases
+            mod = first
+
+    # (c) Handle "Parent>Child" and "Parent/Child" notation:
+    #     "Menu>Sign in"               -> "Menu"
+    #     "Audio> GettyImage Music"    -> "Audio"
+    for sep in (">", ):
+        if sep in mod:
+            first = mod.split(sep)[0].strip()
+            if first:
+                mod = first
+                break
+
+    # Step 2: O(1) alias lookup (case-insensitive via lowercase shadow dict)
     alias_result = _MODULE_ALIASES_LOWER.get(mod.lower())
     if alias_result:
         return alias_result
 
-    # Mapping store
+    # Step 3: Mapping store (permanent + confirmed versions)
     if store is not None:
         result = store.lookup(mod, version)
         if result:
             return result
 
-    # Fuzzy match
+    # Step 4: Fuzzy match
     if FUZZY_AVAILABLE and len(mod) >= 4:
         match, score, _ = process.extractOne(
             mod, _CANONICAL_MODULES, scorer=fuzz.token_sort_ratio
@@ -716,7 +747,6 @@ def normalize_module(raw: str, version: str = "unknown",
             store.add_pending(mod, match, version)
 
     return mod
-
 
 def get_category(module_name: str) -> str:
     cat = _FLAT_OVERRIDES.get(module_name)
@@ -789,8 +819,8 @@ def parse_ecl_export(
         "parsed_product": [],
         "parsed_version": [],
         "parsed_tags": [],
-        "parsed_module_raw": [],   # original string from ECL e.g. "Auto Edit(Pet 02)"
-        "parsed_module": [],       # normalised + sub-variant stripped e.g. "Auto Edit"
+        "parsed_module_raw": [],   # original ECL string e.g. "Auto Edit(Pet 02)"
+        "parsed_module": [],       # normalised + stripped e.g. "Auto Edit"
         "parsed_description": [],
         "module_category": [],
     }

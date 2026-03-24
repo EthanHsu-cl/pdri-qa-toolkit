@@ -5,11 +5,11 @@ Behavior:
 
 Given a combined risk register (ALL versions), this script will:
 
-  - Score the combined file → risk_register_scored_all.csv
-  - Score each per-version risk register found in the same directory:
-        risk_register_<version>.csv
-    and save:
-        risk_register_scored_<version>.csv
+  - Score the combined file -> risk_register_scored_all.csv
+  - Score each per-version risk register found in data/risk_register_versions/:
+        risk_register_versions/risk_register_<version>.csv
+    and save to the same subfolder:
+        risk_register_versions/risk_register_scored_<version>.csv
 
 No extra arguments needed.
 
@@ -25,17 +25,13 @@ import pandas as pd, numpy as np
 import urllib.request
 
 
-# All keys are explicitly lowercase — lookup uses .lower() so case never matters
 IMPACT_OVERRIDES = {
-    "export": 5, "produced video": 5, "ai storytelling": 5, "auto edit": 5, "project": 5,
-    "new project": 5, "auto edit project": 4, "image to video": 4, "text to video": 4,
-    "ai art": 4, "ai music generator": 4, "auto captions": 4, "video enhance": 4,
-    "video enhancer": 4, "ai video upscaler": 4, "camera": 4, "trim": 4,
-    "split": 3, "timeline": 3, "pip": 3, "text to speech": 3, "voice cloning": 3,
-    "settings": 1, "preference": 1, "tutorials & tips": 1, "credit": 1,
-    "more": 1, "my artwork": 1, "trending": 2, "vip benefit page": 3,
-    "sign in": 2, "notification": 2, "analytics": 1, "mixpanel": 1,
-    "setup": 1, "demo": 1, "shortcut": 2,
+    "export":5,"produced video":5,"ai storytelling":5,"auto edit":5,"project":5,
+    "new project":5,"auto edit project":4,"image to video":4,"text to video":4,
+    "ai art":4,"ai music generator":4,"auto captions":4,"video enhance":4,
+    "camera":4,"trim":4,"split":3,"settings":1,"preference":1,
+    "tutorials & tips":1,"credit":1,"more":1,"my artwork":1,
+    "trending":2,"vip benefit page":3,
 }
 
 
@@ -88,37 +84,31 @@ def score_ollama(row, model="llama3.1"):
         headers={"Content-Type": "application/json"},
     )
 
-    max_retries = 2
-    for attempt in range(max_retries + 1):
+    try:
+        resp = urllib.request.urlopen(req, timeout=120)
+        raw = resp.read().decode(errors="replace")
+        envelope = json.loads(raw)
+        text = envelope.get("response", "").strip()
+
         try:
-            resp = urllib.request.urlopen(req, timeout=120)
-            raw = resp.read().decode(errors="replace")
-            envelope = json.loads(raw)
-            text = envelope.get("response", "").strip()
+            obj = json.loads(text)
+        except json.JSONDecodeError:
+            m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+            if not m:
+                raise
+            obj = json.loads(m.group(0))
 
-            try:
-                obj = json.loads(text)
-            except json.JSONDecodeError:
-                m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-                if not m:
-                    raise
-                obj = json.loads(m.group(0))
+        impact = int(obj.get("impact", 3))
+        detect = int(obj.get("detectability", 3))
+        reason = str(obj.get("reasoning", ""))
 
-            impact = int(obj.get("impact", 3))
-            detect = int(obj.get("detectability", 3))
-            reason = str(obj.get("reasoning", ""))
+        impact = max(1, min(5, impact))
+        detect = max(1, min(5, detect))
+        return impact, detect, "ollama", reason
 
-            impact = max(1, min(5, impact))
-            detect = max(1, min(5, detect))
-            return impact, detect, "ollama", reason
-
-        except Exception as e:
-            if attempt < max_retries:
-                print(f" Ollama attempt {attempt+1} failed for {mod}: {e} — retrying...")
-                time.sleep(2)
-            else:
-                print(f" Ollama failed for {mod} after {max_retries+1} attempts (model={model}): {e} — falling back to heuristic")
-                return score_heuristic(row)
+    except Exception as e:
+        print(f" Ollama failed for {mod} (model={model}): {e}")
+        return score_heuristic(row)
 
 
 def score_openai(row):
@@ -165,10 +155,10 @@ def score_openai(row):
 
 
 def assign_quadrant(score):
-    if score >= 60: return "Q4 - Test First"
-    if score >= 30: return "Q3 - Test Second"
-    if score >= 10: return "Q2 - Test Third"
-    return "Q1 - Test Last"
+    if score >= 60: return "P1 - Critical"
+    if score >= 30: return "P2 - High"
+    if score >= 10: return "P3 - Medium"
+    return "P4 - Low"
 
 
 def score_file(in_csv: str, out_csv: str, provider: str, model: str):
@@ -178,46 +168,82 @@ def score_file(in_csv: str, out_csv: str, provider: str, model: str):
     if "parsed_module" not in df.columns and "module" in df.columns:
         df["parsed_module"] = df["module"]
 
-    impacts, detects, methods, reasons = [], [], [], []
-    for i, (_, row) in enumerate(df.iterrows()):
+    # Resume support: if the output file already exists, load previously scored
+    # rows and skip them — so an interrupted run continues from where it stopped.
+    already_scored: set = set()
+    if os.path.exists(out_csv):
+        try:
+            prev = pd.read_csv(out_csv)
+            # Only treat a row as complete if it has a real score (not the 0 placeholder)
+            done = prev[
+                (prev["impact_score"] > 0) & (prev["detectability_score"] > 0)
+            ]["module"]
+            already_scored = set(done.dropna().tolist())
+            if already_scored:
+                print(f"  Resuming: {len(already_scored)} modules already scored, "
+                      f"{len(df) - len(already_scored)} remaining.")
+                # Merge existing scores back into df so we don't lose them
+                score_cols = ["module", "impact_score", "detectability_score",
+                              "scoring_method", "ai_reasoning"]
+                score_cols = [c for c in score_cols if c in prev.columns]
+                df = df.merge(prev[score_cols], on="module", how="left",
+                              suffixes=("", "_prev"))
+                for col in ["impact_score", "detectability_score",
+                            "scoring_method", "ai_reasoning"]:
+                    if col + "_prev" in df.columns:
+                        df[col] = df[col + "_prev"].combine_first(df.get(col))
+                        df.drop(columns=[col + "_prev"], inplace=True)
+        except Exception as e:
+            print(f"  Warning: could not load previous output ({e}) — scoring from scratch.")
+            already_scored = set()
+
+    # Ensure score columns exist before the loop
+    for col in ["impact_score", "detectability_score", "scoring_method", "ai_reasoning"]:
+        if col not in df.columns:
+            df[col] = None
+
+    total       = len(df)
+    skipped     = len(already_scored)
+    to_score    = total - skipped
+    done_so_far = 0
+
+    for i, (idx, row) in enumerate(df.iterrows()):
+        module_name = str(row.get("module", ""))
+        if module_name in already_scored:
+            continue  # already have a valid score for this module
+
         if provider == "heuristic":
             r = score_heuristic(row)
         elif provider == "ollama":
             r = score_ollama(row, model=model)
-            if i % 10 == 0:
-                print(f"  Progress: {i+1}/{len(df)}")
         else:
             r = score_openai(row)
             time.sleep(0.5)
-        impacts.append(r[0]); detects.append(r[1]); methods.append(r[2]); reasons.append(r[3])
 
-    df["impact_score"] = impacts
-    df["detectability_score"] = detects
-    df["scoring_method"] = methods
-    df["ai_reasoning"] = reasons
+        df.at[idx, "impact_score"]      = r[0]
+        df.at[idx, "detectability_score"] = r[1]
+        df.at[idx, "scoring_method"]    = r[2]
+        df.at[idx, "ai_reasoning"]      = r[3]
+        done_so_far += 1
+
+        # Progress reporting
+        if provider in ("ollama", "openai") and done_so_far % 5 == 0:
+            print(f"  Progress: {done_so_far}/{to_score} scored "
+                  f"({skipped} resumed, {total} total)")
+
+        # Checkpoint: save to disk every 10 modules so a crash loses at most 10
+        if done_so_far % 10 == 0:
+            df.to_csv(out_csv, index=False, encoding="utf-8-sig")
 
     prob = df["probability_score_auto"] if "probability_score_auto" in df.columns else 3
-    df["risk_score_final"] = df["impact_score"] * prob * df["detectability_score"]
+    df["risk_score_final"] = df["impact_score"].astype(float) * prob * df["detectability_score"].astype(float)
     df["quadrant"] = df["risk_score_final"].apply(assign_quadrant)
     df = df.sort_values("risk_score_final", ascending=False)
 
     df.to_csv(out_csv, index=False, encoding="utf-8-sig")
     print(f"  Saved to: {out_csv}")
-
-    # Summary breakdown by scoring method
-    method_counts = df["scoring_method"].value_counts()
-    for method, count in method_counts.items():
-        print(f"  {method:12s}: {count} modules")
-
-    # Print RISK SCORING RESULTS
-    print("\nRISK SCORING RESULTS")
-    for q_label in ["Q4 - Test First", "Q3 - Test Second", "Q2 - Test Third", "Q1 - Test Last"]:
-        qdf = df[df["quadrant"] == q_label].head(5)
-        if len(qdf):
-            print(f"{q_label} ({(df['quadrant'] == q_label).sum()} modules):")
-            for _, r in qdf.iterrows():
-                p = int(r.get("probability_score_auto", 3))
-                print(f"  {r['module']:30s} Score:{r['risk_score_final']:>5.0f}  I:{int(r['impact_score'])} P:{p} D:{int(r['detectability_score'])}")
+    if skipped:
+        print(f"  Resumed {skipped} previously scored modules, scored {done_so_far} new.")
 
 
 def main():
@@ -235,18 +261,22 @@ def main():
     # 1) Score combined file
     score_file(a.input_csv, a.output_csv, a.provider, a.model)
 
-    # 2) Score each per-version risk_register_<ver>.csv from the versions subfolder
-    ver_dir = os.path.join(base_dir, "risk_register_versions")
+    # 2) Score each per-version file from data/risk_register_versions/
+    ver_dir        = os.path.join(base_dir, "risk_register_versions")
     scored_ver_dir = os.path.join(base_out_dir, "risk_register_versions")
     os.makedirs(scored_ver_dir, exist_ok=True)
 
-    pattern = os.path.join(ver_dir, "risk_register_*.csv")
+    pattern   = os.path.join(ver_dir, "risk_register_*.csv")
     ver_files = sorted(glob.glob(pattern))
     if ver_files:
         print(f"\nScoring {len(ver_files)} per-version files from {ver_dir}/")
         print(f"Scored outputs -> {scored_ver_dir}/")
+    else:
+        print(f"\nNo per-version files found in {ver_dir}/ — skipping per-version scoring.")
+        print("Re-run compute_risk_scores.py to generate them.")
+
     for path in ver_files:
-        name = os.path.basename(path)
+        name     = os.path.basename(path)
         ver_part = name.replace("risk_register_", "").replace(".csv", "")
         out_name = f"risk_register_scored_{ver_part}.csv"
         out_path = os.path.join(scored_ver_dir, out_name)
