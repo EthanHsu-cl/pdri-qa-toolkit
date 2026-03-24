@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
-"""PDR-I ECL Export Parser v2.3
+"""PDR-I ECL Export Parser v2.4
+
+Changes from v2.3:
+
+  - JSON input support (n8n webhook integration):
+      * Accepts .json files produced by fetch_from_n8n.py in addition to
+        .xlsx / .csv files. The JSON must be a list of bug objects, each using
+        the exact field names returned by the n8n "Get Columns_v3" Set node:
+            Short Description, Severity, Priority, Status,
+            Create Date, Closed Date, Version, Build#, Close Build#,
+            BugCode, Creator, BugBelong, Handler
+      * Column name normalisation on load: maps n8n output names to the
+        internal names the rest of the pipeline expects (e.g. "Create Date",
+        "Closed Date", "Build#", "Close Build#").  This means the JSON from
+        the webhook can be fed in directly without any manual renaming.
+      * Reproduce Probability is absent from the API — repro_rate defaults to
+        0.5 for all JSON-sourced bugs (same as the "no repro column" fallback).
 
 Changes from v2.2:
 
@@ -20,9 +36,15 @@ Changes from v2.2:
       * Adds `priority_num` and human-readable `priority_label` columns:
           1 = Fix Now, 2 = Must Fix, 3 = Better Fix, 4 = No Matter, 5 = N/A.
 
-Usage:
-  python scripts/parse_ecl_export.py data/ecl_export.xlsx data/ecl_parsed.csv \
-    --mapping-dir data/module_mappings --fuzzy-threshold 85
+Usage (Excel / CSV — original):
+  python scripts/parse_ecl_export.py data/ecl_export.xlsx data/ecl_parsed.csv
+
+Usage (JSON from n8n webhook — new):
+  python scripts/fetch_from_n8n.py --output data/ecl_raw.json
+  python scripts/parse_ecl_export.py data/ecl_raw.json data/ecl_parsed.csv
+
+  Or in one step:
+  python scripts/fetch_from_n8n.py --then-parse
 """
 import re
 import sys
@@ -797,8 +819,51 @@ def parse_ecl_export(
     fuzzy_threshold: int = 85,
 ):
     ext = Path(input_path).suffix.lower()
-    df = pd.read_excel(input_path) if ext in [".xlsx", ".xls"] else pd.read_csv(input_path)
-    print(f"Loaded {len(df)} bugs")
+    if ext == ".json":
+        with open(input_path, "r", encoding="utf-8") as _f:
+            _raw = json.load(_f)
+        # Accept either a plain list or n8n's wrapped {"json": {...}} shape
+        if isinstance(_raw, list):
+            _records = [
+                r["json"] if (isinstance(r, dict) and "json" in r) else r
+                for r in _raw
+            ]
+        else:
+            _records = [_raw]
+        df = pd.DataFrame(_records)
+
+        # ── Normalise n8n column names to the names the parser expects ──
+        # The n8n "Get Columns_v3" Set node outputs these exact names; map
+        # them to canonical internal names so no downstream code changes.
+        # All names happen to already match — this is an explicit contract so
+        # future n8n renames are fixed in one place.
+        _N8N_COL_MAP = {
+            "Short Description" : "Short Description",
+            "Severity"          : "Severity",
+            "Priority"          : "Priority",
+            "Status"            : "Status",
+            "Create Date"       : "Create Date",
+            "Closed Date"       : "Closed Date",
+            "Version"           : "Version",
+            "Build#"            : "Build#",
+            "Close Build#"      : "Close Build#",
+            "Creator"           : "Creator",
+            "BugCode"           : "BugCode",
+            "BugBelong"         : "BugBelong",
+            "Handler"           : "Handler",
+        }
+        df.rename(
+            columns={k: v for k, v in _N8N_COL_MAP.items() if k in df.columns},
+            inplace=True,
+        )
+        print(f"Loaded {len(df)} bugs from JSON (n8n webhook output)")
+        print(f"  Columns: {sorted(df.columns.tolist())}")
+    elif ext in (".xlsx", ".xls"):
+        df = pd.read_excel(input_path)
+        print(f"Loaded {len(df)} bugs from Excel")
+    else:
+        df = pd.read_csv(input_path)
+        print(f"Loaded {len(df)} bugs from CSV")
 
     store = VersionMappingStore(Path(mapping_dir))
 
@@ -980,8 +1045,8 @@ def parse_ecl_export(
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="PDR-I ECL Export Parser v2.3")
-    parser.add_argument("input", help="Input Excel/CSV file")
+    parser = argparse.ArgumentParser(description="PDR-I ECL Export Parser v2.4")
+    parser.add_argument("input", help="Input file: .xlsx, .csv, or .json (n8n webhook output)")
     parser.add_argument("output", help="Output CSV file")
     parser.add_argument(
         "--mapping-dir",
