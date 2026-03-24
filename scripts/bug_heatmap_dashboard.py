@@ -1099,9 +1099,21 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
                     pt.get("label") if isinstance(pt, dict)
                     else getattr(pt, "label", None)
                 )
+                # Use the Plotly `parent` field to distinguish a module node from a
+                # category node. Category nodes have an empty parent (they sit at the
+                # root level), while module nodes have a non-empty parent that is the
+                # category name. This correctly handles the edge case where a module
+                # shares the same name as its category (e.g. "Shortcut" module inside
+                # the "Shortcut" category) — the old `not in all_categories` check
+                # would silently drop the click in that situation.
+                clicked_parent = (
+                    pt.get("parent") if isinstance(pt, dict)
+                    else getattr(pt, "parent", None)
+                )
+                is_module_node = bool(clicked_parent)  # empty string / None = category root
                 if (clicked_label
                         and clicked_label in all_modules
-                        and clicked_label not in all_categories):
+                        and is_module_node):
                     cat_row = tm_agg[tm_agg["parsed_module"] == clicked_label]
                     st.session_state["tm_selected_module"] = clicked_label
                     st.session_state["tm_selected_category"] = (

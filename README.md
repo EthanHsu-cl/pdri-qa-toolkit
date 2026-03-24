@@ -1,9 +1,17 @@
-# PDR-I QA Toolkit v2.3 — Complete Step-by-Step Implementation Guide
+# PDR-I QA Toolkit v2.4 — Complete Step-by-Step Implementation Guide
 
 > Mac Mini M1 · Python 3.14 · Appium · Jenkins · Streamlit  
-> Updated from v2.2 based on session changes.
+> Updated from v2.3 based on session changes.
 
 ***
+
+## What Changed in v2.4
+
+| File | Change |
+|------|--------|
+| `bug_heatmap_dashboard.py` | **v2.14** — Fixed treemap click detection for modules whose name matches their category name (e.g. the "Shortcut" module inside the "Shortcut" category was silently ignored). Root cause: the old guard `clicked_label not in all_categories` evaluated to `False` when label and category are identical. Fix: replaced name-based check with Plotly's `parent` field — category-root nodes have an empty `parent`, module-leaf nodes always have a non-empty `parent`, so the two are unambiguously distinguished. Also reverted responsive layout back to a fixed left/right `[6, 4]` column split; removed the JS width-detection snippet (`components.html` import); removed `wide_layout` / vertical layout logic and the `render_detail_panel` helper. v2.12: dynamic treemap height (min 700 px, max 1100 px, scales with module count); scrollable right panel div capped at treemap height. |
+
+---
 
 ## What Changed in v2.3
 
@@ -19,22 +27,22 @@
 
 ## File Inventory
 
-| # | File | Purpose |
-|---|------|---------|
-| 1 | `scripts/parse_ecl_export.py` | Parse ECL Excel → enriched CSV |
-| 2 | `scripts/compute_risk_scores.py` | Module metric aggregation → risk register |
-| 3 | `scripts/ai_risk_scorer.py` | Impact/Detectability scoring (heuristic/Ollama/OpenAI) |
-| 4 | `scripts/auto_tag_tests.py` | pytest skeleton generator |
-| 5 | `scripts/bug_heatmap_dashboard.py` | Streamlit dashboard — 7 tabs, dual-input |
-| 6 | `scripts/cluster_bugs.py` | TF-IDF + K-Means/DBSCAN clustering |
-| 7 | `scripts/predict_defects.py` | Gradient Boosting defect prediction |
-| 8 | `scripts/visual_regression.py` | Screenshot diff engine |
-| 9 | `Jenkinsfile` | Q4→Q3→Q2→Q1 CI/CD pipeline |
-| 10 | `tests/conftest.py` | Appium + visual regression fixtures |
-| 11 | `pytest.ini` | Marker registration |
-| 12 | `requirements.txt` | Python dependencies |
-| 13 | `tests/test_ai_storytelling.py` | Example Q4 test |
-| 14 | `setup_mac_mini.sh` | One-command M1 setup + LaunchAgent |
+| # | File | Version | Purpose |
+|---|------|---------|---------|
+| 1 | `scripts/parse_ecl_export.py` | v2.3 | Parse ECL Excel → enriched CSV |
+| 2 | `scripts/compute_risk_scores.py` | v2.3 | Module metric aggregation → risk register |
+| 3 | `scripts/ai_risk_scorer.py` | v2.3 | Impact/Detectability scoring (heuristic/Ollama/OpenAI) |
+| 4 | `scripts/auto_tag_tests.py` | v2.1 | pytest skeleton generator |
+| 5 | `scripts/bug_heatmap_dashboard.py` | v2.14 | Streamlit dashboard — 7 tabs, dual-input |
+| 6 | `scripts/cluster_bugs.py` | v2.2 | TF-IDF + K-Means/DBSCAN clustering |
+| 7 | `scripts/predict_defects.py` | v2.1 | Gradient Boosting defect prediction |
+| 8 | `scripts/visual_regression.py` | v2.1 | Screenshot diff engine |
+| 9 | `Jenkinsfile` | — | Q4→Q3→Q2→Q1 CI/CD pipeline |
+| 10 | `tests/conftest.py` | — | Appium + visual regression fixtures |
+| 11 | `pytest.ini` | — | Marker registration |
+| 12 | `requirements.txt` | — | Python dependencies |
+| 13 | `tests/test_ai_storytelling.py` | — | Example Q4 test |
+| 14 | `setup_mac_mini.sh` | — | One-command M1 setup + LaunchAgent |
 
 ***
 
@@ -392,7 +400,7 @@ The dashboard automatically resolves per-version scored files from `data/risk_re
 | 4 | Priority vs Severity | Bug-level | QA severity vs RD priority mismatch matrix |
 | 5 | Team Coverage | Bug-level | Tester × Category matrix — knowledge silo detection |
 | 6 | KPI Dashboard | Bug-level + Risk | Total bugs, critical count, weekly trend, severity pie. Q4 count + avg risk score when risk data loaded |
-| 7 | Risk Heatmap | **Risk-scored** | Interactive treemap. Version-aware: shows per-version or combined scores based on sidebar filter. Click any module to see its bugs in the right panel. |
+| 7 | Risk Heatmap | **Risk-scored** | Interactive treemap. Version-aware: shows per-version or combined scores based on sidebar filter. Click any module to see its bugs in the right panel. Module click detection uses Plotly's `parent` field (v2.14) so modules whose name matches their category (e.g. "Shortcut") are correctly handled. |
 
 Each tab has a **📖 How to read this chart** expander explaining the data source, what the numbers mean, and how the scores were calculated.
 
@@ -592,6 +600,7 @@ In the dashboard sidebar: set **Step 1** path to `data/ecl_parsed.csv`, set **St
 | Dashboard: "Wrong file!" on ecl_parsed.csv | File is risk_register_scored_all.csv (lacks `severity_num`) | Use `ecl_parsed.csv` from Step 2.2 |
 | Dashboard: Tab 7 shows warning, not treemap | Risk data not loaded in sidebar Step 2 | Set path to `risk_register_scored_all.csv` in sidebar |
 | Dashboard: "No per-version score file" caption | Per-version scoring not yet run | Run `ai_risk_scorer.py` — it auto-scores all files in `risk_register_versions/` |
+| Dashboard: clicking a module block shows nothing (right panel stays empty) | Module name is identical to its parent category name (e.g. "Shortcut" module inside "Shortcut" category) — fixed in v2.14 | Update to `bug_heatmap_dashboard.py` v2.14; the fix uses Plotly's `parent` field instead of the name-based category exclusion |
 | Port 8501 not available | Previous Streamlit instance still running | `lsof -i :8501` then `kill -9 <PID>` |
 | Parse rate below 90% | Non-standard Short Description format or new module patterns | Check `*_pending.json` files; confirm suggestions or add alias for truly unparseable strings |
 | 1000+ uncategorized modules | `parse_ecl_export.py` is the old version without auto-strip | Replace with v2.3 and delete `module_mappings/versions/*_pending.json`, then re-run |
