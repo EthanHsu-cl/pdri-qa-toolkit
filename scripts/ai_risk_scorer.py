@@ -227,9 +227,7 @@ def score_file(in_csv: str, out_csv: str, provider: str, model: str):
         done_so_far += 1
 
         # Progress reporting
-        if provider in ("ollama", "openai") and done_so_far % 5 == 0:
-            print(f"  Progress: {done_so_far}/{to_score} scored "
-                  f"({skipped} resumed, {total} total)")
+        print(f"  [{done_so_far}/{to_score}] {module_name} -> I={r[0]} D={r[1]} ({r[2]})")
 
         # Checkpoint: save to disk every 10 modules so a crash loses at most 10
         if done_so_far % 10 == 0:
@@ -244,6 +242,21 @@ def score_file(in_csv: str, out_csv: str, provider: str, model: str):
     print(f"  Saved to: {out_csv}")
     if skipped:
         print(f"  Resumed {skipped} previously scored modules, scored {done_so_far} new.")
+
+    # Summary breakdown by scoring method
+    method_counts = df["scoring_method"].value_counts()
+    for method, count in method_counts.items():
+        print(f"  {method:12s}: {count} modules")
+
+    # Print RISK SCORING RESULTS
+    print("\nRISK SCORING RESULTS")
+    for q_label in ["P1 - Critical", "P2 - High", "P3 - Medium", "P4 - Low"]:
+        qdf = df[df["quadrant"] == q_label].head(5)
+        if len(qdf):
+            print(f"{q_label} ({(df['quadrant'] == q_label).sum()} modules):")
+            for _, r in qdf.iterrows():
+                p = int(r.get("probability_score_auto", 3))
+                print(f"  {r['module']:30s} Score:{r['risk_score_final']:>5.0f}  I:{int(r['impact_score'])} P:{p} D:{int(r['detectability_score'])}")
 
 
 def main():
