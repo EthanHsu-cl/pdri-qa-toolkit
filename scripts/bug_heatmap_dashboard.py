@@ -671,12 +671,15 @@ elif active_tab == "⚖️ P/S Alignment":
         st.markdown("""
 **QA assigns Severity (S1–S4). RD assigns Priority (Fix Now → N/A).**
 
-| | RD: N/A (not triaged) | RD: Low priority (No Matter) | RD: High priority (Fix Now/Must Fix) |
-|---|---|---|---|
-| **QA: S1–S2 (Critical/Major)** | 🔴 **Urgent Gap** — critical bug not yet triaged by RD | 🔴 **Mismatch** — escalate to RD | ✅ Aligned |
-| **QA: S3–S4 (Normal/Minor)** | ⚪ Expected — low priority bugs often untriaged | ✅ Aligned | 🟡 **Inverse** — RD fast-tracked something QA rates minor, verify scope |
+The chart has **RD Priority on the Y axis (rows)** and **QA Severity on the X axis (columns)**.
 
-**Priority 5 = N/A** means RD has not assigned a priority yet.
+| RD Priority (rows) ↓ \\ QA Severity (columns) → | **S1–S2 (Critical/Major)** | **S3–S4 (Normal/Minor)** |
+|---|---|---|
+| **Fix Now / Must Fix** | ✅ Aligned | 🟡 **Inverse** — RD fast-tracked something QA rates minor; verify scope with RD |
+| **Better Fix / No Matter** | 🔴 **Mismatch** — high-severity bug deprioritised by RD; escalate | ✅ Aligned |
+| **N/A (not yet triaged)** | 🔴 **Urgent Gap** — critical bug not yet triaged by RD | ⚪ Expected — low-severity bugs often untriaged |
+
+**Priority N/A** means RD has not assigned a priority yet. Bugs on the **diagonal** (top-left and bottom-right) are well-aligned. Bugs in the **top-right or bottom-left** cells are mismatches worth investigating.
 """)
 
     if "priority_label" in df.columns and "severity_num" in df.columns:
