@@ -136,7 +136,7 @@ def compute_risk_all_and_per_version(input_csv: str, output_csv_all: str):
         if df_ver.empty:
             continue
         agg_ver = _compute_risk_core(df_ver)
-        ver_safe = str(ver).replace(" ", "_")
+        ver_safe = str(ver).replace(" ", "_").replace(".", "_")
         ver_out = ver_dir / f"risk_register_{ver_safe}.csv"
         agg_ver["parsed_version"] = ver  # keep version for later AI scoring
         agg_ver.to_csv(ver_out, index=False, encoding="utf-8-sig")

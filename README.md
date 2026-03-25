@@ -1,11 +1,22 @@
-# PDR-I QA Toolkit v2.4 — Complete Step-by-Step Implementation Guide
+# PDR-I QA Toolkit v2.5 — Complete Step-by-Step Implementation Guide
 
 > Mac Mini M1 · Python 3.14 · Appium · Jenkins · Streamlit  
-> Updated from v2.3 based on session changes.
+> Updated from v2.4 based on session changes.
 
 ***
 
+## What Changed in v2.5
+
+| File | Change |
+|------|--------|
+| `parse_ecl_export.py` | **v2.4** — JSON input support for n8n webhook integration. Accepts `.json` files (list of bug objects) produced by `fetch_from_n8n.py` in addition to `.xlsx` / `.csv`. Handles both plain list and n8n's `{"json": {...}}` wrapped shape. Applies `_N8N_COL_MAP` remapping table so the webhook's output field names (`Short Description`, `Create Date`, `Closed Date`, `Build#`, `Close Build#`) map explicitly to internal parser names — all downstream pipeline code unchanged. `Reproduce Probability` is absent from the API; `repro_rate` defaults to `0.5` for all JSON-sourced rows (same as the existing no-repro-column fallback). |
+| `fetch_from_n8n.py` | **New script.** POSTs to the n8n webhook, normalises the n8n item-wrapper shape, audits that all required fields are present (warns on optional missing fields), saves the flat list to `data/ecl_raw.json`. Run with `--then-parse` to chain directly into `parse_ecl_export.py` in one command. |
+| `Dashboard_Query_eBug_List_v3.json` | **Updated n8n workflow.** Renames the `Get Columns_v2` Set node to `Get Columns_v3` with corrected field mappings using the real API field names confirmed from a live sample response: `$json.Build` → `Build#`, `$json.CloseToBuild` → `Close Build#`, `$json.ShortDescription` → `Short Description`, `$json.CreateTime` → `Create Date`, `$json.CloseTime` → `Closed Date`. Adds `Creator` and `Handler` pass-through fields. Removes the fragile `TemplateName.split(ProductName)` expression for `ProjectName` (field unused downstream). |
+
+---
+
 ## What Changed in v2.4
+
 
 | File | Change |
 |------|--------|
@@ -29,7 +40,7 @@
 
 | # | File | Version | Purpose |
 |---|------|---------|---------|
-| 1 | `scripts/parse_ecl_export.py` | v2.3 | Parse ECL Excel → enriched CSV |
+| 1 | `scripts/parse_ecl_export.py` | v2.4 | Parse ECL Excel / CSV / n8n JSON → enriched CSV |
 | 2 | `scripts/compute_risk_scores.py` | v2.3 | Module metric aggregation → risk register |
 | 3 | `scripts/ai_risk_scorer.py` | v2.3 | Impact/Detectability scoring (heuristic/Ollama/OpenAI) |
 | 4 | `scripts/auto_tag_tests.py` | v2.1 | pytest skeleton generator |
@@ -43,6 +54,8 @@
 | 12 | `requirements.txt` | — | Python dependencies |
 | 13 | `tests/test_ai_storytelling.py` | — | Example Q4 test |
 | 14 | `setup_mac_mini.sh` | — | One-command M1 setup + LaunchAgent |
+| 15 | `scripts/fetch_from_n8n.py` | v1.0 | Fetch bugs from n8n webhook → `data/ecl_raw.json` |
+| 16 | `n8n/Dashboard_Query_eBug_List_v3.json` | v3 | n8n workflow — queries eCL eBug API and returns normalised bug records |
 
 ***
 
@@ -56,7 +69,8 @@ pdri-qa-toolkit/
 ├── Jenkinsfile
 ├── README.md
 ├── data/
-│   ├── ecl_export.xlsx                    ← you provide this (ECL export)
+│   ├── ecl_export.xlsx                    ← you provide this (ECL export, optional)
+│   ├── ecl_raw.json                       ← Step 2.1b output (from n8n webhook)
 │   ├── ecl_parsed.csv                     ← Step 2.2 output
 │   ├── risk_register_all.csv              ← Step 3.1 output (combined)
 │   ├── risk_register_scored_all.csv       ← Step 3.2 output ← Dashboard Step 2 input
@@ -71,6 +85,7 @@ pdri-qa-toolkit/
 │   ├── predictions.csv                    ← Step 6.2 output
 │   └── quadrant_summary.md               ← Step 3.3 output
 ├── scripts/
+│   ├── fetch_from_n8n.py
 │   ├── parse_ecl_export.py
 │   ├── compute_risk_scores.py
 │   ├── ai_risk_scorer.py
@@ -79,6 +94,8 @@ pdri-qa-toolkit/
 │   ├── cluster_bugs.py
 │   ├── predict_defects.py
 │   └── visual_regression.py
+├── n8n/
+│   └── Dashboard_Query_eBug_List_v3.json  ← import into n8n to enable webhook
 ├── tests/
 │   ├── conftest.py
 │   ├── test_ai_storytelling.py
@@ -148,7 +165,57 @@ Expected output: `All packages OK` and Appium version number.
 
 ## Phase 2 — ECL Data Export & Parsing (Days 2–3)
 
-### Step 2.1 — Export Bug Data from ECL
+There are now **two ways** to get bug data into the pipeline. Use whichever fits your workflow.
+
+---
+
+### Path A — n8n Webhook (recommended for regular refreshes)
+
+#### Step 2.1a — Import the n8n Workflow
+
+1. Open your n8n instance
+2. Import `n8n/Dashboard_Query_eBug_List_v3.json`
+3. Activate the workflow — the webhook endpoint is now live
+
+#### Step 2.1b — Fetch Bugs via Webhook
+
+```bash
+source .venv/bin/activate
+python scripts/fetch_from_n8n.py   --webhook-url https://your-n8n-host/webhook/82746bb5-e140-4720-98a3-d1965900274d   --output data/ecl_raw.json
+```
+
+Or fetch and parse in one command:
+
+```bash
+python scripts/fetch_from_n8n.py   --webhook-url https://your-n8n-host/webhook/82746bb5-e140-4720-98a3-d1965900274d   --then-parse
+```
+
+**What fields the API provides:**
+
+| Field delivered | Maps to parser column | Notes |
+|---|---|---|
+| `ShortDescription` | `Short Description` | Module, tags, version all parsed from this |
+| `EbugSeverity` (int) | `Severity` | Integer `1`–`4` |
+| `EbugPriority` (int) | `Priority` | Integer `1`–`5` |
+| `Status` | `Status` | Exact match |
+| `CreateTime` | `Create Date` | ISO datetime |
+| `CloseTime` | `Closed Date` | ISO datetime, nullable |
+| `Version` | `Version` | e.g. `16.3.5` |
+| `Build` | `Build#` | Numeric build ID |
+| `CloseToBuild` | `Close Build#` | Nullable |
+| `Creator` | `Creator` | Username string |
+| `BugCode` | `BugCode` | Used for dashboard ECL links |
+| `BugBelong` | `BugBelong` | RD / QA attribution |
+| `Handler` | `Handler` | Current assignee |
+| `Reproduce Probability` | — | **Not in API** — `repro_rate` defaults to `0.5` |
+
+Then proceed to **Step 2.2**.
+
+---
+
+### Path B — Manual ECL Excel Export (original method)
+
+#### Step 2.1b — Export Bug Data from ECL
 
 1. Log into ECL
 2. Navigate to bug export
@@ -167,12 +234,23 @@ Expected output: `All packages OK` and Appium version number.
 5. Export as **Excel (.xlsx)**
 6. Save to `data/ecl_export.xlsx`
 
-### Step 2.2 — Parse the Export
+---
 
+### Step 2.2 — Parse the Data
+
+**From n8n JSON (Path A):**
+```bash
+source .venv/bin/activate
+python scripts/parse_ecl_export.py data/ecl_raw.json data/ecl_parsed.csv
+```
+
+**From Excel export (Path B):**
 ```bash
 source .venv/bin/activate
 python scripts/parse_ecl_export.py data/ecl_export.xlsx data/ecl_parsed.csv
 ```
+
+The parser now accepts `.json`, `.xlsx`, and `.csv` inputs transparently — all produce the same `ecl_parsed.csv` output format.
 
 What it does:
 - Parses every Short Description in format `PDR-I 16.2.5 - [EDF][UX] AI Storytelling: subtitle misplaced`
@@ -448,10 +526,16 @@ Every Monday morning (or after each ECL export):
 cd ~/pdri-qa-toolkit
 source .venv/bin/activate
 
-# 1. Export fresh data from ECL → save as data/ecl_export.xlsx
+# 1a. Fetch fresh data via n8n webhook (recommended)
+python scripts/fetch_from_n8n.py \
+  --webhook-url https://your-n8n-host/webhook/82746bb5-e140-4720-98a3-d1965900274d \
+  --output data/ecl_raw.json
 
-# 2. Re-parse
-python scripts/parse_ecl_export.py data/ecl_export.xlsx data/ecl_parsed.csv
+# 1b. Or export manually from ECL → save as data/ecl_export.xlsx
+
+# 2. Re-parse (works with both .json and .xlsx inputs)
+python scripts/parse_ecl_export.py data/ecl_raw.json data/ecl_parsed.csv
+# or: python scripts/parse_ecl_export.py data/ecl_export.xlsx data/ecl_parsed.csv
 
 # 3. Re-score (only needed if quadrant assignments need updating)
 python scripts/compute_risk_scores.py data/ecl_parsed.csv data/risk_register_all.csv
@@ -553,7 +637,7 @@ Results are published to Allure automatically. Each test shows:
 
 | Day | Task | Time |
 |-----|------|------|
-| Monday | Export fresh ECL data → parse + risk score | 30 min |
+| Monday | Fetch fresh ECL data via n8n webhook (or manual export) → parse + risk score | 20 min |
 | Monday | Review pending mappings in `module_mappings/versions/` | 10 min |
 | Monday | Review dashboard for new hotspots | 15 min |
 | Wednesday | Review Allure report, update failing tests | 1 hr |
@@ -579,6 +663,19 @@ Results are published to Allure automatically. Each test shows:
 
 ## Quick Reference — Full Pipeline (One Command)
 
+**Via n8n webhook (Path A):**
+```bash
+source .venv/bin/activate && \
+python scripts/fetch_from_n8n.py \
+  --webhook-url https://your-n8n-host/webhook/82746bb5-e140-4720-98a3-d1965900274d \
+  --then-parse && \
+python scripts/compute_risk_scores.py data/ecl_parsed.csv data/risk_register_all.csv && \
+python scripts/ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv --provider ollama --model llama3.1 && \
+python scripts/auto_tag_tests.py data/risk_register_scored_all.csv --generate-skeletons tests/generated/ --summary && \
+streamlit run scripts/bug_heatmap_dashboard.py --server.address 0.0.0.0 --server.port 8501
+```
+
+**Via manual Excel export (Path B):**
 ```bash
 source .venv/bin/activate && \
 python scripts/parse_ecl_export.py data/ecl_export.xlsx data/ecl_parsed.csv && \
@@ -611,3 +708,8 @@ In the dashboard sidebar: set **Step 1** path to `data/ecl_parsed.csv`, set **St
 | `cluster_bugs.py` not enough terms | Module has very few unique bug descriptions | Expected — script handles gracefully |
 | Visual regression too sensitive | Minor font rendering differences | Raise threshold: `export VISUAL_THRESHOLD=0.92` |
 | Appium can't find device | `DEVICE_NAME` mismatch | Run `idevice_id -l` and use exact device UUID |
+| `fetch_from_n8n.py`: connection error | n8n not running or wrong URL | Check n8n is active; verify webhook URL matches the imported workflow |
+| `fetch_from_n8n.py`: missing required fields | n8n `Get Columns_v3` Set node misconfigured | Re-import `Dashboard_Query_eBug_List_v3.json`; the script lists which fields are absent |
+| `fetch_from_n8n.py`: empty response | n8n date range filter returns no bugs | Check the `CreateTime` range in the eCL eBug query node; try widening the range |
+| `repro_rate` all 0.5 after JSON parse | `Reproduce Probability` is not in the eCL API response | Expected — 0.5 is the correct default; Detectability scoring is unaffected |
+| JSON parse: "Short Description column not found" | n8n workflow still using old `Get Columns_v2` node | Re-import `Dashboard_Query_eBug_List_v3.json` which outputs `Short Description` correctly |

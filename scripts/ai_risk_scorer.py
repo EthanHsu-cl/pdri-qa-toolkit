@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PDR-I AI Risk Scorer v2.3 - urllib3 fixed, default model qwen3:7b
+"""PDR-I AI Risk Scorer v2.4
 
 Behavior:
 
@@ -15,6 +15,8 @@ No extra arguments needed.
 
 Usage:
   python ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv --provider heuristic
+  python ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv --provider ollama --model llama3.1
+  python ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv --provider ollama --verbose
 """
 import warnings
 warnings.filterwarnings("ignore", message="urllib3.*OpenSSL")
@@ -57,7 +59,6 @@ def score_heuristic(row):
 
 def score_ollama(row, model="llama3.1"):
     mod = row.get("module", "Unknown")
-
     prompt = (
         "You are a QA risk analyst.\n"
         "Return ONLY a JSON object, no extra text.\n"
@@ -70,26 +71,22 @@ def score_ollama(row, model="llama3.1"):
         f"RegressionRate: {row.get('regression_rate', 0):.3f}\n"
         f"AutomationCatchRate: {row.get('automation_catch_rate', 0):.3f}\n"
     )
-
     payload = json.dumps({
         "model": model,
         "prompt": prompt,
         "stream": False,
         "format": "json",
     }).encode()
-
     req = urllib.request.Request(
         "http://localhost:11434/api/generate",
         data=payload,
         headers={"Content-Type": "application/json"},
     )
-
     try:
         resp = urllib.request.urlopen(req, timeout=120)
         raw = resp.read().decode(errors="replace")
         envelope = json.loads(raw)
         text = envelope.get("response", "").strip()
-
         try:
             obj = json.loads(text)
         except json.JSONDecodeError:
@@ -97,17 +94,14 @@ def score_ollama(row, model="llama3.1"):
             if not m:
                 raise
             obj = json.loads(m.group(0))
-
         impact = int(obj.get("impact", 3))
         detect = int(obj.get("detectability", 3))
         reason = str(obj.get("reasoning", ""))
-
         impact = max(1, min(5, impact))
         detect = max(1, min(5, detect))
         return impact, detect, "ollama", reason
-
     except Exception as e:
-        print(f" Ollama failed for {mod} (model={model}): {e}")
+        print(f"    Ollama failed for {mod} (model={model}): {e}")
         return score_heuristic(row)
 
 
@@ -115,7 +109,6 @@ def score_openai(row):
     api_key = os.environ.get("OPENAI_API_KEY","")
     if not api_key:
         return score_heuristic(row)
-
     mod = row.get("module","Unknown")
     msgs = [
         {"role":"system","content":"You are a QA risk analyst. Return only JSON."},
@@ -150,7 +143,7 @@ def score_openai(row):
                 obj.get("reasoning",""),
             )
     except Exception as e:
-        print(f" OpenAI failed for {mod}: {e}")
+        print(f"    OpenAI failed for {mod}: {e}")
     return score_heuristic(row)
 
 
@@ -161,28 +154,40 @@ def assign_quadrant(score):
     return "P4 - Low"
 
 
-def score_file(in_csv: str, out_csv: str, provider: str, model: str):
+def score_file(in_csv: str, out_csv: str, provider: str, model: str, verbose: bool = False):
     df = pd.read_csv(in_csv)
     print(f"\nScoring {len(df)} modules from {in_csv}")
 
     if "parsed_module" not in df.columns and "module" in df.columns:
         df["parsed_module"] = df["module"]
 
-    # Resume support: if the output file already exists, load previously scored
-    # rows and skip them — so an interrupted run continues from where it stopped.
     already_scored: set = set()
     if os.path.exists(out_csv):
         try:
             prev = pd.read_csv(out_csv)
-            # Only treat a row as complete if it has a real score (not the 0 placeholder)
+
+            prev_modules = set(prev["module"].dropna())
+            curr_modules = set(df["module"].dropna())
+            dropped = prev_modules - curr_modules
+            if dropped:
+                print(f"  WARNING: {len(dropped)} modules from previous run are missing in current input:")
+                for m in sorted(dropped):
+                    print(f"    - {m}")
+                print("  These will be dropped from output. Re-check your fetch/parse pipeline.")
+
             done = prev[
                 (prev["impact_score"] > 0) & (prev["detectability_score"] > 0)
             ]["module"]
             already_scored = set(done.dropna().tolist())
+
             if already_scored:
-                print(f"  Resuming: {len(already_scored)} modules already scored, "
-                      f"{len(df) - len(already_scored)} remaining.")
-                # Merge existing scores back into df so we don't lose them
+                unscored_in_current = [m for m in df["module"] if m not in already_scored]
+                print(f"  Resuming: {len(already_scored)} modules in cache, "
+                      f"{len(unscored_in_current)} remaining.")
+                # ADD THIS — skip everything if nothing left to score
+                if not unscored_in_current:
+                    print("  All modules already scored. Nothing to do.")
+                    return  # ← early exit
                 score_cols = ["module", "impact_score", "detectability_score",
                               "scoring_method", "ai_reasoning"]
                 score_cols = [c for c in score_cols if c in prev.columns]
@@ -194,23 +199,26 @@ def score_file(in_csv: str, out_csv: str, provider: str, model: str):
                         df[col] = df[col + "_prev"].combine_first(df.get(col))
                         df.drop(columns=[col + "_prev"], inplace=True)
         except Exception as e:
-            print(f"  Warning: could not load previous output ({e}) — scoring from scratch.")
+            print(f"  Warning: could not load previous output ({e}) -- scoring from scratch.")
             already_scored = set()
 
-    # Ensure score columns exist before the loop
     for col in ["impact_score", "detectability_score", "scoring_method", "ai_reasoning"]:
         if col not in df.columns:
             df[col] = None
 
     total       = len(df)
     skipped     = len(already_scored)
-    to_score    = total - skipped
+    to_score    = max(0, total - skipped)
     done_so_far = 0
 
-    for i, (idx, row) in enumerate(df.iterrows()):
+    print(f"  {chr(9472) * 78}")
+    print(f"  {'#':>4}  {'Module':<30}  {'I':>2} {'P':>2} {'D':>2}  {'Risk':>6}  {'Quadrant':<14}  Reasoning")
+    print(f"  {chr(9472) * 78}")
+
+    for idx, row in df.iterrows():
         module_name = str(row.get("module", ""))
         if module_name in already_scored:
-            continue  # already have a valid score for this module
+            continue
 
         if provider == "heuristic":
             r = score_heuristic(row)
@@ -220,81 +228,111 @@ def score_file(in_csv: str, out_csv: str, provider: str, model: str):
             r = score_openai(row)
             time.sleep(0.5)
 
-        df.at[idx, "impact_score"]      = r[0]
+        df.at[idx, "impact_score"]        = r[0]
         df.at[idx, "detectability_score"] = r[1]
-        df.at[idx, "scoring_method"]    = r[2]
-        df.at[idx, "ai_reasoning"]      = r[3]
+        df.at[idx, "scoring_method"]      = r[2]
+        df.at[idx, "ai_reasoning"]        = r[3]
         done_so_far += 1
 
-        # Progress reporting
-        print(f"  [{done_so_far}/{to_score}] {module_name} -> I={r[0]} D={r[1]} ({r[2]})")
+        prob_val        = float(row.get("probability_score_auto", 3))
+        risk_inline     = r[0] * prob_val * r[1]
+        quadrant_inline = assign_quadrant(risk_inline)
+        reason_display  = r[3][:55] + "..." if len(r[3]) > 55 else r[3]
 
-        # Checkpoint: save to disk every 10 modules so a crash loses at most 10
-        if done_so_far % 10 == 0:
+        print(
+            f"  [{done_so_far:>3}/{to_score}]  {module_name:<30}"
+            f"  {r[0]:>2} {int(prob_val):>2} {r[1]:>2}"
+            f"  {risk_inline:>6.0f}  {quadrant_inline:<14}"
+            f"  {reason_display}"
+        )
+        if verbose:
+            print(f"           Full reasoning: {r[3]}")
+
+        if done_so_far > 0 and done_so_far % 10 == 0:
             df.to_csv(out_csv, index=False, encoding="utf-8-sig")
 
     prob = df["probability_score_auto"] if "probability_score_auto" in df.columns else 3
     df["risk_score_final"] = df["impact_score"].astype(float) * prob * df["detectability_score"].astype(float)
     df["quadrant"] = df["risk_score_final"].apply(assign_quadrant)
     df = df.sort_values("risk_score_final", ascending=False)
-
     df.to_csv(out_csv, index=False, encoding="utf-8-sig")
-    print(f"  Saved to: {out_csv}")
-    if skipped:
-        print(f"  Resumed {skipped} previously scored modules, scored {done_so_far} new.")
 
-    # Summary breakdown by scoring method
-    method_counts = df["scoring_method"].value_counts()
-    for method, count in method_counts.items():
-        print(f"  {method:12s}: {count} modules")
+    print(f"\n  {'=' * 78}")
+    print(f"  RISK SCORING SUMMARY  --  {os.path.basename(in_csv)}")
+    print(f"  {'=' * 78}")
 
-    # Print RISK SCORING RESULTS
-    print("\nRISK SCORING RESULTS")
     for q_label in ["P1 - Critical", "P2 - High", "P3 - Medium", "P4 - Low"]:
-        qdf = df[df["quadrant"] == q_label].head(5)
-        if len(qdf):
-            print(f"{q_label} ({(df['quadrant'] == q_label).sum()} modules):")
-            for _, r in qdf.iterrows():
-                p = int(r.get("probability_score_auto", 3))
-                print(f"  {r['module']:30s} Score:{r['risk_score_final']:>5.0f}  I:{int(r['impact_score'])} P:{p} D:{int(r['detectability_score'])}")
+        qdf = df[df["quadrant"] == q_label].sort_values("risk_score_final", ascending=False)
+        if qdf.empty:
+            continue
+        print(f"\n  {q_label}  ({len(qdf)} modules)")
+        print(f"  {'Module':<30}  {'Score':>6}  I  P  D  Reasoning")
+        print(f"  {'-' * 30}  {'------':>6}  -  -  -  ---------")
+        for _, r in qdf.iterrows():
+            p = int(r.get("probability_score_auto", 3))
+            reason = str(r.get("ai_reasoning", ""))
+            reason_short = reason[:55] + "..." if len(reason) > 55 else reason
+            print(
+                f"  {str(r['module']):<30}  {r['risk_score_final']:>6.0f}"
+                f"  {int(r['impact_score'])}  {p}  {int(r['detectability_score'])}"
+                f"  {reason_short}"
+            )
 
+    total_p1 = (df["quadrant"] == "P1 - Critical").sum()
+    total_p2 = (df["quadrant"] == "P2 - High").sum()
+    method_counts = df["scoring_method"].value_counts()
+    method_str = "  |  ".join(f"{m}: {c}" for m, c in method_counts.items())
+    print(f"\n  {'=' * 78}")
+    print(f"  Modules needing immediate attention (P1+P2): {total_p1 + total_p2} / {total}")
+    print(f"  Scoring method breakdown: {method_str}")
+    if skipped:
+        print(f"  Resumed {skipped} previously scored, scored {done_so_far} new.")
+    print(f"  Saved to: {out_csv}")
+    print(f"  {'=' * 78}")
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("input_csv")   # risk_register_all.csv
-    p.add_argument("output_csv")  # risk_register_scored_all.csv
-    p.add_argument("--provider", choices=["heuristic","ollama","openai"], default="heuristic")
+    p.add_argument("input_csv")
+    p.add_argument("output_csv")
+    p.add_argument("--provider", choices=["heuristic", "ollama", "openai"], default="heuristic")
     p.add_argument("--model", default="qwen3:7b")
+    p.add_argument("--verbose", "-v", action="store_true",
+                   help="Print full AI reasoning per module during scoring")
     a = p.parse_args()
 
-    base_dir = os.path.dirname(a.input_csv) or "."
+    base_dir     = os.path.dirname(a.input_csv)  or "."
     base_out_dir = os.path.dirname(a.output_csv) or "."
-    base_out_name = os.path.basename(a.output_csv)
 
-    # 1) Score combined file
-    score_file(a.input_csv, a.output_csv, a.provider, a.model)
+    score_file(a.input_csv, a.output_csv, a.provider, a.model, verbose=a.verbose)
 
-    # 2) Score each per-version file from data/risk_register_versions/
-    ver_dir        = os.path.join(base_dir, "risk_register_versions")
+    ver_dir        = os.path.join(base_dir,     "risk_register_versions")
     scored_ver_dir = os.path.join(base_out_dir, "risk_register_versions")
     os.makedirs(scored_ver_dir, exist_ok=True)
 
     pattern   = os.path.join(ver_dir, "risk_register_*.csv")
-    ver_files = sorted(glob.glob(pattern))
+    all_files = glob.glob(pattern)
+
+    # FIX 1: exclude already-scored files from being used as inputs
+    ver_files = sorted([
+        f for f in all_files
+        if not os.path.basename(f).startswith("risk_register_scored_")
+    ])
+
     if ver_files:
         print(f"\nScoring {len(ver_files)} per-version files from {ver_dir}/")
         print(f"Scored outputs -> {scored_ver_dir}/")
     else:
-        print(f"\nNo per-version files found in {ver_dir}/ — skipping per-version scoring.")
+        print(f"\nNo per-version files found in {ver_dir}/ -- skipping per-version scoring.")
         print("Re-run compute_risk_scores.py to generate them.")
 
     for path in ver_files:
-        name     = os.path.basename(path)
-        ver_part = name.replace("risk_register_", "").replace(".csv", "")
+        name = os.path.basename(path)
+        # FIX 2: normalize version separator to underscores (1.0.0 → 1_0_0)
+        ver_part = name.replace("risk_register_", "").replace(".csv", "").replace(".", "_")
         out_name = f"risk_register_scored_{ver_part}.csv"
         out_path = os.path.join(scored_ver_dir, out_name)
-        score_file(path, out_path, a.provider, a.model)
+        score_file(path, out_path, a.provider, a.model, verbose=a.verbose)
 
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
