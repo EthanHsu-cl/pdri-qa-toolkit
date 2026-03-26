@@ -68,6 +68,10 @@ Thumbs.db
 *.csv
 data/module_mappings/
 data/risk_register_versions/
+data/predictions/
+data/*.txt
+data/*.md
+data/*.json
 
 # Generated test results and logs
 **/*.log

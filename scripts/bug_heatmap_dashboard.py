@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""PDR-I Bug Heatmap Dashboard v2.14
+"""PDR-I Bug Heatmap Dashboard v2.15
+
+Changes from v2.14:
+  - Heatmap color scale: Module×Severity cells now use a blue gradient
+    (HEATMAP_COLOR_SCALE) so continuous cell shading never clashes with the
+    red/orange/yellow P1/P2 priority badge text on the same rows.
+  - Module×Severity heatmap now sorted by total weighted count (all severities
+    combined) so the busiest modules always float to the top.
+  - Risk Score vs Probability scatter: added ±0.35 x-jitter, reduced bubble
+    size_max from 30→18, added 0.75 opacity so overlapping dots are legible.
+  - predict_defects.py companion: target variable documented, leading-indicator
+    correlation added, plain-English focus summary generated per top-risk module.
+  - fetch_from_n8n.py: status comparison now flags changed records with
+    _status_changed=True; weekday/weekend scope auto-scheduling added.
+  - parse_ecl_export.py: parsed_version now read from the dedicated Version
+    column rather than regex-scraped from Short Description.
 
 Changes from v2.13:
   - Reverted responsive layout — always uses left/right [6,4] split.
@@ -22,6 +37,7 @@ from pathlib import Path
 
 
 st.set_page_config(page_title="PDR-I QA Dashboard", layout="wide", page_icon="🔥")
+st.sidebar.title("🔥 PDR-I QA Dashboard v2.15")
 
 
 # ---------------------------------------------------------------------
@@ -36,6 +52,11 @@ QUADRANT_COLORS = {
     "P3 - Medium":   "#eab308",
     "P4 - Low":      "#22c55e",
 }
+
+# Separate color scale for continuous heatmap cells (severity-weighted counts).
+# Uses blue→purple so it never clashes with the red/orange/yellow priority badge
+# colors that appear as text labels on the same chart rows.
+HEATMAP_COLOR_SCALE = "Blues"
 
 PRIORITY_LABEL_MAP = {
     1: "1-Fix Now",
@@ -69,6 +90,8 @@ TAB_NAMES = [
     "👥 Team Coverage",
     "📊 KPI Dashboard",
     "🔥 Risk Heatmap",
+    "🔬 Bug Clusters",
+    "🔮 Defect Forecast",
 ]
 
 SEV_OPTIONS = ["All", "1-Critical", "2-Major", "3-Normal", "4-Minor"]
@@ -164,7 +187,6 @@ active_tab = st.sidebar.radio(
 # Sidebar – load data
 # ---------------------------------------------------------------------
 
-st.sidebar.title("🔥 PDR-I QA Dashboard v2.14")
 st.sidebar.markdown("**Step 1 — Bug data** (required)")
 
 ds = st.sidebar.radio("Bug data source", ["Upload CSV", "File Path"], key="ds_bugs", index=1)
@@ -271,6 +293,67 @@ elif rds == "File Path":
 if rds != "None" and not risk_base_path and risk_uploaded is None:
     st.sidebar.info("No risk file found yet — Tab 7 will unlock once loaded.")
 
+# ── Step 3 — Cluster file (optional) ──────────────────────────────────────
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Step 3 — Bug clusters** (optional, unlocks Tab 8)")
+
+cds = st.sidebar.radio(
+    "Cluster data source", ["File Path", "None"], key="ds_cluster", index=0
+)
+cluster_df       = None
+cluster_sum_df   = None
+
+if cds == "File Path":
+    cfp = st.sidebar.text_input(
+        "Clustered CSV path",
+        value="data/clusters/ecl_parsed_clustered.csv", key="fp_cluster",
+    )
+    csfp = st.sidebar.text_input(
+        "Cluster summary CSV",
+        value="data/clusters/ecl_parsed_cluster_summary.csv", key="fp_cluster_sum",
+    )
+    if Path(cfp).exists():
+        cluster_df = load_csv(cfp)
+        st.sidebar.caption(f"✅ Clustered bugs loaded ({len(cluster_df):,} rows)")
+    elif cfp:
+        st.sidebar.caption("Clustered file not found — run cluster_bugs.py first.")
+    if Path(csfp).exists():
+        cluster_sum_df = load_csv(csfp)
+
+# ── Step 4 — Prediction file (optional) ───────────────────────────────────
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Step 4 — Defect forecast** (optional, unlocks Tab 9)")
+
+pds = st.sidebar.radio(
+    "Prediction data source", ["File Path", "None"], key="ds_pred", index=0
+)
+pred_df          = None
+pred_summary_txt = ""
+pred_leading_df  = None
+
+if pds == "File Path":
+    pfp = st.sidebar.text_input(
+        "Predictions CSV path",
+        value="data/predictions/ecl_parsed_predictions.csv", key="fp_pred",
+    )
+    psfp = st.sidebar.text_input(
+        "Focus summary .txt",
+        value="data/predictions/ecl_parsed_predictions_focus_summary.txt", key="fp_pred_sum",
+    )
+    plfp = st.sidebar.text_input(
+        "Leading indicators CSV",
+        value="data/predictions/ecl_parsed_predictions_leading_indicators.csv", key="fp_pred_li",
+    )
+    if Path(pfp).exists():
+        pred_df = load_csv(pfp)
+        st.sidebar.caption(f"✅ Predictions loaded ({len(pred_df):,} modules)")
+    elif pfp:
+        st.sidebar.caption("Predictions file not found — run predict_defects.py first.")
+    if Path(psfp).exists():
+        pred_summary_txt = Path(psfp).read_text(encoding="utf-8")
+    if Path(plfp).exists():
+        pred_leading_df = load_csv(plfp)
+
 
 # ---------------------------------------------------------------------
 # Sidebar – filters
@@ -288,9 +371,75 @@ if not include_inactive:
     df = df[df["status_active"] == True]
 
 if "parsed_version" in df.columns:
-    vers = sorted(df["parsed_version"].dropna().unique(), reverse=True)
-    default_vers = vers[:3] if len(vers) >= 3 else vers
-    sel_v = st.sidebar.multiselect("Version", vers, default=default_vers)
+    # ── Version ordering: recency-first, sparse versions last ─────────────
+    # We read version_catalogue.csv (produced by parse_ecl_export.py) when
+    # available because it contains recency order based on max(Create Date)
+    # per version — robust against version strings that don't sort
+    # lexicographically and against typo/sparse versions.
+    #
+    # Fallback: if the catalogue isn't present, derive the same ordering
+    # directly from the loaded dataframe.
+
+    _cat_path = Path(fp if ds != "Upload CSV" else "").parent / "version_catalogue.csv" \
+        if ds != "Upload CSV" else None
+
+    def _build_version_order_from_df(vdf):
+        """Derive recency-ordered version list directly from bug data."""
+        VERSION_SPARSE_THRESHOLD = 5
+        rows = []
+        for ver, grp in vdf.groupby("parsed_version", dropna=True):
+            n = len(grp)
+            latest = pd.to_datetime(grp["Create Date"], errors="coerce").max() \
+                if "Create Date" in grp.columns else pd.NaT
+            rows.append({"v": ver, "n": n, "d": latest,
+                         "sparse": n < VERSION_SPARSE_THRESHOLD})
+        if not rows:
+            return [], []
+        import pandas as _pd
+        tmp = _pd.DataFrame(rows)
+        tmp["_k"] = tmp["d"].fillna(_pd.Timestamp.min)
+        real   = tmp[~tmp["sparse"]].sort_values("_k", ascending=False)
+        sparse = tmp[ tmp["sparse"]].sort_values("_k", ascending=False)
+        ordered = _pd.concat([real, sparse], ignore_index=True)
+        all_vers  = ordered["v"].tolist()
+        real_vers = ordered[~ordered["sparse"]]["v"].tolist()
+        return all_vers, real_vers
+
+    vers_all   = []   # all versions, recency order
+    vers_real  = []   # non-sparse only, for default selection
+
+    if _cat_path and _cat_path.exists():
+        try:
+            _cat = load_csv(str(_cat_path))
+            if {"parsed_version", "version_rank", "version_is_sparse"}.issubset(_cat.columns):
+                _cat = _cat.sort_values("version_rank")
+                vers_all  = [str(r) for r in _cat["parsed_version"].dropna()]
+                vers_real = [
+                    str(r["parsed_version"])
+                    for _, r in _cat.iterrows()
+                    if pd.notna(r["parsed_version"]) and not r["version_is_sparse"]
+                ]
+                n_sparse = int(_cat["version_is_sparse"].sum())
+                if n_sparse:
+                    st.sidebar.caption(
+                        f"ℹ️ {n_sparse} sparse/typo version(s) hidden from default selection "
+                        f"(shown in full list below)."
+                    )
+        except Exception:
+            pass  # fall through to dataframe derivation
+
+    if not vers_all:
+        vers_all, vers_real = _build_version_order_from_df(df)
+
+    # Keep only versions that actually exist in the current (possibly filtered) df
+    present = set(df["parsed_version"].dropna().unique())
+    vers_all  = [v for v in vers_all  if v in present]
+    vers_real = [v for v in vers_real if v in present]
+
+    # Default: 3 most recent non-sparse versions; fall back to top 3 overall
+    default_vers = vers_real[:3] if vers_real else vers_all[:3]
+
+    sel_v = st.sidebar.multiselect("Version", vers_all, default=default_vers)
     if sel_v:
         df = df[df["parsed_version"].isin(sel_v)]
 else:
@@ -425,17 +574,26 @@ They show the module's test priority — see the Risk Heatmap tab for full detai
     if vl.startswith("M"):
         pv = pv.loc[pv.sum(axis=1).nlargest(30).index]
 
-    pv = pv.sort_values("1-Critical", ascending=True)
+    # Sort so highest-count modules appear at the top of the heatmap.
+    # Primary sort: S1 (Critical) descending so the most critical modules
+    # always float to the top; ties broken by total weighted count descending.
+    sort_key = pd.DataFrame({
+        "s1":    pv["1-Critical"],
+        "total": pv.sum(axis=1),
+    })
+    pv = pv.loc[sort_key.sort_values(["s1", "total"], ascending=[False, False]).index]
 
     pv_display = pv.copy()
     if risk_available:
         q_map = df.groupby(gc)["quadrant"].first().to_dict()
         pv_display.index = [f"{y} [{q_map.get(y, '—')}]" for y in pv.index]
 
+    # Use HEATMAP_COLOR_SCALE (blue gradient) so the continuous cell shading
+    # does NOT conflict with the red/orange/yellow priority badge text on each row.
     fig = px.imshow(
         pv_display,
         labels=dict(x="Severity", y=gc, color="Weighted Count"),
-        color_continuous_scale="YlOrRd",
+        color_continuous_scale=HEATMAP_COLOR_SCALE,
         aspect="auto",
         text_auto=True,
     )
@@ -443,6 +601,12 @@ They show the module's test priority — see the Risk Heatmap tab for full detai
         height=max(400, len(pv_display) * 28),
         clickmode="event+select",
     )
+    if risk_available:
+        st.caption(
+            "🔵 Cell shade = severity-weighted bug count (darker = more/heavier bugs). "
+            "🔴 [P1] / 🟠 [P2] badges next to row labels = risk priority — kept separate "
+            "from cell colour to avoid red-on-red confusion."
+        )
 
     available_groups = sorted(df[gc].dropna().unique().tolist())
     if "dd_group" not in st.session_state or st.session_state["dd_group"] not in available_groups:
@@ -528,8 +692,11 @@ elif active_tab == "📅 Version Timeline":
             values="severity_weight", aggfunc="sum", fill_value=0,
         )
         tl = tl[sorted(tl.columns)]
+        row_weights = tl.sum(axis=1)
         if vl2.startswith("M"):
-            tl = tl.loc[tl.sum(axis=1).nlargest(25).index]
+            tl = tl.loc[row_weights.nlargest(25).sort_values(ascending=False).index]
+        else:
+            tl = tl.loc[row_weights.sort_values(ascending=False).index]
 
         fig2 = px.imshow(
             tl,
@@ -1244,6 +1411,15 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
             return "Low Risk (<10)"
 
         scatter_df["risk_zone"] = scatter_df["risk_score"].apply(assign_zone)
+
+        # Add small random jitter to x (probability) so dots at the same
+        # integer score separate from each other and can be hovered individually.
+        rng = np.random.default_rng(42)
+        scatter_df["probability_jittered"] = (
+            scatter_df["probability"]
+            + rng.uniform(-0.35, 0.35, size=len(scatter_df))
+        )
+
         zone_colors = {
             "Critical Risk (≥60)": "#D62728",
             "High Risk (30-59)":   "#FF7F0E",
@@ -1251,14 +1427,33 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
             "Low Risk (<10)":      "#2CA02C",
         }
         fig_scatter = px.scatter(
-            scatter_df, x="probability", y="risk_score",
-            color="risk_zone", color_discrete_map=zone_colors,
-            size="bug_count", hover_name="parsed_module",
-            hover_data={"probability": True, "risk_score": ":.1f",
-                        "bug_count": True, "risk_zone": False},
-            labels={"probability": "Probability Score (1–5)",
-                    "risk_score": "Risk Score (I×P×D)", "bug_count": "Bug Count"},
-            size_max=30,
+            scatter_df,
+            x="probability_jittered",
+            y="risk_score",
+            color="risk_zone",
+            color_discrete_map=zone_colors,
+            size="bug_count",
+            hover_name="parsed_module",
+            hover_data={
+                "probability_jittered": False,        # hide the jittered value
+                "probability": True,                  # show the real integer
+                "risk_score": ":.1f",
+                "bug_count": True,
+                "risk_zone": False,
+            },
+            labels={
+                "probability_jittered": "Probability Score (1–5, jittered for readability)",
+                "risk_score": "Risk Score (I×P×D)",
+                "bug_count": "Bug Count",
+            },
+            size_max=18,          # smaller max bubble so dense clusters separate
+            opacity=0.75,         # transparency lets overlapping dots show through
+        )
+        # Overlay true integer tick labels on x-axis so jitter doesn't confuse
+        fig_scatter.update_xaxes(
+            tickvals=[1, 2, 3, 4, 5],
+            ticktext=["1", "2", "3", "4", "5"],
+            range=[0.3, 5.7],
         )
         for y_val, label in [
             (10, "Medium threshold"), (30, "High threshold"), (60, "Critical threshold")
@@ -1268,4 +1463,480 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
                 annotation_text=label, annotation_position="right",
             )
         fig_scatter.update_layout(height=500)
+        st.caption(
+            "ℹ️ X-axis values are slightly jittered (±0.35) so dots at the same probability "
+            "level separate visually. Hover any dot for the true score."
+        )
         st.plotly_chart(fig_scatter, width='stretch')
+
+# =====================================================================
+# TAB 8 – Bug Clusters
+# =====================================================================
+
+elif active_tab == "🔬 Bug Clusters":
+    st.header("🔬 Bug Clusters — What Kinds of Problems Exist?")
+
+    with st.expander("📖 What is this tab?", expanded=False):
+        st.markdown("""
+This tab groups all bugs into **themes** using natural language analysis of their descriptions.
+Instead of listing hundreds of individual bugs, it answers the question:
+**"What categories of problems keep appearing?"**
+
+Each cluster is named by the 2–3 keywords that appear most often in the bugs it contains.
+You don't need a technical background to use this — think of each cluster as a *recurring complaint type*.
+
+**How to act on it:**
+- **Big clusters** = widespread problem pattern — worth a dedicated investigation or test run.
+- **High severity clusters** (red/orange) = the pattern is causing serious bugs, not just cosmetic ones.
+- **Clusters affecting many modules** = the root cause may be shared infrastructure (e.g. a common component or API).
+
+**Where does this data come from?**
+Run `python scripts/cluster_bugs.py data/ecl_parsed.csv` to generate the cluster files,
+then set the path in **Step 3** of the sidebar.
+""")
+
+    if cluster_df is None:
+        st.warning(
+            "**Cluster data not loaded.** "
+            "Run `python scripts/cluster_bugs.py data/ecl_parsed.csv` then set the path in **Sidebar → Step 3**."
+        )
+        st.stop()
+
+    # ── Guard: need cluster columns ──────────────────────────────────────
+    if "cluster_id" not in cluster_df.columns or "cluster_label" not in cluster_df.columns:
+        st.error("Cluster file is missing `cluster_id` / `cluster_label` columns. Re-run cluster_bugs.py.")
+        st.stop()
+
+    # ── Headline metrics ─────────────────────────────────────────────────
+    n_total    = len(cluster_df)
+    n_clustered = (cluster_df["cluster_id"] != -1).sum()
+    n_clusters  = cluster_df[cluster_df["cluster_id"] != -1]["cluster_id"].nunique()
+    n_unclustered = n_total - n_clustered
+
+    hm1, hm2, hm3, hm4 = st.columns(4)
+    hm1.metric("Total Bugs Analysed", f"{n_total:,}")
+    hm2.metric("Distinct Themes Found", f"{n_clusters}")
+    hm3.metric("Bugs Grouped into Themes", f"{n_clustered:,}",
+               help=f"{n_clustered/n_total*100:.0f}% of all bugs belong to a named theme")
+    hm4.metric("Uncategorised Bugs", f"{n_unclustered:,}",
+               help="Bugs whose descriptions were too short or too unique to cluster")
+
+    st.markdown("---")
+
+    # ── Build summary table if not pre-loaded from CSV ───────────────────
+    if cluster_sum_df is not None and not cluster_sum_df.empty:
+        summary = cluster_sum_df.copy()
+        # normalise column names that come from the CSV vs computed inline
+        summary = summary.reset_index(drop=True)
+    else:
+        clustered_only = cluster_df[cluster_df["cluster_id"] != -1]
+        summary = (
+            clustered_only
+            .groupby(["cluster_id", "cluster_label"])
+            .agg(
+                count=("cluster_id", "size"),
+                modules=("parsed_module",
+                         lambda x: ", ".join(sorted(x.dropna().unique())[:5])),
+                avg_sev=("severity_num", "mean"),
+            )
+            .sort_values("count", ascending=False)
+            .reset_index()
+        )
+
+    if summary.empty:
+        st.info("No clusters found in the loaded data.")
+        st.stop()
+
+    # Ensure required columns exist
+    for col, default in [("count", 0), ("avg_sev", 3.0), ("modules", "")]:
+        if col not in summary.columns:
+            summary[col] = default
+
+    summary["avg_sev"] = pd.to_numeric(summary["avg_sev"], errors="coerce").fillna(3.0)
+    summary["count"]   = pd.to_numeric(summary["count"],   errors="coerce").fillna(0).astype(int)
+
+    # Human-readable severity label for the bar chart colour
+    def _sev_band(v):
+        if v <= 1.5: return "🔴 Mostly Critical"
+        if v <= 2.5: return "🟠 Mostly Major"
+        if v <= 3.5: return "🟡 Mostly Normal"
+        return "🟢 Mostly Minor"
+
+    summary["severity_band"] = summary["avg_sev"].apply(_sev_band)
+
+    SEV_BAND_COLORS = {
+        "🔴 Mostly Critical": "#ef4444",
+        "🟠 Mostly Major":    "#f97316",
+        "🟡 Mostly Normal":   "#eab308",
+        "🟢 Mostly Minor":    "#22c55e",
+    }
+
+    # Truncate very long cluster labels for display
+    summary["label_short"] = summary["cluster_label"].apply(
+        lambda s: s[:45] + "…" if isinstance(s, str) and len(s) > 45 else s
+    )
+
+    # ── Overview bar chart ───────────────────────────────────────────────
+    st.subheader("📊 Theme Overview — How Many Bugs per Theme?")
+    st.caption(
+        "Each bar is a recurring bug theme. Colour shows average severity. "
+        "Longer bar = more bugs share that theme."
+    )
+
+    top_n_bar = st.slider("Show top N themes", min_value=5, max_value=min(30, len(summary)),
+                          value=min(15, len(summary)), key="cluster_bar_n")
+    bar_data = summary.head(top_n_bar).copy()
+
+    fig_cl = px.bar(
+        bar_data,
+        x="count",
+        y="label_short",
+        orientation="h",
+        color="severity_band",
+        color_discrete_map=SEV_BAND_COLORS,
+        hover_data={"count": True, "avg_sev": ":.2f", "modules": True,
+                    "severity_band": False, "label_short": False},
+        labels={"count": "Number of Bugs", "label_short": "Theme (keywords)",
+                "avg_sev": "Avg Severity (1=Critical, 4=Minor)",
+                "modules": "Modules affected"},
+        text="count",
+    )
+    fig_cl.update_layout(
+        height=max(380, top_n_bar * 30),
+        yaxis={"categoryorder": "total ascending"},
+        showlegend=True,
+        legend_title_text="Severity",
+        margin=dict(l=10, r=10, t=10, b=10),
+    )
+    fig_cl.update_traces(textposition="outside")
+    st.plotly_chart(fig_cl, width='stretch')
+
+    # ── Per-cluster detail cards ─────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🃏 Theme Detail Cards")
+    st.caption(
+        "Each card shows one recurring bug theme. "
+        "Expand a card to see which modules are affected and example bugs."
+    )
+
+    for _, row in summary.head(top_n_bar).iterrows():
+        cid    = row.get("cluster_id", -1)
+        label  = str(row.get("cluster_label", "Unknown"))
+        count  = int(row.get("count", 0))
+        avg_sv = float(row.get("avg_sev", 3.0))
+        mods   = str(row.get("modules", ""))
+        sband  = row.get("severity_band", "🟡 Mostly Normal")
+        rank   = summary.index[summary["cluster_label"] == label].tolist()
+        rank_n = (rank[0] + 1) if rank else "?"
+
+        # Severity emoji for card header
+        sev_icon = {"🔴 Mostly Critical": "🔴", "🟠 Mostly Major": "🟠",
+                    "🟡 Mostly Normal": "🟡", "🟢 Mostly Minor": "🟢"}.get(sband, "⚪")
+
+        card_title = f"{sev_icon} Theme #{rank_n} · **{count} bugs** · _{label}_"
+
+        with st.expander(card_title, expanded=(rank_n == 1)):
+            cc1, cc2, cc3 = st.columns(3)
+            cc1.metric("Bugs in theme", count)
+            cc2.metric("Avg severity", f"{avg_sv:.1f}",
+                       help="1=Critical  2=Major  3=Normal  4=Minor")
+            pct = f"{count / n_clustered * 100:.1f}%" if n_clustered else "—"
+            cc3.metric("Share of clustered bugs", pct)
+
+            if mods:
+                st.markdown(f"**Modules affected:** {mods}")
+
+            # Sample bugs from this cluster
+            if cluster_df is not None and "cluster_id" in cluster_df.columns:
+                cl_bugs = cluster_df[cluster_df["cluster_id"] == cid]
+                if "parsed_description" in cl_bugs.columns:
+                    samples = (
+                        cl_bugs[cl_bugs["parsed_description"].notna()]
+                        [["parsed_module", "parsed_description", "severity_label"]]
+                        .head(6)
+                        .rename(columns={
+                            "parsed_module": "Module",
+                            "parsed_description": "Bug description",
+                            "severity_label": "Severity",
+                        })
+                    )
+                    if not samples.empty:
+                        st.markdown("**Sample bugs in this theme:**")
+                        st.dataframe(samples, hide_index=True, width='stretch')
+
+            # Plain-English interpretation for non-QA readers
+            if avg_sv <= 1.5:
+                action = "🚨 **Immediate attention** — this theme contains crash-level or data-loss bugs. Escalate to RD."
+            elif avg_sv <= 2.5:
+                action = "⚠️ **High priority** — major functionality issues. Add these modules to the next sprint's regression list."
+            elif avg_sv <= 3.5:
+                action = "📋 **Standard priority** — normal-severity issues. Cover in release-candidate testing."
+            else:
+                action = "✅ **Low priority** — mostly cosmetic or minor issues. Include in full release cycle testing."
+            st.info(action)
+
+    # ── Raw summary table ────────────────────────────────────────────────
+    with st.expander("📋 Full theme table (raw data)"):
+        display_sum = summary[["cluster_label", "count", "avg_sev", "modules",
+                                "severity_band"]].copy()
+        display_sum.columns = ["Theme keywords", "Bug count", "Avg severity (1–4)",
+                                "Modules affected", "Severity band"]
+        st.dataframe(display_sum, hide_index=True, width='stretch')
+
+
+# =====================================================================
+# TAB 9 – Defect Forecast
+# =====================================================================
+
+elif active_tab == "🔮 Defect Forecast":
+    st.header("🔮 Defect Forecast — What Will Break Next Build?")
+
+    with st.expander("📖 What is this tab?", expanded=False):
+        st.markdown("""
+This tab shows a **machine-learning forecast** of how many bugs each module is likely to produce
+in the **next build**, based on its recent history.
+
+**What is being predicted?**
+The model counts how many new bugs were filed against each module in each past build,
+learns the pattern over time, and extrapolates to the next build.
+It uses signals like: *how many bugs appeared in the last 1 / 3 / 5 builds*, *how many were critical*,
+and whether the bug count is trending up or down.
+
+**How to read the risk levels:**
+
+| Level | Predicted bugs | What to do |
+|-------|---------------|------------|
+| 🔴 Critical | > 10 | Must test every build — high instability |
+| 🟠 High | 6 – 10 | Test every sprint, watch for regressions |
+| 🟡 Medium | 3 – 5 | Include in release-candidate pass |
+| 🟢 Low | < 3 | Standard release cycle coverage |
+
+**Leading signal** = the current bug pattern most strongly correlated with future bugs for that module.
+If a module's leading signal is "critical-bug momentum", it means that whenever it has critical bugs *now*,
+it tends to have more bugs *next build* — a reliable early warning.
+
+**Where does this data come from?**
+Run `python scripts/predict_defects.py data/ecl_parsed.csv` then set the path in **Sidebar → Step 4**.
+""")
+
+    if pred_df is None:
+        st.warning(
+            "**Prediction data not loaded.** "
+            "Run `python scripts/predict_defects.py data/ecl_parsed.csv` then set the path in **Sidebar → Step 4**."
+        )
+        st.stop()
+
+    required_pred_cols = {"module", "predicted", "risk_level"}
+    if not required_pred_cols.issubset(pred_df.columns):
+        st.error(f"Predictions file missing columns: {required_pred_cols - set(pred_df.columns)}")
+        st.stop()
+
+    pred_df["predicted"] = pd.to_numeric(pred_df["predicted"], errors="coerce").fillna(0)
+    pred_df = pred_df.sort_values("predicted", ascending=False).reset_index(drop=True)
+
+    # ── Headline metrics ─────────────────────────────────────────────────
+    rl_counts = pred_df["risk_level"].value_counts()
+    pm1, pm2, pm3, pm4 = st.columns(4)
+    pm1.metric("🔴 Critical modules",  int(rl_counts.get("Critical", 0)),
+               help="Predicted > 10 bugs next build")
+    pm2.metric("🟠 High-risk modules", int(rl_counts.get("High", 0)),
+               help="Predicted 6–10 bugs next build")
+    pm3.metric("Total modules forecast", len(pred_df))
+    if "target" in pred_df.columns:
+        mae = abs(pred_df["predicted"] - pd.to_numeric(pred_df["target"], errors="coerce")).mean()
+        pm4.metric("Model accuracy (MAE)", f"±{mae:.1f} bugs",
+                   help="Mean absolute error on the most recent known build — lower is better")
+    else:
+        pm4.metric("Model accuracy (MAE)", "N/A")
+
+    st.markdown("---")
+
+    # ── Forecast bar chart ────────────────────────────────────────────────
+    st.subheader("📊 Predicted Bug Count — Next Build")
+    st.caption(
+        "Bar height = predicted number of new bugs. "
+        "Colour = risk level. Hover for current (actual) vs predicted."
+    )
+
+    FORECAST_COLORS = {
+        "Critical": "#ef4444",
+        "High":     "#f97316",
+        "Medium":   "#eab308",
+        "Low":      "#22c55e",
+    }
+    RISK_ORDER = ["Critical", "High", "Medium", "Low"]
+
+    top_n_pred = st.slider("Show top N modules", min_value=5,
+                           max_value=min(40, len(pred_df)),
+                           value=min(20, len(pred_df)), key="pred_bar_n")
+    bar_pred = pred_df.head(top_n_pred).copy()
+    bar_pred["risk_level"] = pd.Categorical(
+        bar_pred["risk_level"].astype(str), categories=RISK_ORDER, ordered=True
+    )
+    bar_pred = bar_pred.sort_values(["risk_level", "predicted"], ascending=[True, False])
+
+    hover_extra = {}
+    if "target" in bar_pred.columns:
+        hover_extra["target"] = True
+    if "dominant_bug_type" in bar_pred.columns:
+        hover_extra["dominant_bug_type"] = True
+
+    fig_pred = px.bar(
+        bar_pred,
+        x="module",
+        y="predicted",
+        color="risk_level",
+        color_discrete_map=FORECAST_COLORS,
+        category_orders={"risk_level": RISK_ORDER},
+        hover_data={"predicted": ":.1f", "risk_level": True, **hover_extra},
+        labels={"module": "Module", "predicted": "Predicted bugs (next build)",
+                "risk_level": "Risk level", "target": "Actual (last build)",
+                "dominant_bug_type": "Typical bug type"},
+        text="predicted",
+    )
+    fig_pred.update_traces(texttemplate="%{text:.0f}", textposition="outside")
+    fig_pred.update_layout(
+        height=460,
+        xaxis_tickangle=-35,
+        showlegend=True,
+        legend_title_text="Risk level",
+        margin=dict(t=20, b=10),
+    )
+    st.plotly_chart(fig_pred, width='stretch')
+
+    # ── Actual vs Predicted comparison ───────────────────────────────────
+    if "target" in pred_df.columns:
+        with st.expander("📈 Actual vs Predicted (last known build)"):
+            st.caption(
+                "Compares the model's prediction against what actually happened in the most recent build. "
+                "Bars close to the line = accurate; bars far above = module had a surprise spike."
+            )
+            avp = pred_df.head(top_n_pred)[["module", "target", "predicted", "risk_level"]].copy()
+            avp["target"]    = pd.to_numeric(avp["target"],    errors="coerce").fillna(0)
+            avp["predicted"] = pd.to_numeric(avp["predicted"], errors="coerce").fillna(0)
+            avp_melt = avp.melt(id_vars="module", value_vars=["target", "predicted"],
+                                var_name="Type", value_name="Bugs")
+            avp_melt["Type"] = avp_melt["Type"].map(
+                {"target": "Actual (last build)", "predicted": "Forecast (next build)"}
+            )
+            fig_avp = px.bar(
+                avp_melt, x="module", y="Bugs", color="Type", barmode="group",
+                color_discrete_map={
+                    "Actual (last build)":     "#6366f1",
+                    "Forecast (next build)":   "#f97316",
+                },
+                labels={"module": "Module", "Bugs": "Bug count"},
+            )
+            fig_avp.update_layout(height=380, xaxis_tickangle=-35,
+                                  legend_title_text="", margin=dict(t=10, b=10))
+            st.plotly_chart(fig_avp, width='stretch')
+
+    # ── Module forecast cards ─────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🃏 Module Forecast Cards")
+    st.caption(
+        "One card per high-risk module. Written for anyone on the team — "
+        "no data science background needed."
+    )
+
+    cards_df = pred_df[pred_df["risk_level"].isin(["Critical", "High"])].head(10)
+    if cards_df.empty:
+        cards_df = pred_df.head(5)
+
+    RISK_ICONS   = {"Critical": "🔴", "High": "🟠", "Medium": "🟡", "Low": "🟢"}
+    RISK_ADVICE  = {
+        "Critical": "Test **every build**. Focus on crash scenarios, data loss, and any recently changed functionality.",
+        "High":     "Test **every sprint**. Run full regression for this module and check for side effects in related areas.",
+        "Medium":   "Include in **release-candidate** testing. Spot-check changed areas.",
+        "Low":      "Cover in the full **release cycle** pass. No special urgency.",
+    }
+
+    for _, row in cards_df.iterrows():
+        mod       = str(row.get("module", "Unknown"))
+        pred_val  = float(row.get("predicted", 0))
+        rl        = str(row.get("risk_level", "Medium"))
+        dom_type  = str(row.get("dominant_bug_type", "mixed"))
+        lead_sig  = str(row.get("leading_signal", "recent bug momentum"))
+        target_v  = row.get("target", None)
+        icon      = RISK_ICONS.get(rl, "⚪")
+
+        card_header = f"{icon} **{mod}** — forecast {pred_val:.0f} bugs · {rl} risk"
+        with st.expander(card_header, expanded=(rl == "Critical")):
+            fc1, fc2, fc3 = st.columns(3)
+            fc1.metric("Predicted bugs", f"{pred_val:.0f}")
+            if target_v is not None:
+                fc2.metric("Actual last build", f"{float(target_v):.0f}")
+            fc3.metric("Risk level", rl)
+
+            st.markdown(f"**Typical bug type:** {dom_type}")
+            st.markdown(f"**Why high risk:** driven by _{lead_sig}_")
+            st.info(f"**What to test:** {RISK_ADVICE.get(rl, '')}")
+
+    # ── Leading indicators ────────────────────────────────────────────────
+    if pred_leading_df is not None and not pred_leading_df.empty:
+        st.markdown("---")
+        st.subheader("📡 Leading Indicators — What Predicts Future Bugs?")
+        st.caption(
+            "These are the current bug signals most strongly correlated with future bug counts. "
+            "A high positive value means: 'when this signal is elevated now, more bugs tend to follow next build.'"
+        )
+
+        li = pred_leading_df.copy()
+        li["pearson_r"] = pd.to_numeric(li["pearson_r"], errors="coerce").fillna(0)
+        li["abs_r"]     = li["pearson_r"].abs()
+        li = li.sort_values("abs_r", ascending=False).head(12)
+
+        # Use label column if present, else feature name
+        li["display_label"] = li.get("label", li.get("feature", li.index)).fillna(li.get("feature", ""))
+
+        li["direction"] = li["pearson_r"].apply(
+            lambda r: "📈 More now → more bugs later" if r > 0 else "📉 More now → fewer bugs later"
+        )
+        li["strength"]  = li["abs_r"].apply(
+            lambda r: "Strong" if r >= 0.5 else "Moderate" if r >= 0.3 else "Weak"
+        )
+
+        fig_li = px.bar(
+            li,
+            x="pearson_r",
+            y="display_label",
+            orientation="h",
+            color="pearson_r",
+            color_continuous_scale=["#22c55e", "#f3f4f6", "#ef4444"],
+            range_color=[-1, 1],
+            hover_data={"pearson_r": ":.3f", "direction": True, "strength": True,
+                        "display_label": False},
+            labels={"pearson_r": "Correlation (−1 to +1)",
+                    "display_label": "Signal",
+                    "direction": "Direction",
+                    "strength": "Strength"},
+            text="pearson_r",
+        )
+        fig_li.update_traces(texttemplate="%{text:.2f}", textposition="outside")
+        fig_li.update_layout(
+            height=max(320, len(li) * 36),
+            yaxis={"categoryorder": "total ascending"},
+            coloraxis_showscale=False,
+            margin=dict(l=10, r=60, t=10, b=10),
+        )
+        fig_li.add_vline(x=0, line_color="gray", line_width=1)
+        st.plotly_chart(fig_li, width='stretch')
+
+        with st.expander("📋 Full leading indicators table"):
+            li_display = li[["display_label", "pearson_r", "direction", "strength"]].copy()
+            li_display.columns = ["Signal", "Correlation", "Direction", "Strength"]
+            st.dataframe(li_display, hide_index=True, width='stretch')
+
+    # ── Raw predictions table ──────────────────────────────────────────────
+    with st.expander("📋 Full predictions table"):
+        show_cols = [c for c in ["module", "predicted", "target", "risk_level",
+                                 "dominant_bug_type", "leading_signal"] if c in pred_df.columns]
+        disp_pred = pred_df[show_cols].copy()
+        disp_pred.columns = [
+            {"module": "Module", "predicted": "Forecast (next build)",
+             "target": "Actual (last build)", "risk_level": "Risk level",
+             "dominant_bug_type": "Typical bug type",
+             "leading_signal": "Leading signal"}.get(c, c)
+            for c in show_cols
+        ]
+        st.dataframe(disp_pred, hide_index=True, width='stretch')

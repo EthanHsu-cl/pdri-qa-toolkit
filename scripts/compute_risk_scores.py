@@ -1,14 +1,29 @@
 #!/usr/bin/env python3
-"""PDR-I Risk Register Generator v2.3
+"""PDR-I Risk Register Generator v2.4
+
+Changes from v2.3:
+  - Per-version risk registers are now generated in recency order (newest
+    first, by max Create Date) rather than lexicographic version-string order.
+    This is robust against version strings that don't sort numerically and
+    against typo/sparse versions (< VERSION_SPARSE_THRESHOLD bugs) that would
+    appear at the wrong position in a string-sorted list.
+  - Sparse versions (< VERSION_SPARSE_THRESHOLD bugs) are skipped for
+    per-version risk register generation.  They are still included in the
+    combined all-versions register.  A warning is printed for each skipped
+    version so the operator knows it was intentional.
+  - Reads version_catalogue.csv (produced by parse_ecl_export.py) when
+    available to reuse the pre-computed recency ordering and sparse flags.
+    Falls back gracefully to re-computing the same logic from the CSV data
+    when the catalogue file is not present.
 
 Behavior:
-
 - Single call:
     python compute_risk_scores.py data/ecl_parsed.csv data/risk_register_all.csv
 
   Produces:
     - data/risk_register_all.csv        ← combined (all versions)
-    - data/risk_register_<ver>.csv      ← one per parsed_version value
+    - data/risk_register_<ver>.csv      ← one per non-sparse parsed_version,
+                                          newest first
 
 No extra arguments required.
 """
@@ -104,6 +119,61 @@ def _compute_risk_core(df: pd.DataFrame) -> pd.DataFrame:
     return agg
 
 
+def _version_order(df: pd.DataFrame, cat_path: str = None):
+    """Return (version_string, is_sparse) tuples ordered newest → oldest.
+
+    Resolution priority:
+      1. version_catalogue.csv produced by parse_ecl_export.py (most accurate)
+      2. Re-derive from Create Date in df (same algorithm, no catalogue needed)
+
+    Sparse = fewer than VERSION_SPARSE_THRESHOLD bugs.  Sparse versions are
+    returned last so callers can easily skip them for per-version registers
+    while still having the full list for reference.
+    """
+    VERSION_SPARSE_THRESHOLD = 5
+
+    # ── Try reading pre-built catalogue ─────────────────────────────────────
+    if cat_path and Path(cat_path).exists():
+        try:
+            cat = pd.read_csv(cat_path)
+            if {"parsed_version", "version_rank", "version_is_sparse"}.issubset(cat.columns):
+                cat = cat.sort_values("version_rank")
+                return [
+                    (str(r["parsed_version"]), bool(r["version_is_sparse"]))
+                    for _, r in cat.iterrows()
+                    if pd.notna(r["parsed_version"])
+                ]
+        except Exception as e:
+            print(f"  Note: could not read version catalogue ({e}) — re-deriving from data.")
+
+    # ── Fallback: derive from Create Date ────────────────────────────────────
+    rows = []
+    for ver, grp in df.groupby("parsed_version", dropna=True):
+        n = len(grp)
+        if "Create Date" in grp.columns:
+            latest = pd.to_datetime(grp["Create Date"], errors="coerce").max()
+        else:
+            latest = pd.NaT
+        rows.append({
+            "parsed_version":     ver,
+            "bug_count":          n,
+            "latest_create_date": latest,
+            "version_is_sparse":  n < VERSION_SPARSE_THRESHOLD,
+        })
+    if not rows:
+        return []
+
+    cat = pd.DataFrame(rows)
+    cat["_sort_key"] = cat["latest_create_date"].fillna(pd.Timestamp.min)
+    real   = cat[~cat["version_is_sparse"]].sort_values("_sort_key", ascending=False)
+    sparse = cat[ cat["version_is_sparse"]].sort_values("_sort_key", ascending=False)
+    cat = pd.concat([real, sparse], ignore_index=True)
+    return [
+        (str(r["parsed_version"]), bool(r["version_is_sparse"]))
+        for _, r in cat.iterrows()
+    ]
+
+
 def compute_risk_all_and_per_version(input_csv: str, output_csv_all: str):
     df = pd.read_csv(input_csv, low_memory=False)
     print(f"Loaded {len(df)} bugs from {input_csv}")
@@ -123,26 +193,38 @@ def compute_risk_all_and_per_version(input_csv: str, output_csv_all: str):
         )
     print(f"Saved combined register to: {output_csv_all}")
 
-    # 2) Per-version risk registers -- stored under data/risk_register_versions/
-    versions = sorted(df["parsed_version"].dropna().unique())
+    # 2) Per-version risk registers, newest first, sparse versions skipped
     out_path = Path(output_csv_all)
     base_dir = out_path.parent
+    cat_path = str(base_dir / "version_catalogue.csv")
     ver_dir  = base_dir / "risk_register_versions"
     ver_dir.mkdir(parents=True, exist_ok=True)
 
+    version_order = _version_order(df, cat_path=cat_path)
+
     print(f"\nPer-version risk registers -> {ver_dir}/")
-    for ver in versions:
+    n_written = n_skipped = 0
+    for ver, is_sparse in version_order:
         df_ver = df[df["parsed_version"] == ver].copy()
         if df_ver.empty:
+            continue
+        if is_sparse:
+            print(f"  ⚠️  SKIP  {ver:<18s} ({len(df_ver)} bugs) — sparse/typo version, "
+                  f"excluded from per-version registers")
+            n_skipped += 1
             continue
         agg_ver = _compute_risk_core(df_ver)
         ver_safe = str(ver).replace(" ", "_").replace(".", "_")
         ver_out = ver_dir / f"risk_register_{ver_safe}.csv"
-        agg_ver["parsed_version"] = ver  # keep version for later AI scoring
+        agg_ver["parsed_version"] = ver
         agg_ver.to_csv(ver_out, index=False, encoding="utf-8-sig")
         print(
-            f"  {ver:15s} -> {len(agg_ver):4d} modules  -> risk_register_versions/{ver_out.name}"
+            f"  ✅  {ver:<18s} -> {len(agg_ver):4d} modules  -> "
+            f"risk_register_versions/{ver_out.name}"
         )
+        n_written += 1
+
+    print(f"\n  Written: {n_written} per-version files  |  Skipped (sparse): {n_skipped}")
 
 
 def main():

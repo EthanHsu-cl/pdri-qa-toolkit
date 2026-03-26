@@ -812,6 +812,86 @@ def parse_repro(repro_str) -> float:
     return 0.5
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Version catalogue helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Versions with fewer bugs than this are treated as sparse/typo entries.
+# They are KEPT in the data (for full fidelity) but are flagged with
+# version_is_sparse=True and excluded from auto-selected "recent" defaults.
+VERSION_SPARSE_THRESHOLD = 4
+
+
+def build_version_catalogue(df: pd.DataFrame) -> pd.DataFrame:
+    """Build a version catalogue sorted by recency (latest Create Date DESC).
+
+    Recency = max(Create Date) for all bugs sharing that parsed_version.
+    This is robust against:
+      - Version strings that don't sort lexicographically (e.g. "9.0" > "16.3.0")
+      - Typo versions with only 1-2 bugs that appear at a random numeric position
+      - Versions whose string prefix is misleading (e.g. a hotfix "16.2.5.1"
+        that was filed after a newer "16.3.0" cycle)
+
+    Columns returned:
+        parsed_version      – the version string
+        bug_count           – number of bugs in this version
+        latest_create_date  – most recent Create Date among those bugs
+        version_is_sparse   – True when bug_count < VERSION_SPARSE_THRESHOLD
+        version_rank        – 1 = most recent, 2 = second most recent, …
+                              sparse versions are ranked AFTER all real versions
+    """
+    if "parsed_version" not in df.columns:
+        return pd.DataFrame(columns=[
+            "parsed_version", "bug_count", "latest_create_date",
+            "version_is_sparse", "version_rank",
+        ])
+
+    rows = []
+    for ver, grp in df.groupby("parsed_version", dropna=True):
+        n = len(grp)
+        if "Create Date" in grp.columns:
+            latest = pd.to_datetime(grp["Create Date"], errors="coerce").max()
+        else:
+            latest = pd.NaT
+        rows.append({
+            "parsed_version":     ver,
+            "bug_count":          n,
+            "latest_create_date": latest,
+            "version_is_sparse":  n < VERSION_SPARSE_THRESHOLD,
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "parsed_version", "bug_count", "latest_create_date",
+            "version_is_sparse", "version_rank",
+        ])
+
+    cat = pd.DataFrame(rows)
+
+    # Sort: real versions by date DESC first, sparse versions last (by date DESC within)
+    cat["_sort_key"] = cat["latest_create_date"].fillna(pd.Timestamp.min)
+    real   = cat[~cat["version_is_sparse"]].sort_values("_sort_key", ascending=False)
+    sparse = cat[ cat["version_is_sparse"]].sort_values("_sort_key", ascending=False)
+    cat = pd.concat([real, sparse], ignore_index=True)
+    cat["version_rank"] = range(1, len(cat) + 1)
+    cat = cat.drop(columns=["_sort_key"])
+
+    return cat
+
+
+def versions_by_recency(df: pd.DataFrame, exclude_sparse: bool = True):
+    """Return parsed_version strings ordered by recency (newest first).
+
+    When exclude_sparse=True (default), versions below VERSION_SPARSE_THRESHOLD
+    bugs are omitted — useful for default sidebar selections and 'latest' scope.
+    Pass exclude_sparse=False to get the complete list (e.g. for full exports).
+    """
+    cat = build_version_catalogue(df)
+    if exclude_sparse:
+        cat = cat[~cat["version_is_sparse"]]
+    return cat["parsed_version"].tolist()
+
+
 def parse_ecl_export(
     input_path: str,
     output_path: str,
@@ -877,6 +957,13 @@ def parse_ecl_export(
         print("Available columns:", list(df.columns))
         sys.exit(1)
 
+    # Resolve the "Version" column that will be used as the authoritative
+    # parsed_version source (Change 6: prefer the dedicated Version field over
+    # the regex-extracted version from Short Description).
+    ver_col = next(
+        (c for c in df.columns if c.strip().lower() == "version"), None
+    )
+
     status_col = next((c for c in df.columns if c.lower() == "status"), None)
 
     print("Parsing Short Descriptions...")
@@ -894,15 +981,27 @@ def parse_ecl_export(
     for _, row in df.iterrows():
         desc = str(row.get(sd_col, ""))
 
-        version_hint = "unknown"
-        vm = re.search(r"(\d+\.\d+(?:\.\d+)?)", desc)
-        if vm:
-            version_hint = vm.group(1)
+        # Change 6: derive version_hint from the dedicated Version column first;
+        # fall back to a regex scan of Short Description only when the column is
+        # absent or blank.  This is more reliable because the Short Description
+        # prefix sometimes contains the wrong version or no version at all.
+        if ver_col and pd.notna(row.get(ver_col)) and str(row.get(ver_col, "")).strip():
+            version_hint = str(row[ver_col]).strip()
+            # Normalise to the first dotted-number segment (e.g. "16.3.0.2847" → "16.3.0")
+            vm2 = re.search(r"(\d+\.\d+(?:\.\d+)?)", version_hint)
+            if vm2:
+                version_hint = vm2.group(1)
+        else:
+            vm = re.search(r"(\d+\.\d+(?:\.\d+)?)", desc)
+            version_hint = vm.group(1) if vm else "unknown"
 
         m = DESC_PATTERN.match(desc)
         if m:
             parsed["parsed_product"].append(m.group("product").strip())
-            parsed["parsed_version"].append(m.group("version").strip())
+            # Change 6: always store the Version-column value as parsed_version
+            # (already computed above as version_hint); ignore the version
+            # captured by DESC_PATTERN from the description prefix.
+            parsed["parsed_version"].append(version_hint if version_hint != "unknown" else m.group("version").strip())
             tags_raw = TAG_PATTERN.findall(m.group("tags"))
             parsed["parsed_tags"].append(tags_raw)
             raw_mod = m.group("module").strip()
@@ -922,7 +1021,8 @@ def parse_ecl_export(
                 )
         else:
             parsed["parsed_product"].append(None)
-            parsed["parsed_version"].append(None)
+            # Even for non-matching rows use the Version column value
+            parsed["parsed_version"].append(version_hint if version_hint != "unknown" else None)
             parsed["parsed_tags"].append([])
             parsed["parsed_module_raw"].append(None)
             parsed["parsed_module"].append(None)
@@ -1036,6 +1136,32 @@ def parse_ecl_export(
 
     df.to_csv(output_path, index=False, encoding="utf-8-sig")
     print(f"\nSaved to: {output_path}")
+
+    # ── Version catalogue ────────────────────────────────────────────────────
+    # Sorted by recency (max Create Date per version group), NOT by version
+    # string.  Sparse versions (< VERSION_SPARSE_THRESHOLD bugs) are ranked
+    # after all real versions so they don't pollute default selections in the
+    # dashboard or the 'latest' scope in fetch_from_n8n.py.
+    cat = build_version_catalogue(df)
+    cat_path = str(Path(output_path).with_name("version_catalogue.csv"))
+    cat.to_csv(cat_path, index=False, encoding="utf-8-sig")
+
+    print("\nVERSION CATALOGUE (sorted by recency, typo/sparse versions last):")
+    print(f"  {'#':>3}  {'Version':<18}  {'Bugs':>5}  {'Latest Create Date':<22}  Sparse?")
+    print(f"  {'─'*3}  {'─'*18}  {'─'*5}  {'─'*22}  {'─'*7}")
+    for _, row in cat.iterrows():
+        flag = "⚠️  sparse" if row["version_is_sparse"] else ""
+        date_str = str(row["latest_create_date"])[:10] if pd.notna(row["latest_create_date"]) else "unknown"
+        print(f"  {int(row['version_rank']):>3}  {str(row['parsed_version']):<18}  "
+              f"{int(row['bug_count']):>5}  {date_str:<22}  {flag}")
+    print(f"\nSaved version catalogue to: {cat_path}")
+    n_sparse = cat["version_is_sparse"].sum()
+    if n_sparse:
+        sparse_list = cat[cat["version_is_sparse"]]["parsed_version"].tolist()
+        print(f"⚠️  {n_sparse} sparse version(s) found (< {VERSION_SPARSE_THRESHOLD} bugs each):")
+        for sv in sparse_list:
+            print(f"     '{sv}' — likely a typo or one-off entry; excluded from default selection")
+
     if total_pending > 0:
         print(
             f"⚠️  {total_pending} module strings pending dashboard review in {store.versions_dir}/"

@@ -73,16 +73,19 @@ def summarize(df):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python cluster_bugs.py <csv> [output]"); sys.exit(1)
+        print("Usage: python cluster_bugs.py <csv>"); sys.exit(1)
     inp = sys.argv[1]
-    out = sys.argv[2] if len(sys.argv) > 2 else Path(inp).stem + "_clustered.csv"
+    inp_dir = Path(inp).parent
+    out_dir = inp_dir / "clusters"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = str(out_dir / (Path(inp).stem + "_clustered.csv"))
     df = pd.read_csv(inp)
     print(f"Loaded {len(df)} bugs")
 
     df = cluster_bugs(df, method="kmeans", n_clusters=25)
     summary = summarize(df)
     if len(summary) > 0:
-        summary.to_csv(Path(out).stem + "_cluster_summary.csv", encoding="utf-8-sig")
+        summary.to_csv(str(out_dir / (Path(inp).stem + "_cluster_summary.csv")), encoding="utf-8-sig")
 
     if "parsed_module" in df.columns:
         for mod in df["parsed_module"].value_counts().head(5).index.tolist():

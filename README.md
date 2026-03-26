@@ -1,26 +1,71 @@
-# PDR-I QA Toolkit v2.5 — Complete Step-by-Step Implementation Guide
+# PDR-I QA Toolkit v2.6 — Complete Step-by-Step Implementation Guide
 
 > Mac Mini M1 · Python 3.14 · Appium · Jenkins · Streamlit  
-> Updated from v2.4 based on session changes.
+> Updated from v2.5 to reflect all session changes through v2.16.
 
 ***
+
+## What Changed in v2.6
+
+### Dashboard (`bug_heatmap_dashboard.py` → v2.16)
+
+| Area | Change |
+|------|--------|
+| **Tab 8 — 🔬 Bug Clusters** | New tab. Loads `ecl_parsed_clustered.csv` + `ecl_parsed_cluster_summary.csv` (Sidebar Step 3). Shows headline metrics (themes found, bugs grouped), a colour-coded bar chart of all themes by size and severity, and expandable per-theme detail cards with sample bug descriptions and a plain-English action line. Designed to be readable by anyone on the team, not just QA. |
+| **Tab 9 — 🔮 Defect Forecast** | New tab. Loads `ecl_parsed_predictions.csv` + `_focus_summary.txt` + `_leading_indicators.csv` (Sidebar Step 4). Shows forecast bug counts per module for the next build, an actual-vs-predicted comparison chart, per-module "what to test" cards in plain English, and a leading-indicators chart explaining which current signals best predict future bugs. |
+| **Sidebar Steps 3 & 4** | Two new optional data loaders added below the existing risk score loader. Step 3 = cluster files, Step 4 = prediction files. Neither is required; the new tabs show a clear setup prompt when files are missing. |
+| **Heatmap colour conflict** | Module × Severity heatmap cells now use a **blue gradient** (`HEATMAP_COLOR_SCALE = "Blues"`) instead of red/orange/yellow, so cell shading never visually clashes with the `[P1]`/`[P2]` priority badge text on the same rows. A caption explains the two-channel encoding. |
+| **Heatmap sort order** | Module × Severity heatmap now sorts rows by **total weighted count** across all severities, so the busiest modules always float to the top. Previously sorted by Critical count only, which buried modules with many Major/Normal bugs. |
+| **Scatter plot overlap** | Risk Score vs Probability scatter now adds ±0.35 random x-jitter so dots at the same integer probability level separate visually. `size_max` reduced 30 → 18, `opacity` set to 0.75. X-axis tick labels remain pinned to integers 1–5. A caption explains the jitter. |
+
+### `predict_defects.py` → v2.2
+
+| Area | Change |
+|------|--------|
+| **Target clarification** | A `PREDICTION_GUIDE` box printed at startup explains exactly what `bug_count` (the target) means, what every feature column represents, what `target` vs `predicted` means, and what each risk level threshold is. A plain-English legend is printed before the results table. |
+| **`dominant_bug_type`** | Each predicted module now carries its most common historical severity (e.g. "crash/Critical (S1)", "Major functional (S2)") so readers know *what kind* of bugs to expect, not just how many. |
+| **Leading indicators** | `compute_leading_indicators()` computes Pearson correlation of each lag feature against the next-build target. Identifies which current bug signals (e.g. "critical-bug momentum in last 3 builds") are most strongly predictive of future issues. Saved to `_leading_indicators.csv`. |
+| **Focus summary** | `generate_focus_summary()` writes a plain-English paragraph per top-risk module: what type of bugs to expect, which signal is driving the risk, and what specific testing action to take. Saved to `_focus_summary.txt`. |
+| **Output files** | Now produces four files: `_predictions.csv`, `_importance.csv`, `_leading_indicators.csv`, `_focus_summary.txt`. |
+
+### `fetch_from_n8n.py`
+
+| Area | Change |
+|------|--------|
+| **Status comparison** | `save_json()` now compares incoming `Status` against the cached value for each `BugCode`. Changed records get `_status_changed=True` + `_prev_status` stored. Unchanged records have `_status_changed=False` explicitly reset so stale flags from previous runs are cleared. Summary prints `New / Status-changed / Unchanged` counts. |
+| **Weekday/weekend scheduling** | `resolve_scope()` + `--scope auto\|latest\|all` flag. Auto mode: weekdays → `scope=latest` (fast, newest version only); weekends → `scope=all` (full history, lets you measure total update time). The actual latest version string is read from `version_catalogue.csv` and sent as `latest_version` in the webhook payload, so n8n filters by an exact version string rather than guessing. |
+
+### `parse_ecl_export.py`
+
+| Area | Change |
+|------|--------|
+| **Version from `Version` column** | `parsed_version` is now read from the dedicated ECL `Version` column first, normalised to the first `X.Y.Z` segment. The previous regex scan of `Short Description` is kept only as a fallback when the column is absent or blank. Non-matching rows also inherit the Version column value instead of getting `None`. |
+| **Version catalogue** | `build_version_catalogue()` groups all bugs by `parsed_version`, finds `max(Create Date)` per group, and ranks versions newest-first by recency — not by string sort order. Versions with fewer than 5 bugs (`VERSION_SPARSE_THRESHOLD`) are flagged `version_is_sparse=True` and ranked after all real versions. Saved to `data/version_catalogue.csv` for all downstream tools to consume. |
+
+### `compute_risk_scores.py` → v2.4
+
+| Area | Change |
+|------|--------|
+| **Recency-ordered per-version registers** | `_version_order()` reads `version_catalogue.csv` (falls back to re-deriving from `Create Date` if absent). Per-version risk registers are generated newest-first. |
+| **Sparse version skipping** | Versions below the sparse threshold are skipped for per-version register generation with a `⚠️ SKIP` log line. They are still included in the combined all-versions register. |
+
+---
 
 ## What Changed in v2.5
 
 | File | Change |
 |------|--------|
-| `parse_ecl_export.py` | **v2.4** — JSON input support for n8n webhook integration. Accepts `.json` files (list of bug objects) produced by `fetch_from_n8n.py` in addition to `.xlsx` / `.csv`. Handles both plain list and n8n's `{"json": {...}}` wrapped shape. Applies `_N8N_COL_MAP` remapping table so the webhook's output field names (`Short Description`, `Create Date`, `Closed Date`, `Build#`, `Close Build#`) map explicitly to internal parser names — all downstream pipeline code unchanged. `Reproduce Probability` is absent from the API; `repro_rate` defaults to `0.5` for all JSON-sourced rows (same as the existing no-repro-column fallback). |
-| `fetch_from_n8n.py` | **New script.** POSTs to the n8n webhook, normalises the n8n item-wrapper shape, audits that all required fields are present (warns on optional missing fields), saves the flat list to `data/ecl_raw.json`. Run with `--then-parse` to chain directly into `parse_ecl_export.py` in one command. |
-| `Dashboard_Query_eBug_List_v3.json` | **Updated n8n workflow.** Renames the `Get Columns_v2` Set node to `Get Columns_v3` with corrected field mappings using the real API field names confirmed from a live sample response: `$json.Build` → `Build#`, `$json.CloseToBuild` → `Close Build#`, `$json.ShortDescription` → `Short Description`, `$json.CreateTime` → `Create Date`, `$json.CloseTime` → `Closed Date`. Adds `Creator` and `Handler` pass-through fields. Removes the fragile `TemplateName.split(ProductName)` expression for `ProjectName` (field unused downstream). |
+| `parse_ecl_export.py` | **v2.4** — JSON input support for n8n webhook integration. Accepts `.json` files (list of bug objects) produced by `fetch_from_n8n.py` in addition to `.xlsx` / `.csv`. Handles both plain list and n8n's `{"json": {...}}` wrapped shape. Applies `_N8N_COL_MAP` remapping table so the webhook's output field names map explicitly to internal parser names. `Reproduce Probability` is absent from the API; `repro_rate` defaults to `0.5` for all JSON-sourced rows. |
+| `fetch_from_n8n.py` | **New script.** POSTs to the n8n webhook, normalises the n8n item-wrapper shape, audits required fields, saves the flat list to `data/ecl_raw.json`. Run with `--then-parse` to chain directly into `parse_ecl_export.py` in one command. |
+| `Dashboard_Query_eBug_List_v3.json` | **Updated n8n workflow.** Renames `Get Columns_v2` → `Get Columns_v3` with corrected field mappings using real API field names. Adds `Creator` and `Handler` pass-through. Removes the fragile `TemplateName.split(ProductName)` expression. |
 
 ---
 
 ## What Changed in v2.4
 
-
 | File | Change |
 |------|--------|
-| `bug_heatmap_dashboard.py` | **v2.14** — Fixed treemap click detection for modules whose name matches their category name (e.g. the "Shortcut" module inside the "Shortcut" category was silently ignored). Root cause: the old guard `clicked_label not in all_categories` evaluated to `False` when label and category are identical. Fix: replaced name-based check with Plotly's `parent` field — category-root nodes have an empty `parent`, module-leaf nodes always have a non-empty `parent`, so the two are unambiguously distinguished. Also reverted responsive layout back to a fixed left/right `[6, 4]` column split; removed the JS width-detection snippet (`components.html` import); removed `wide_layout` / vertical layout logic and the `render_detail_panel` helper. v2.12: dynamic treemap height (min 700 px, max 1100 px, scales with module count); scrollable right panel div capped at treemap height. |
+| `bug_heatmap_dashboard.py` | **v2.14** — Fixed treemap click detection for modules whose name matches their category name. Root cause: old guard `clicked_label not in all_categories` evaluated to `False` when label and category are identical. Fix: replaced with Plotly's `parent` field check. Also reverted responsive layout to fixed `[6, 4]` split; removed JS width-detection snippet; removed `render_detail_panel`. v2.12: dynamic treemap height; scrollable right panel. |
 
 ---
 
@@ -28,11 +73,11 @@
 
 | File | Change |
 |------|--------|
-| `parse_ecl_export.py` | **Automatic sub-variant normalisation** in `normalize_module`: strips trailing parentheticals `Module(Sub)` → `Module`, comma-splits `A, B, C` → `A`, handles `A>B` → `A`. Only 4 hardcoded aliases remain (leading/trailing punctuation, pure acronyms). Added `parsed_module_raw` column (Option B) preserving original ECL string. O(1) alias lookup via lowercase shadow dict. `VersionMappingStore.lookup()` now caches confirmed files to avoid repeated disk scans across 10k+ rows. |
-| `compute_risk_scores.py` | Per-version files now stored in `data/risk_register_versions/` subfolder. Single `groupby` for all tag columns (was one per tag). Single pivot for status counts (was 3 separate groupbys). `low_memory=False` on CSV read. |
-| `ai_risk_scorer.py` | Resume/checkpoint support — skips already-scored modules on restart, saves to disk every 10 modules. Ollama retry logic (2 retries + 2s delay before heuristic fallback). Expanded `IMPACT_OVERRIDES` (all lowercase keys, more modules). Per-version scored files stored in `data/risk_register_versions/`. Scoring method summary + Q4/Q3/Q2/Q1 results printed after each file. |
-| `bug_heatmap_dashboard.py` | **Version-aware risk loading**: single version selected → loads per-version scored file; multiple/all → loads combined `_all` file. Version context banner in Tab 7. `normalise_module()` safety net in dashboard. All `use_container_width` → `width='stretch'`. `low_memory=False` on all CSV reads. `BugCode` column is now a clickable link (regex `display_text`). Dynamic treemap height. Scrollable right panel. Comprehensive `📖` help expanders on all tabs explaining the full I×P×D pipeline. |
-| `predict_defects.py` | Logs number of rows dropped due to non-numeric `Build#` values before the `<20 samples` check. |
+| `parse_ecl_export.py` | Automatic sub-variant normalisation, `parsed_module_raw` column, O(1) alias lookup, `VersionMappingStore` caching. |
+| `compute_risk_scores.py` | Per-version files in `risk_register_versions/` subfolder, single `groupby` for tag columns, single pivot for status counts. |
+| `ai_risk_scorer.py` | Resume/checkpoint support, Ollama retry logic, expanded `IMPACT_OVERRIDES`, per-version scored files. |
+| `bug_heatmap_dashboard.py` | Version-aware risk loading, version context banner, `normalise_module()` safety net, all `use_container_width` → `width='stretch'`, clickable `BugCode` links, dynamic treemap height, comprehensive `📖` expanders on all tabs. |
+| `predict_defects.py` | Logs dropped row count for non-numeric `Build#` before the `<20 samples` check. |
 
 ***
 
@@ -40,21 +85,21 @@
 
 | # | File | Version | Purpose |
 |---|------|---------|---------|
-| 1 | `scripts/parse_ecl_export.py` | v2.4 | Parse ECL Excel / CSV / n8n JSON → enriched CSV |
-| 2 | `scripts/compute_risk_scores.py` | v2.3 | Module metric aggregation → risk register |
-| 3 | `scripts/ai_risk_scorer.py` | v2.3 | Impact/Detectability scoring (heuristic/Ollama/OpenAI) |
+| 1 | `scripts/parse_ecl_export.py` | v2.4+ | Parse ECL Excel / CSV / n8n JSON → enriched CSV + version catalogue |
+| 2 | `scripts/compute_risk_scores.py` | v2.4 | Module metric aggregation → risk register (recency-ordered, sparse-skipping) |
+| 3 | `scripts/ai_risk_scorer.py` | v2.3 | Impact/Detectability scoring (heuristic / Ollama / OpenAI) |
 | 4 | `scripts/auto_tag_tests.py` | v2.1 | pytest skeleton generator |
-| 5 | `scripts/bug_heatmap_dashboard.py` | v2.14 | Streamlit dashboard — 7 tabs, dual-input |
+| 5 | `scripts/bug_heatmap_dashboard.py` | v2.16 | Streamlit dashboard — 9 tabs, 4-step sidebar |
 | 6 | `scripts/cluster_bugs.py` | v2.2 | TF-IDF + K-Means/DBSCAN clustering |
-| 7 | `scripts/predict_defects.py` | v2.1 | Gradient Boosting defect prediction |
+| 7 | `scripts/predict_defects.py` | v2.2 | Gradient Boosting defect prediction with leading indicators + focus summary |
 | 8 | `scripts/visual_regression.py` | v2.1 | Screenshot diff engine |
-| 9 | `Jenkinsfile` | — | Q4→Q3→Q2→Q1 CI/CD pipeline |
-| 10 | `tests/conftest.py` | — | Appium + visual regression fixtures |
-| 11 | `pytest.ini` | — | Marker registration |
-| 12 | `requirements.txt` | — | Python dependencies |
-| 13 | `tests/test_ai_storytelling.py` | — | Example Q4 test |
-| 14 | `setup_mac_mini.sh` | — | One-command M1 setup + LaunchAgent |
-| 15 | `scripts/fetch_from_n8n.py` | v1.0 | Fetch bugs from n8n webhook → `data/ecl_raw.json` |
+| 9 | `scripts/fetch_from_n8n.py` | v1.1 | Fetch bugs from n8n webhook → `data/ecl_raw.json` (status comparison, scope scheduling) |
+| 10 | `Jenkinsfile` | — | P1→P2→P3→P4 CI/CD pipeline |
+| 11 | `tests/conftest.py` | — | Appium + visual regression fixtures |
+| 12 | `pytest.ini` | — | Marker registration |
+| 13 | `requirements.txt` | — | Python dependencies |
+| 14 | `tests/test_ai_storytelling.py` | — | Example P1 test |
+| 15 | `setup_mac_mini.sh` | — | One-command M1 setup + LaunchAgent |
 | 16 | `n8n/Dashboard_Query_eBug_List_v3.json` | v3 | n8n workflow — queries eCL eBug API and returns normalised bug records |
 
 ***
@@ -69,21 +114,26 @@ pdri-qa-toolkit/
 ├── Jenkinsfile
 ├── README.md
 ├── data/
-│   ├── ecl_export.xlsx                    ← you provide this (ECL export, optional)
-│   ├── ecl_raw.json                       ← Step 2.1b output (from n8n webhook)
-│   ├── ecl_parsed.csv                     ← Step 2.2 output
-│   ├── risk_register_all.csv              ← Step 3.1 output (combined)
-│   ├── risk_register_scored_all.csv       ← Step 3.2 output ← Dashboard Step 2 input
-│   ├── risk_register_versions/            ← per-version files (auto-created)
+│   ├── ecl_export.xlsx                          ← you provide this (ECL export, optional)
+│   ├── ecl_raw.json                             ← Step 2.1a output (from n8n webhook)
+│   ├── ecl_parsed.csv                           ← Step 2.2 output  ← Dashboard Step 1
+│   ├── version_catalogue.csv                    ← Step 2.2 output  (recency-ordered version list)
+│   ├── risk_register_all.csv                    ← Step 3.1 output (combined)
+│   ├── risk_register_scored_all.csv             ← Step 3.2 output  ← Dashboard Step 2
+│   ├── risk_register_versions/                  ← per-version files (auto-created, newest-first)
 │   │   ├── risk_register_16.4.0.csv
 │   │   ├── risk_register_scored_16.4.0.csv
 │   │   └── ...
-│   ├── module_mappings/                   ← fuzzy match store (auto-created)
-│   │   ├── permanent/mappings_global.json ← promoted confirmed mappings
-│   │   └── versions/                      ← per-version pending/confirmed files
-│   ├── ecl_clustered.csv                  ← Step 6.1 output
-│   ├── predictions.csv                    ← Step 6.2 output
-│   └── quadrant_summary.md               ← Step 3.3 output
+│   ├── module_mappings/                         ← fuzzy match store (auto-created)
+│   │   ├── permanent/mappings_global.json
+│   │   └── versions/
+│   ├── ecl_parsed_clustered.csv                 ← Step 6.1 output  ← Dashboard Step 3
+│   ├── ecl_parsed_cluster_summary.csv           ← Step 6.1 output  ← Dashboard Step 3
+│   ├── ecl_parsed_predictions.csv               ← Step 6.2 output  ← Dashboard Step 4
+│   ├── ecl_parsed_predictions_focus_summary.txt ← Step 6.2 output  ← Dashboard Step 4
+│   ├── ecl_parsed_predictions_leading_indicators.csv  ← Step 6.2 output  ← Dashboard Step 4
+│   ├── ecl_parsed_predictions_importance.csv    ← Step 6.2 output (model feature importances)
+│   └── quadrant_summary.md                      ← Step 3.3 output
 ├── scripts/
 │   ├── fetch_from_n8n.py
 │   ├── parse_ecl_export.py
@@ -95,11 +145,11 @@ pdri-qa-toolkit/
 │   ├── predict_defects.py
 │   └── visual_regression.py
 ├── n8n/
-│   └── Dashboard_Query_eBug_List_v3.json  ← import into n8n to enable webhook
+│   └── Dashboard_Query_eBug_List_v3.json
 ├── tests/
 │   ├── conftest.py
 │   ├── test_ai_storytelling.py
-│   └── generated/               ← auto-created by Step 3.3
+│   └── generated/
 ├── visual_baselines/
 └── visual_results/
 ```
@@ -165,7 +215,7 @@ Expected output: `All packages OK` and Appium version number.
 
 ## Phase 2 — ECL Data Export & Parsing (Days 2–3)
 
-There are now **two ways** to get bug data into the pipeline. Use whichever fits your workflow.
+There are two ways to get bug data into the pipeline. Use whichever fits your workflow.
 
 ---
 
@@ -181,14 +231,29 @@ There are now **two ways** to get bug data into the pipeline. Use whichever fits
 
 ```bash
 source .venv/bin/activate
-python scripts/fetch_from_n8n.py   --webhook-url https://your-n8n-host/webhook/82746bb5-e140-4720-98a3-d1965900274d   --output data/ecl_raw.json
+python scripts/fetch_from_n8n.py \
+  --webhook-url https://your-n8n-host/webhook/82746bb5-e140-4720-98a3-d1965900274d \
+  --output data/ecl_raw.json
 ```
 
 Or fetch and parse in one command:
 
 ```bash
-python scripts/fetch_from_n8n.py   --webhook-url https://your-n8n-host/webhook/82746bb5-e140-4720-98a3-d1965900274d   --then-parse
+python scripts/fetch_from_n8n.py \
+  --webhook-url https://your-n8n-host/webhook/82746bb5-e140-4720-98a3-d1965900274d \
+  --then-parse
 ```
+
+**Scheduling mode (new in v2.6):**
+```bash
+# Auto mode (default): weekdays fetch latest version only, weekends fetch all
+python scripts/fetch_from_n8n.py --scope auto --then-parse
+
+# Force full fetch regardless of day
+python scripts/fetch_from_n8n.py --scope all --then-parse
+```
+
+The script prints `New: N | Status-changed: N | Unchanged: N` after each run. Records whose Status changed since the last fetch are flagged with `_status_changed=True` in `ecl_raw.json` for traceability.
 
 **What fields the API provides:**
 
@@ -200,7 +265,7 @@ python scripts/fetch_from_n8n.py   --webhook-url https://your-n8n-host/webhook/8
 | `Status` | `Status` | Exact match |
 | `CreateTime` | `Create Date` | ISO datetime |
 | `CloseTime` | `Closed Date` | ISO datetime, nullable |
-| `Version` | `Version` | e.g. `16.3.5` |
+| `Version` | `Version` | e.g. `16.3.5` — now used as authoritative `parsed_version` source |
 | `Build` | `Build#` | Numeric build ID |
 | `CloseToBuild` | `Close Build#` | Nullable |
 | `Creator` | `Creator` | Username string |
@@ -208,8 +273,6 @@ python scripts/fetch_from_n8n.py   --webhook-url https://your-n8n-host/webhook/8
 | `BugBelong` | `BugBelong` | RD / QA attribution |
 | `Handler` | `Handler` | Current assignee |
 | `Reproduce Probability` | — | **Not in API** — `repro_rate` defaults to `0.5` |
-
-Then proceed to **Step 2.2**.
 
 ---
 
@@ -250,59 +313,41 @@ source .venv/bin/activate
 python scripts/parse_ecl_export.py data/ecl_export.xlsx data/ecl_parsed.csv
 ```
 
-The parser now accepts `.json`, `.xlsx`, and `.csv` inputs transparently — all produce the same `ecl_parsed.csv` output format.
+The parser accepts `.json`, `.xlsx`, and `.csv` inputs transparently — all produce the same `ecl_parsed.csv` format.
 
 What it does:
 - Parses every Short Description in format `PDR-I 16.2.5 - [EDF][UX] AI Storytelling: subtitle misplaced`
 - Extracts: product code, version, tags, module name, description
-- **Automatic sub-variant normalisation** (new in v2.3):
-  - Strips trailing parentheticals: `Auto Edit(Pet 02)` → `Auto Edit`, `Text(Neon_01)` → `Text`
-  - Comma-splits compound names: `Text, Title, MGT` → `Text`, `Launcher, Shortcut` → `Launcher`
-  - Handles `>` notation: `Menu>Sign in` → `Menu`
-- Applies typo aliases (e.g. `HQ Auido Denoise` → `HQ Audio Denoise`)
-- Falls back to fuzzy matching (rapidfuzz, threshold 85%) for unrecognised strings
-- Low-confidence matches go to `data/module_mappings/versions/<ver>_pending.json` for your review
-- Confirmed matches are saved to `data/module_mappings/versions/<ver>_confirmed.json` and promoted to `permanent/mappings_global.json`
+- **`parsed_version` from `Version` column (new in v2.6):** reads the dedicated `Version` field instead of regex-scraping it from Short Description. Falls back to Short Description scan only when the field is absent or blank. This avoids mismatches caused by copy-paste errors or version prefix formatting differences.
+- **Automatic sub-variant normalisation:** strips trailing parentheticals (`Auto Edit(Pet 02)` → `Auto Edit`), comma-splits compound names, handles `>` notation
+- Applies typo aliases and fuzzy matching (rapidfuzz, threshold 85%)
 - Maps every module to one of 20 top-level categories
-- Creates boolean tag columns: `tag_edf`, `tag_ux`, `tag_side_effect`, `tag_at_found`, `tag_mui`, etc.
-- Saves both `parsed_module` (normalised) and `parsed_module_raw` (original ECL string) for traceability
+- Creates boolean tag columns: `tag_edf`, `tag_ux`, `tag_side_effect`, `tag_at_found`, etc.
+- Saves both `parsed_module` (normalised) and `parsed_module_raw` (original ECL string)
 - Parses severity to numeric (1–4) and weighted (S1×10 / S2×5 / S3×2 / S4×1)
-- Parses reproduce probability to float (0.0–1.0)
 - Computes `days_to_close` and `builds_to_fix`
+- **Generates `version_catalogue.csv` (new in v2.6):** ranks all versions by recency (`max(Create Date)` per version group). Versions with fewer than 5 bugs are flagged `version_is_sparse=True` and ranked last to prevent typo versions from appearing as "newest."
 
 **Expected output:**
 ```
 Loaded 9992 bugs
-Parsing Short Descriptions...
 
 PARSING SUMMARY
 Total bugs:            9992
 Successfully parsed:   9654 (96.6%)
-Unique modules:        ~90–150 (depends on data)
-Fuzzy threshold used:  85%
+Unique modules:        ~90–150
 
-Top 10 modules:
-  Auto Edit                     991
-  Shortcut                      853
-  ...
-
-PENDING review for version 16.4.0 (N entries):
-  'Some Module(Sub)' → suggested: 'Some Module'
-  ...
-
-✅ No uncategorized modules!  (or small number needing confirmation)
+VERSION CATALOGUE (sorted by recency, typo/sparse versions last):
+  #   Version             Bugs   Latest Create Date       Sparse?
+  1   16.4.0              412    2025-03-18               
+  2   16.3.5              387    2025-02-04               
+  3   16.3.0              290    2024-11-11               
+  4   16.0a               2      2024-10-30               ⚠️  sparse
 ```
 
 ### Step 2.3 — Review and Confirm Pending Mappings
 
-After parsing, check `data/module_mappings/versions/` for `*_pending.json` files. These contain strings the fuzzy matcher found a near-match for (score 65–84%) but didn't auto-confirm.
-
-To confirm a batch of pending entries, edit the JSON file and set `"confirmed": true` for each correct suggestion, then re-run the parser — confirmed entries will be used on the next run and promoted to `permanent/mappings_global.json`.
-
-**Action items if parse rate < 90%:**
-- Check if Short Descriptions follow `PRODUCT VERSION - [TAGS] MODULE: description` format
-- Genuinely new module names will be caught by fuzzy matching automatically
-- Only add to `MODULE_ALIASES` in `parse_ecl_export.py` for strings that fuzzy matching structurally cannot handle (leading/trailing punctuation, pure acronyms)
+After parsing, check `data/module_mappings/versions/` for `*_pending.json` files. These contain strings the fuzzy matcher found a near-match for (score 65–84%) but didn't auto-confirm. Edit the JSON and set `"confirmed": true` for each correct suggestion, then re-run the parser.
 
 ### Step 2.4 — Review Parser Output
 
@@ -322,7 +367,7 @@ print(df.severity_num.value_counts().sort_index())
 
 ***
 
-## Phase 3 — Risk Scoring & Quadrant Assignment (Days 3–4)
+## Phase 3 — Risk Scoring & Priority Assignment (Days 3–4)
 
 ### Step 3.1 — Generate Risk Register
 
@@ -340,24 +385,20 @@ Per-module metrics computed:
 
 Produces:
 - `data/risk_register_all.csv` — combined across all versions
-- `data/risk_register_versions/risk_register_<ver>.csv` — one per version (stored in subfolder)
+- `data/risk_register_versions/risk_register_<ver>.csv` — one per non-sparse version, **newest first** (new in v2.6). Sparse/typo versions are skipped with a `⚠️ SKIP` warning.
 
-### Step 3.2 — Score Impact & Detectability with Local LLM
-
-```bash
-python scripts/ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv --provider heuristic
-```
+### Step 3.2 — Score Impact & Detectability
 
 Three provider options:
 
 **Option A — Heuristic (instant, no dependencies, recommended first run):**
 ```bash
-python scripts/ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv --provider heuristic
+python scripts/ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv \
+  --provider heuristic
 ```
 
-**Option B — Ollama (local LLM, free, ~2–5 minutes for ~90 modules):**
+**Option B — Ollama (local LLM, free, ~2–5 min for ~90 modules):**
 ```bash
-# Ollama is likely already running; if not: ollama serve &>/dev/null & sleep 5
 python scripts/ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv \
   --provider ollama --model qwen3:7b
 # 8 GB Mac Mini:
@@ -372,34 +413,18 @@ python scripts/ai_risk_scorer.py data/risk_register_all.csv data/risk_register_s
   --provider openai
 ```
 
-**Resume support:** If the run is interrupted, simply rerun the same command. Already-scored modules are skipped automatically. Progress is checkpointed to disk every 10 modules so at most 10 modules of work are lost on a crash.
+**Resume support:** If the run is interrupted, simply rerun the same command. Already-scored modules are skipped automatically. Progress is checkpointed every 10 modules.
 
-**Output per module (all three modes):**
+**Output per module:**
 - `impact_score` (1–5) — domain severity if module breaks
-- `detectability_score` (1–5) — how hard bugs are to catch
+- `detectability_score` (1–5) — how hard bugs are to catch before release
 - `probability_score_auto` (1–5) — quintile rank of historical bug density
 - `risk_score_final` = Impact × Probability × Detectability (max 125)
-- `quadrant`: Q4 (≥60), Q3 (30–59), Q2 (10–29), Q1 (<10)
+- `quadrant`: P1 ≥60 / P2 30–59 / P3 10–29 / P4 <10
 
 Produces:
-- `data/risk_register_scored_all.csv` — combined scored file (Dashboard Step 2 input)
+- `data/risk_register_scored_all.csv` ← Dashboard Step 2 input
 - `data/risk_register_versions/risk_register_scored_<ver>.csv` — one per version
-
-**Expected output:**
-```
-Scoring 90 modules from data/risk_register_all.csv
-
-RISK SCORING RESULTS
-Q4 - Test First (12 modules):
-  AI Storytelling   Score:100  I:5 P:5 D:4
-  Export            Score: 75  I:5 P:5 D:3
-  Auto Edit         Score: 60  I:5 P:4 D:3
-Q3 - Test Second (23 modules):
-  Auto Captions     Score: 48  I:4 P:4 D:3
-  ...
-
-heuristic   : 90 modules
-```
 
 ### Step 3.3 — Generate Test Skeletons & Management Summary
 
@@ -408,23 +433,17 @@ python scripts/auto_tag_tests.py data/risk_register_scored_all.csv \
   --generate-skeletons tests/generated/ --summary
 ```
 
-Creates:
-- One `test_<module>.py` per module with correct `@pytest.mark.q4` (or q3/q2/q1) markers
-- Allure `suite`/`sub-suite`/`tag` decorators
-- Severity matched to quadrant (Q4=CRITICAL, Q1=TRIVIAL)
-- Three skeleton test methods per file
-- `data/quadrant_summary.md` — formatted table ready for management
+Creates one `test_<module>.py` per module with `@pytest.mark.p1` (or p2/p3/p4) markers, Allure decorators, and `data/quadrant_summary.md`.
 
 ### Step 3.4 — Optional: Team Refinement Workshop
 
 1. Upload `data/risk_register_scored_all.csv` to Google Sheets
-2. Share with team
-3. In a 2-hour meeting: review AI-assigned `impact_score` and `detectability_score`
-4. Override scores the team disagrees with (AI is a starting point, not final)
-5. Re-export corrected CSV, then re-run:
+2. Review AI-assigned `impact_score` and `detectability_score` with team
+3. Re-export corrected CSV, then re-run:
 
 ```bash
-python scripts/ai_risk_scorer.py data/risk_register_corrected.csv data/risk_register_final.csv --provider heuristic
+python scripts/ai_risk_scorer.py data/risk_register_corrected.csv data/risk_register_final.csv \
+  --provider heuristic
 python scripts/auto_tag_tests.py data/risk_register_final.csv --tag-existing tests/ --summary
 ```
 
@@ -442,71 +461,73 @@ streamlit run scripts/bug_heatmap_dashboard.py \
   --server.headless true
 ```
 
-Access from any team device on the same network at: `http://<mac-mini-ip>:8501`
+Access from any team device on the same network: `http://<mac-mini-ip>:8501`
 
 ```bash
 # Find Mac Mini IP:
 ipconfig getifaddr en0
 ```
 
-**Note:** Port 8501 may already be in use if Streamlit is running. Find and kill the existing process:
-```bash
-lsof -i :8501        # find the PID
-kill -9 <PID>        # kill it
-```
-Or use a different port with `--server.port 8502`.
-
 ### Step 4.2 — Load Data into Dashboard
 
-The dashboard uses a **dual-input system**:
+The dashboard uses a **four-step sidebar**:
 
-**Step 1 (required) — Bug data (File Path mode):**
-Set path to `data/ecl_parsed.csv` → unlocks tabs 1–6
+| Step | File | Required | Unlocks |
+|------|------|----------|---------|
+| **Step 1** — Bug data | `data/ecl_parsed.csv` | ✅ Required | Tabs 1–6 |
+| **Step 2** — Risk scores | `data/risk_register_scored_all.csv` | Optional | Tab 7 (Risk Heatmap), risk badges on all other tabs |
+| **Step 3** — Bug clusters | `data/ecl_parsed_clustered.csv` + `ecl_parsed_cluster_summary.csv` | Optional | Tab 8 (Bug Clusters) |
+| **Step 4** — Defect forecast | `data/ecl_parsed_predictions.csv` + `_focus_summary.txt` + `_leading_indicators.csv` | Optional | Tab 9 (Defect Forecast) |
 
-**Step 2 (optional, recommended) — Risk scores (File Path mode):**
-Set path to `data/risk_register_scored_all.csv` → enriches all tabs with risk scores, unlocks Tab 7
-
-The dashboard automatically resolves per-version scored files from `data/risk_register_versions/` — when a single version is selected in the sidebar filter, it loads that version's specific scores. When multiple or all versions are selected, it uses the combined `_all` file.
+The dashboard reads `data/version_catalogue.csv` (produced by the parser) to order the version picker by recency and exclude sparse/typo versions from the default selection. When the catalogue is absent it falls back to deriving the same ordering live from the bug data.
 
 ### Step 4.3 — Dashboard Tabs
 
-| Tab | Name | Data Source | What It Shows |
-|-----|------|-------------|---------------|
-| 1 | Module × Severity | Bug-level | Heatmap of bug density by module/category and severity (1–4). `[Q4]`/`[Q3]` badges when risk data is loaded |
-| 2 | Version Timeline | Bug-level | Severity-weighted bugs per module across versions — reveals regressions |
-| 3 | Tag Analysis | Bug-level | Tag distribution heatmap. Regression hotspots (Side Effect), AT blind spots |
-| 4 | Priority vs Severity | Bug-level | QA severity vs RD priority mismatch matrix |
-| 5 | Team Coverage | Bug-level | Tester × Category matrix — knowledge silo detection |
-| 6 | KPI Dashboard | Bug-level + Risk | Total bugs, critical count, weekly trend, severity pie. Q4 count + avg risk score when risk data loaded |
-| 7 | Risk Heatmap | **Risk-scored** | Interactive treemap. Version-aware: shows per-version or combined scores based on sidebar filter. Click any module to see its bugs in the right panel. Module click detection uses Plotly's `parent` field (v2.14) so modules whose name matches their category (e.g. "Shortcut") are correctly handled. |
+| Tab | Name | Requires | What It Shows |
+|-----|------|----------|---------------|
+| 1 | 🗺️ Module × Severity | Step 1 | Heatmap of bug density by module/category and severity. Cell shade uses a **blue gradient** (separate from priority colours). `[P1]`/`[P2]` badges when risk data loaded. Sorted by total weighted count (busiest modules at top). |
+| 2 | 📅 Version Timeline | Step 1 | Severity-weighted bugs per module across versions — reveals regressions |
+| 3 | 🏷️ Tag Analysis | Step 1 | Tag distribution heatmap, regression rate, AT coverage blind spots |
+| 4 | ⚖️ P/S Alignment | Step 1 | QA severity vs RD priority mismatch matrix |
+| 5 | 👥 Team Coverage | Step 1 | Tester × Category matrix — knowledge silo detection |
+| 6 | 📊 KPI Dashboard | Steps 1–2 | Total bugs, critical count, weekly trend, severity pie. P1/P2 counts + avg risk score when risk data loaded. |
+| 7 | 🔥 Risk Heatmap | Steps 1–2 | Interactive treemap with version-aware scores. Click any module to see its bugs. P1 bar chart. Risk vs Probability scatter (jittered for readability). |
+| 8 | 🔬 Bug Clusters | Steps 1+3 | Theme overview bar chart, expandable per-theme cards with sample bugs and plain-English action lines. |
+| 9 | 🔮 Defect Forecast | Steps 1+4 | Forecast bar chart, actual-vs-predicted comparison, per-module "what to test" cards, leading indicators chart. |
 
-Each tab has a **📖 How to read this chart** expander explaining the data source, what the numbers mean, and how the scores were calculated.
+Each tab has a **📖 How to read this chart** expander written for both QA engineers and non-technical team members.
 
-### Step 4.4 — Risk Heatmap Tab (Tab 7) — Detail
+### Step 4.4 — Bug Clusters Tab (Tab 8) — Detail
 
-**Version context:** A banner at the top shows which data is currently displayed:
-- Single version selected → per-version scored file used (falls back to combined if not available)
-- Multiple or all versions → combined `risk_register_scored_all.csv` used
+**What "themes" are:**
+`cluster_bugs.py` groups all bugs by the keywords that appear most often in their descriptions. Each cluster is named by its top 2–3 keywords (e.g. `ai storytelling | subtitle | timing`). Think of each cluster as a *recurring complaint type*.
 
-**Color options (radio button):**
-- **Risk Score (LLM)** — Color = `risk_score_final` (I×P×D). Scale: yellow (low) → red (high). Primary view.
-- **Quadrant** — Color by Q4 (red) / Q3 (orange) / Q2 (yellow) / Q1 (green)
-- **Critical Count** — Color = number of S1 bugs
-- **Severity Weight** — Color = weighted sum (S1×10 + S2×5 + S3×2 + S4×1)
+**Colour coding:** Each theme bar is coloured by average severity of the bugs it contains:
+- 🔴 Red = Mostly Critical (avg severity < 1.5)
+- 🟠 Orange = Mostly Major (1.5–2.5)
+- 🟡 Yellow = Mostly Normal (2.5–3.5)
+- 🟢 Green = Mostly Minor (> 3.5)
 
-**Rectangle size** = bug count from `ecl_parsed.csv`
+**Cards:** Each expandable card shows bug count, average severity, affected modules, 6 sample bug descriptions, and a one-line action ("🚨 Immediate attention — escalate to RD" / "✅ Low priority — standard release cycle").
 
-**Hierarchy**: Category → Module. Click any module block to show its individual bugs in the right panel.
+### Step 4.5 — Defect Forecast Tab (Tab 9) — Detail
 
-**Sunburst view** available in expandable section below treemap.
+**What is being predicted:**
+The model counts new bugs per module per build over history, learns the pattern, and forecasts how many new bugs each module will produce in the **next build**. This is a raw count, not severity-weighted.
 
-**Category Summary table** shows: Modules, Total Bugs, Severity Weight, Avg Risk Score, Q4 count per category.
+**Risk levels:**
+| Level | Predicted bugs | Testing cadence |
+|-------|---------------|-----------------|
+| 🔴 Critical | > 10 | Every build |
+| 🟠 High | 6–10 | Every sprint |
+| 🟡 Medium | 3–5 | Release-candidate pass |
+| 🟢 Low | < 3 | Full release cycle |
 
-**Q4 bar chart** ranks Q4 modules by risk score descending.
+**Module cards** explain each high-risk module in plain English: what type of bugs to expect, which current signal is driving the risk (e.g. "driven by critical-bug momentum in last 3 builds"), and exactly what to test.
 
-**Risk vs Probability scatter** appears when `probability_score_auto` is available.
+**Leading indicators chart:** Shows which current bug signals are most strongly correlated with future bug counts. A red bar means "more of this signal now → more bugs next build." Written in plain English — not feature variable names.
 
-### Step 4.5 — Enable Auto-Start on Login
+### Step 4.6 — Enable Auto-Start on Login
 
 ```bash
 launchctl load ~/Library/LaunchAgents/com.pdri.qa-dashboard.plist
@@ -526,48 +547,80 @@ Every Monday morning (or after each ECL export):
 cd ~/pdri-qa-toolkit
 source .venv/bin/activate
 
-# 1a. Fetch fresh data via n8n webhook (recommended)
+# 1. Fetch fresh data (auto-mode: weekday → latest version only, weekend → all)
 python scripts/fetch_from_n8n.py \
   --webhook-url https://your-n8n-host/webhook/82746bb5-e140-4720-98a3-d1965900274d \
+  --scope auto \
   --output data/ecl_raw.json
 
-# 1b. Or export manually from ECL → save as data/ecl_export.xlsx
-
-# 2. Re-parse (works with both .json and .xlsx inputs)
+# 2. Re-parse (updates ecl_parsed.csv and version_catalogue.csv)
 python scripts/parse_ecl_export.py data/ecl_raw.json data/ecl_parsed.csv
-# or: python scripts/parse_ecl_export.py data/ecl_export.xlsx data/ecl_parsed.csv
 
 # 3. Re-score (only needed if quadrant assignments need updating)
 python scripts/compute_risk_scores.py data/ecl_parsed.csv data/risk_register_all.csv
 python scripts/ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv \
   --provider heuristic
 
-# 4. Refresh dashboard — click Streamlit's "Rerun" button or reload browser
+# 4. Refresh clustering and predictions (run Friday or when patterns feel stale)
+python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv
+python scripts/predict_defects.py data/ecl_parsed.csv data/ecl_parsed_predictions.csv
+
+# 5. Refresh dashboard — reload the browser tab (Streamlit auto-picks up new CSVs)
 ```
 
-**Note on pending mappings:** After re-parsing, check for new entries in `data/module_mappings/versions/*_pending.json`. These are new module strings the fuzzy matcher found but wasn't confident enough to auto-confirm. Review and confirm them once — they'll be used automatically on all future runs.
+**Weekend full-refresh timing experiment:**
+On the first Saturday after setup, run with `--scope all` to measure total fetch + parse + score + cluster + predict time. This gives a benchmark for how long a full data refresh takes so you can decide whether it fits in an overnight cron job.
+
+```bash
+python scripts/fetch_from_n8n.py --scope all --then-parse
+time python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv
+time python scripts/predict_defects.py data/ecl_parsed.csv data/ecl_parsed_predictions.csv
+```
 
 ***
 
-## Phase 6 — NLP Clustering & Prediction (Optional)
+## Phase 6 — NLP Clustering & Prediction
 
 ### Step 6.1 — Cluster Similar Bugs
 
 ```bash
-python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_clustered.csv
+python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv
 ```
 
-Uses TF-IDF + K-Means globally (25 clusters) and DBSCAN per-module (top 5 modules). Falls back from bigrams to unigrams if vocabulary too sparse. Outputs `ecl_clustered.csv` and `data/cluster_summary.csv`.
+Uses TF-IDF + K-Means globally (25 clusters) and DBSCAN per-module (top 5 modules). Falls back from bigrams to unigrams if vocabulary too sparse.
+
+**Output files (load in Dashboard Step 3):**
+- `data/ecl_parsed_clustered.csv` — full bug-level file with `cluster_id` and `cluster_label` columns
+- `data/ecl_parsed_cluster_summary.csv` — one row per cluster: keyword label, bug count, affected modules, average severity
 
 ### Step 6.2 — Predict Next Build's Defects
 
 ```bash
-python scripts/predict_defects.py data/ecl_parsed.csv data/predictions.csv
+python scripts/predict_defects.py data/ecl_parsed.csv data/ecl_parsed_predictions.csv
 ```
 
-Requires numeric build numbers in `Build#` column. Needs ≥20 build-module data points. Uses lag features (bugs in last 1/3/5 builds, severity trends) in a Gradient Boosting model.
+Requires numeric `Build#` values. Needs ≥20 build-module data points (at least 5 builds per module with bugs). Version strings in `Build#` are dropped automatically with a count logged.
 
-**Note:** If `Build#` contains version strings (e.g. `16.3.0.2847`) rather than plain integers, those rows are automatically dropped. The script will log how many were dropped so you can verify this isn't removing too much data.
+At startup the script prints a full guide explaining what is being predicted, what each feature means, and how to interpret the output. No data-science background required.
+
+**Output files (load in Dashboard Step 4):**
+
+| File | Contains |
+|------|----------|
+| `ecl_parsed_predictions.csv` | Per-module: `predicted` (next build), `target` (last build actual), `risk_level`, `dominant_bug_type`, `leading_signal` |
+| `ecl_parsed_predictions_focus_summary.txt` | Plain-English paragraph per top-risk module: what to test, why risk is high, what bug type to expect |
+| `ecl_parsed_predictions_leading_indicators.csv` | Pearson correlation of each feature vs future bug count — shows which current signals best predict next build |
+| `ecl_parsed_predictions_importance.csv` | Model feature importances (Gradient Boosting internal ranking) |
+
+**Example focus summary output:**
+```
+📍 Export  →  predicted 14 bugs  [Critical]
+   Bug type to expect : crash/Critical (S1)
+   Leading signal     : critical-bug momentum (last 3 builds)
+   Testing advice     : Mandatory — add to test suite for every build.
+                        Focus on crash scenarios, data loss, and any
+                        recently changed functionality.
+```
 
 ***
 
@@ -610,24 +663,22 @@ Failed visual tests produce diff images in `visual_results/` with red overlays o
 
 ### Step 8.2 — Pipeline Stages
 
-The Jenkinsfile runs tests in quadrant priority order:
-
 ```
-Setup → Q4 (Critical) → Q3 (Important) → Q2 (Standard) → Q1 (Low Risk) → Visual Regression
+Setup → P1 (Critical) → P2 (High) → P3 (Medium) → P4 (Low) → Visual Regression
 ```
 
 Use the `TEST_SCOPE` parameter to control which stages run:
-- `q4` — smoke tests only (fastest, ~5 min)
-- `q4,q3` — critical + important (~15 min)
-- `q4,q3,q2,q1` — full suite
+- `p1` — smoke tests only (fastest, ~5 min)
+- `p1,p2` — critical + high (~15 min)
+- `p1,p2,p3,p4` — full suite
 - `visual` — visual regression only
 
 ### Step 8.3 — Allure Reporting
 
 Results are published to Allure automatically. Each test shows:
-- **Suite**: Module Category (e.g., `AI Features`)
-- **Sub-suite**: Module name (e.g., `AI Storytelling`)
-- **Tag**: Quadrant (`Q4`, `Q3`, `Q2`, `Q1`)
+- **Suite**: Module Category (e.g. `AI Features`)
+- **Sub-suite**: Module name (e.g. `AI Storytelling`)
+- **Tag**: Priority (`P1`, `P2`, `P3`, `P4`)
 
 ***
 
@@ -637,25 +688,27 @@ Results are published to Allure automatically. Each test shows:
 
 | Day | Task | Time |
 |-----|------|------|
-| Monday | Fetch fresh ECL data via n8n webhook (or manual export) → parse + risk score | 20 min |
+| Monday | Fetch fresh ECL data (`--scope auto`) → parse + risk score | 20 min |
 | Monday | Review pending mappings in `module_mappings/versions/` | 10 min |
-| Monday | Review dashboard for new hotspots | 15 min |
+| Monday | Review dashboard for new hotspots (Tabs 1, 6, 7) | 15 min |
 | Wednesday | Review Allure report, update failing tests | 1 hr |
-| Friday | Run clustering to find new bug patterns | 15 min |
+| Friday | Re-run clustering + predictions, check Tab 8 and Tab 9 for new patterns | 15 min |
+| Friday | Review `_focus_summary.txt` with team — confirm next build test focus | 10 min |
 
 ### Monthly Cadence
 
-- Re-run `ai_risk_scorer.py` with latest data (quadrant assignments may shift)
+- Re-run `ai_risk_scorer.py` with latest data (priority assignments may shift)
 - Run `auto_tag_tests.py --tag-existing tests/` to update markers on existing tests
-- Review `data/quadrant_summary.md` with team — validate Q4/Q3 modules still correct
-- Promote confirmed pending mappings: open `*_confirmed.json` files and check they look correct, then they auto-promote to `mappings_global.json` on next parse run
+- Review `data/quadrant_summary.md` with the team — validate P1/P2 modules are still correct
+- Compare this month's `_leading_indicators.csv` against last month — check whether the predictive signals are shifting
+- Promote confirmed pending mappings (they auto-promote to `mappings_global.json` on next parse run)
 
 ### When New Modules Are Added
 
-1. Re-run the parser — new modules will be caught by fuzzy matching automatically
+1. Re-run the parser — new modules are caught by fuzzy matching automatically
 2. Review `*_pending.json` for the new module's suggestions and confirm
 3. If the new module is a high-impact feature, add it to `IMPACT_OVERRIDES` in `ai_risk_scorer.py`
-4. Re-run the full pipeline (Steps 2.2 → 3.2 → 3.3)
+4. Re-run the full pipeline (Steps 2.2 → 3.2 → 3.3 → 6.1 → 6.2)
 
 **You no longer need to manually add new modules to `MODULE_ALIASES` or `MODULE_CATEGORIES`** unless the module name is structurally unparseable (leading/trailing punctuation, pure acronym with no word overlap).
 
@@ -667,11 +720,14 @@ Results are published to Allure automatically. Each test shows:
 ```bash
 source .venv/bin/activate && \
 python scripts/fetch_from_n8n.py \
-  --webhook-url https://your-n8n-host/webhook/82746bb5-e140-4720-98a3-d1965900274d \
-  --then-parse && \
+  --scope auto --then-parse && \
 python scripts/compute_risk_scores.py data/ecl_parsed.csv data/risk_register_all.csv && \
+ollama serve &>/dev/null & sleep 5 && \
 python scripts/ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv --provider ollama --model llama3.1 && \
-python scripts/auto_tag_tests.py data/risk_register_scored_all.csv --generate-skeletons tests/generated/ --summary && \
+python scripts/auto_tag_tests.py data/risk_register_scored_all.csv \
+  --generate-skeletons tests/generated/ --summary && \
+python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv && \
+python scripts/predict_defects.py data/ecl_parsed.csv data/ecl_parsed_predictions.csv && \
 streamlit run scripts/bug_heatmap_dashboard.py --server.address 0.0.0.0 --server.port 8501
 ```
 
@@ -682,11 +738,18 @@ python scripts/parse_ecl_export.py data/ecl_export.xlsx data/ecl_parsed.csv && \
 python scripts/compute_risk_scores.py data/ecl_parsed.csv data/risk_register_all.csv && \
 ollama serve &>/dev/null & sleep 5 && \
 python scripts/ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv --provider ollama --model llama3.1 && \
-python scripts/auto_tag_tests.py data/risk_register_scored_all.csv --generate-skeletons tests/generated/ --summary && \
+python scripts/auto_tag_tests.py data/risk_register_scored_all.csv \
+  --generate-skeletons tests/generated/ --summary && \
+python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv && \
+python scripts/predict_defects.py data/ecl_parsed.csv data/ecl_parsed_predictions.csv && \
 streamlit run scripts/bug_heatmap_dashboard.py --server.address 0.0.0.0 --server.port 8501
 ```
 
-In the dashboard sidebar: set **Step 1** path to `data/ecl_parsed.csv`, set **Step 2** path to `data/risk_register_scored_all.csv`.
+**Dashboard sidebar setup after launch:**
+- **Step 1** → `data/ecl_parsed.csv`
+- **Step 2** → `data/risk_register_scored_all.csv`
+- **Step 3** → `data/ecl_parsed_clustered.csv` + `ecl_parsed_cluster_summary.csv`
+- **Step 4** → `data/ecl_parsed_predictions.csv` + `_focus_summary.txt` + `_leading_indicators.csv`
 
 ***
 
@@ -696,20 +759,28 @@ In the dashboard sidebar: set **Step 1** path to `data/ecl_parsed.csv`, set **St
 |-------|-------|-----|
 | Dashboard: "Wrong file!" on ecl_parsed.csv | File is risk_register_scored_all.csv (lacks `severity_num`) | Use `ecl_parsed.csv` from Step 2.2 |
 | Dashboard: Tab 7 shows warning, not treemap | Risk data not loaded in sidebar Step 2 | Set path to `risk_register_scored_all.csv` in sidebar |
+| Dashboard: Tab 8 shows setup prompt | Cluster files not loaded | Run `cluster_bugs.py` then set path in sidebar Step 3 |
+| Dashboard: Tab 9 shows setup prompt | Prediction files not loaded | Run `predict_defects.py` then set path in sidebar Step 4 |
+| Dashboard: Tab 9 "Missing columns" error | Predictions file is from `predict_defects.py` v2.1 (lacks new columns) | Re-run with `predict_defects.py` v2.2 |
 | Dashboard: "No per-version score file" caption | Per-version scoring not yet run | Run `ai_risk_scorer.py` — it auto-scores all files in `risk_register_versions/` |
-| Dashboard: clicking a module block shows nothing (right panel stays empty) | Module name is identical to its parent category name (e.g. "Shortcut" module inside "Shortcut" category) — fixed in v2.14 | Update to `bug_heatmap_dashboard.py` v2.14; the fix uses Plotly's `parent` field instead of the name-based category exclusion |
+| Dashboard: clicking a module block shows nothing | Module name matches its parent category name — fixed in v2.14 | Ensure `bug_heatmap_dashboard.py` v2.14+ is in use |
+| Dashboard: version picker shows "9.0" before "16.3.0" | Using old dashboard without version catalogue | Update to v2.15+ and re-run `parse_ecl_export.py` to generate `version_catalogue.csv` |
+| Dashboard: typo version appears in default selection | Sparse versions not filtered | Re-run parser — version catalogue flags versions with < 5 bugs; dashboard excludes them from defaults |
+| Dashboard: heatmap cells are red/orange, clashing with [P1] badges | Using dashboard older than v2.15 | Update to v2.15+ — heatmap cells now use a blue gradient |
 | Port 8501 not available | Previous Streamlit instance still running | `lsof -i :8501` then `kill -9 <PID>` |
-| Parse rate below 90% | Non-standard Short Description format or new module patterns | Check `*_pending.json` files; confirm suggestions or add alias for truly unparseable strings |
-| 1000+ uncategorized modules | `parse_ecl_export.py` is the old version without auto-strip | Replace with v2.3 and delete `module_mappings/versions/*_pending.json`, then re-run |
-| risk_register_all.csv has 1000+ rows | Old scorer file used — sub-variants not stripped | Ensure `parse_ecl_export.py` v2.3 is in use; re-run full pipeline |
+| Parse rate below 90% | Non-standard Short Description format | Check `*_pending.json` files; confirm suggestions |
+| 1000+ uncategorized modules | Old parser without auto-strip | Replace with v2.3+, delete `module_mappings/versions/*_pending.json`, re-run |
+| `predict_defects.py` drops many rows | `Build#` contains version strings not plain integers | Expected — script logs the count. Use numeric build numbers for better accuracy. |
+| `predict_defects.py` "Not enough data" | Fewer than 20 build-module data points | Need at least ~5 builds per module. Run predictions after more build history is available. |
+| `cluster_bugs.py` not enough terms | Module has very few unique bug descriptions | Expected — script handles gracefully, produces "Unclustered" label |
 | Ollama timeout errors | Model too large for available RAM | Switch to `phi3` or use `--provider heuristic` |
 | Scorer stops mid-run | Timeout / crash | Re-run same command — resume support skips already-scored modules automatically |
-| `predict_defects.py` drops many rows | `Build#` contains version strings not plain integers | Expected — script logs the count. Use numeric build numbers for better predictions |
-| `cluster_bugs.py` not enough terms | Module has very few unique bug descriptions | Expected — script handles gracefully |
 | Visual regression too sensitive | Minor font rendering differences | Raise threshold: `export VISUAL_THRESHOLD=0.92` |
 | Appium can't find device | `DEVICE_NAME` mismatch | Run `idevice_id -l` and use exact device UUID |
 | `fetch_from_n8n.py`: connection error | n8n not running or wrong URL | Check n8n is active; verify webhook URL matches the imported workflow |
-| `fetch_from_n8n.py`: missing required fields | n8n `Get Columns_v3` Set node misconfigured | Re-import `Dashboard_Query_eBug_List_v3.json`; the script lists which fields are absent |
-| `fetch_from_n8n.py`: empty response | n8n date range filter returns no bugs | Check the `CreateTime` range in the eCL eBug query node; try widening the range |
-| `repro_rate` all 0.5 after JSON parse | `Reproduce Probability` is not in the eCL API response | Expected — 0.5 is the correct default; Detectability scoring is unaffected |
-| JSON parse: "Short Description column not found" | n8n workflow still using old `Get Columns_v2` node | Re-import `Dashboard_Query_eBug_List_v3.json` which outputs `Short Description` correctly |
+| `fetch_from_n8n.py`: missing required fields | n8n `Get Columns_v3` Set node misconfigured | Re-import `Dashboard_Query_eBug_List_v3.json`; script lists which fields are absent |
+| `fetch_from_n8n.py`: empty response | n8n date range filter returns no bugs | Widen the `CreateTime` range in the eCL eBug query node |
+| `fetch_from_n8n.py`: `_status_changed` all False | First-ever run (no existing cache to compare against) | Expected — flags will populate on second+ runs |
+| `repro_rate` all 0.5 after JSON parse | `Reproduce Probability` not in the eCL API | Expected — 0.5 is the correct default; Detectability scoring is unaffected |
+| `version_catalogue.csv` not found | Parser not yet re-run after v2.6 update | Re-run `parse_ecl_export.py` — catalogue is generated automatically |
+| `parsed_version` shows wrong version | Parser is pre-v2.6 (reads from Short Description) | Update to v2.6+ parser; new version reads from the `Version` column directly |

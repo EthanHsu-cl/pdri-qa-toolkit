@@ -21,11 +21,12 @@ import urllib.request
 import urllib.error
 from datetime import datetime
 from pathlib import Path
+import pandas as pd
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 DEFAULT_WEBHOOK_URL = (
-    "https://ecl-agent.cyberlink.com/webhook-test/82746bb5-e140-4720-98a3-d1965900274d"
+    "https://ecl-agent.cyberlink.com/webhook/82746bb5-e140-4720-98a3-d1965900274d-v3"
 )
 DEFAULT_OUTPUT   = "data/ecl_raw.json"
 DEFAULT_PARSED   = "data/ecl_parsed.csv"
@@ -115,24 +116,119 @@ def audit_fields(records: list[dict]) -> bool:
     return True
 
 
-def save_json(records: list[dict], output_path: str):
+def save_json(records: list[dict], output_path: str) -> dict:
+    """Merge incoming records with any existing file, deduplicating by BugCode.
+
+    Returns a summary dict with keys: new, updated_status, unchanged, total.
+
+    Change 4 — Status comparison / update
+    ─────────────────────────────────────
+    When a record already exists in the cache (same BugCode), its current Status
+    is compared with the incoming Status.  If they differ the record is updated
+    AND a `_status_changed` flag is set so downstream tools (parse, dashboard)
+    can highlight freshly-transitioned bugs without re-processing everything.
+
+    A record that is unchanged on every field still has its `_status_changed`
+    flag cleared to False so it is never left incorrectly marked from a
+    previous run.
+    """
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    
-    existing = []
+
+    existing_map: dict = {}
     p = Path(output_path)
     if p.exists():
         with open(p, "r", encoding="utf-8") as f:
-            existing = json.load(f)
-    
-    # Deduplicate by BugCode; new records win on conflict
-    merged = {r["BugCode"]: r for r in existing}
-    merged.update({r["BugCode"]: r for r in records})
-    final = list(merged.values())
-    
+            try:
+                for r in json.load(f):
+                    if isinstance(r, dict) and r.get("BugCode"):
+                        existing_map[r["BugCode"]] = r
+            except json.JSONDecodeError:
+                print("⚠️  Could not parse existing JSON — treating as empty cache.")
+
+    n_new = n_updated = n_unchanged = 0
+
+    for rec in records:
+        code = rec.get("BugCode")
+        if not code:
+            continue
+        if code not in existing_map:
+            rec["_status_changed"] = False
+            existing_map[code] = rec
+            n_new += 1
+        else:
+            old = existing_map[code]
+            old_status = str(old.get("Status", "")).strip().lower()
+            new_status = str(rec.get("Status", "")).strip().lower()
+            if old_status != new_status:
+                rec["_status_changed"] = True
+                rec["_prev_status"]    = old.get("Status", "")
+                existing_map[code]     = rec
+                n_updated += 1
+            else:
+                # Always reset flag so a record from a previous run is not
+                # stuck with _status_changed=True after it stabilises.
+                rec["_status_changed"] = False
+                existing_map[code]     = rec
+                n_unchanged += 1
+
+    final = list(existing_map.values())
+
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(final, f, ensure_ascii=False, indent=2)
-    
-    print(f"✅ Saved {len(final):,} bugs ({len(records):,} new/updated) → {output_path}")
+
+    summary = dict(new=n_new, updated_status=n_updated, unchanged=n_unchanged, total=len(final))
+    print(
+        f"✅ Saved {summary['total']:,} bugs → {output_path}\n"
+        f"   New: {n_new}  |  Status-changed: {n_updated}  |  Unchanged: {n_unchanged}"
+    )
+    return summary
+
+
+def get_latest_version(output_path: str) -> str:
+    """Read version_catalogue.csv (same directory as output_path) and return
+    the most recent non-sparse version string.
+
+    This is used when scope=latest so the n8n workflow receives the actual
+    version string to filter on, not the bare word 'latest'.
+
+    Returns an empty string if the catalogue is absent or unreadable — in
+    that case the workflow falls back to its own 'latest' logic.
+    """
+    cat_path = Path(output_path).parent / "version_catalogue.csv"
+    if not cat_path.exists():
+        return ""
+    try:
+        cat = pd.read_csv(str(cat_path))
+        real = cat[~cat["version_is_sparse"].astype(bool)].sort_values("version_rank")
+        if not real.empty:
+            ver = str(real.iloc[0]["parsed_version"])
+            print(f"  Latest non-sparse version from catalogue: {ver}")
+            return ver
+    except Exception as e:
+        print(f"  Could not read version catalogue ({e}) — n8n will decide 'latest'.")
+    return ""
+
+
+def resolve_scope(args) -> str:
+    """Change 5 — Testing-schedule experiment.
+
+    Weekdays (Mon–Fri): fetch only the latest version (faster, lighter).
+    Weekends (Sat–Sun): fetch all versions to measure full-update duration.
+
+    Override with --scope latest | all to force either mode regardless of day.
+    """
+    if args.scope == "latest":
+        return "latest"
+    if args.scope == "all":
+        return "all"
+    # auto: weekday → latest, weekend → all
+    today = datetime.now().weekday()   # 0=Mon … 6=Sun
+    if today >= 5:
+        print(f"📅 Weekend detected (weekday={today}) → fetching ALL versions")
+        return "all"
+    else:
+        print(f"📅 Weekday detected (weekday={today}) → fetching LATEST version only")
+        return "latest"
 
 
 def main():
@@ -165,10 +261,35 @@ def main():
         action="store_true",
         help="After saving, immediately run parse_ecl_export.py on the result",
     )
+    # Change 5 — scope control
+    parser.add_argument(
+        "--scope",
+        choices=["auto", "latest", "all"],
+        default="auto",
+        help=(
+            "Fetch scope: 'latest' = newest version only (fast, weekday default); "
+            "'all' = all versions (thorough, weekend default); "
+            "'auto' = choose by day of week (default)."
+        ),
+    )
     args = parser.parse_args()
 
-    print(f"Fetching eBugs — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    records = fetch_bugs(args.webhook_url, DEFAULT_PAYLOAD, timeout=args.timeout)
+    scope = resolve_scope(args)
+    start_time = datetime.now()
+    print(f"Fetching eBugs — {start_time.strftime('%Y-%m-%d %H:%M:%S')}  [scope={scope}]")
+
+    # Build the payload; when scope=latest, resolve the actual version string
+    # from the catalogue so the n8n workflow knows exactly which version to
+    # fetch rather than guessing by string sort order.
+    payload = dict(DEFAULT_PAYLOAD)
+    payload["scope"] = scope
+    if scope == "latest":
+        latest_ver = get_latest_version(args.output)
+        if latest_ver:
+            payload["latest_version"] = latest_ver
+            print(f"  Sending latest_version={latest_ver!r} in webhook payload")
+
+    records = fetch_bugs(args.webhook_url, payload, timeout=args.timeout)
     print(f"  Received {len(records):,} records")
 
     if not records:
@@ -179,7 +300,10 @@ def main():
     if not ok:
         sys.exit(1)
 
-    save_json(records, args.output)
+    summary = save_json(records, args.output)
+
+    elapsed = (datetime.now() - start_time).total_seconds()
+    print(f"⏱  Fetch+save completed in {elapsed:.1f}s  (scope={scope})")
 
     if args.then_parse:
         print(f"\nRunning parser → {args.parsed_output}")
