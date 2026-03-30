@@ -1,40 +1,31 @@
 #!/usr/bin/env python3
-"""PDR-I Defect Prediction v2.4
+"""PDR-I Defect Prediction v2.5
 
-Changes from v2.3
+Changes from v2.4
 ─────────────────
-Change 6 — Description-based TF-IDF features
-  • Aggregates parsed_description text per module and extracts the top-N
-    TF-IDF terms as numeric features (mean TF-IDF weight per term per module).
-  • These text features are merged into the feature matrix alongside the
-    existing momentum/severity/risk-score signals, giving the GBR model
-    vocabulary-level signal about what kinds of bugs each module attracts.
-  • Falls back gracefully if parsed_description is absent or too sparse.
+Change 8 — Ollama narrative provider
+• Added --provider flag: claude (default), ollama, none
+• Added --model flag (default: llama3.1)
+• New generate_ai_narrative_ollama() mirrors generate_ai_narrative() but
+  calls http://localhost:11434/api/generate instead of the Anthropic API.
+• generate_focus_summary() and main() route to the correct provider automatically.
+• --no-ai is kept for backwards compat and maps to --provider none.
 
-Change 7 — Claude API narrative focus summary
-  • Replaces the hardcoded template in generate_focus_summary() with a real
-    Claude API call (claude-sonnet-4-20250514).
-  • For each high-risk module, Claude receives: predicted bug count, risk level,
-    dominant severity, leading signal, AND a sample of recent parsed_description
-    strings so it can reason about the actual bug content.
-  • Output: a concise plain-English paragraph per module — what to test, why
-    it's risky, and what kind of bugs to expect — saved to focus_summary.txt
-    and also stored as an ai_narrative column in the predictions CSV.
-  • --no-ai flag skips the Claude call and falls back to the old template
-    (useful for CI/offline runs).
-  • ANTHROPIC_API_KEY must be set in environment (or passed via --api-key).
+All other behaviour is unchanged from v2.4.
 
-Output paths (unchanged from v2.3):
+Output paths (unchanged):
   data/predictions/ecl_parsed_predictions.csv
   data/predictions/ecl_parsed_predictions_importance.csv
   data/predictions/ecl_parsed_predictions_leading_indicators.csv
   data/predictions/ecl_parsed_predictions_focus_summary.txt
 
 Usage:
-  python predict_defects.py <parsed_csv>
-  python predict_defects.py <parsed_csv> --no-ai
-  python predict_defects.py <parsed_csv> --scored-csv <risk_register_scored_all.csv>
-  python predict_defects.py <parsed_csv> --api-key <anthropic_api_key>
+  python predict_defects.py <input_csv>
+  python predict_defects.py <input_csv> --provider ollama
+  python predict_defects.py <input_csv> --provider ollama --model llama3.1
+  python predict_defects.py <input_csv> --provider claude --api-key <key>
+  python predict_defects.py <input_csv> --no-ai
+  python predict_defects.py <input_csv> --scored-csv <path>
 """
 import os
 import sys
@@ -55,45 +46,46 @@ warnings.filterwarnings("ignore")
 
 PREDICTION_GUIDE = """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  PDR-I DEFECT PREDICTION — HOW TO READ THIS OUTPUT                          ║
+║           PDR-I DEFECT PREDICTION — HOW TO READ THIS OUTPUT                ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  TARGET VARIABLE                                                             ║
-║  ─────────────                                                               ║
-║  The model predicts  'bug_count'  for each module in the NEXT build.        ║
-║  bug_count = number of new bugs filed against that module in one build.     ║
-║  It is NOT severity-weighted; it is a raw head-count of new defects.        ║
-║                                                                              ║
-║  FEATURES USED                                                               ║
-║  ─────────────                                                               ║
-║  bugs_1 / bugs_3 / bugs_5   Bugs filed in last 1 / 3 / 5 builds            ║
-║  sev_1  / sev_3  / sev_5    Severity-weighted sum over same windows         ║
-║  crit_1 / crit_3 / crit_5   Critical (S1) count over same windows           ║
-║  trend                       bugs in last build minus bugs 3 builds ago     ║
-║  repro_rate (if present)     mean reproduce probability for recent bugs      ║
-║  tfidf_*   (if descriptions present) top TF-IDF terms from bug descriptions ║
-║  impact_score          (if risk scores loaded) domain impact 1-5            ║
-║  detectability_score   (if risk scores loaded) test difficulty 1-5          ║
-║  probability_score_auto(if risk scores loaded) historical defect probability ║
-║  risk_score_final      (if risk scores loaded) I × P × D composite score    ║
-║                                                                              ║
-║  OUTPUT COLUMNS                                                              ║
-║  ──────────────                                                              ║
-║  target          Actual bug count in the most recent build (ground truth)   ║
-║  predicted       Model's forecast for the NEXT build                        ║
-║  risk_level      Low(<3) / Medium(3-5) / High(6-10) / Critical(>10)        ║
-║  dominant_bug_type  Most common severity in recent history for this module  ║
-║  leading_signal     Feature most predictive of this module's future bugs    ║
-║  ai_narrative    Plain-English AI explanation of risk and what to test      ║
-║                                                                              ║
-║  HOW TO ACT ON IT                                                            ║
-║  ────────────────                                                            ║
-║  Critical/High modules → add to mandatory test suite for the next build.    ║
-║  Read 'ai_narrative' for a plain-English explanation of why and what to do. ║
+║  TARGET VARIABLE                                                            ║
+║  ─────────────                                                              ║
+║  The model predicts 'bug_count' for each module in the NEXT build.         ║
+║  bug_count = number of new bugs filed against that module in one build.    ║
+║  It is NOT severity-weighted; it is a raw head-count of new defects.       ║
+║                                                                             ║
+║  FEATURES USED                                                              ║
+║  ─────────────                                                              ║
+║  bugs_1 / bugs_3 / bugs_5        Bugs filed in last 1 / 3 / 5 builds      ║
+║  sev_1  / sev_3  / sev_5         Severity-weighted sum over same windows   ║
+║  crit_1 / crit_3 / crit_5        Critical (S1) count over same windows     ║
+║  trend                            bugs in last build minus bugs 3 ago      ║
+║  repro_rate       (if present)    mean reproduce probability                ║
+║  tfidf_*          (if present)    top TF-IDF terms from descriptions        ║
+║  impact_score     (if scored)     domain impact 1-5                        ║
+║  detectability_score              test difficulty 1-5                      ║
+║  probability_score_auto           historical defect probability            ║
+║  risk_score_final                 I × P × D composite score                ║
+║                                                                             ║
+║  OUTPUT COLUMNS                                                             ║
+║  ──────────────                                                             ║
+║  target           Actual bug count in most recent build (ground truth)     ║
+║  predicted        Model's forecast for the NEXT build                      ║
+║  risk_level       Low(<3) / Medium(3-5) / High(6-10) / Critical(>10)      ║
+║  dominant_bug_type  Most common severity in recent history                 ║
+║  leading_signal   Feature most predictive of this module's future bugs     ║
+║  ai_narrative     Plain-English AI explanation of risk and what to test    ║
+║                                                                             ║
+║  HOW TO ACT ON IT                                                           ║
+║  ────────────────                                                           ║
+║  Critical/High modules → add to mandatory test suite for the next build.  ║
+║  Read 'ai_narrative' for a plain-English explanation of why.               ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
 TFIDF_TOP_N  = 40
 TFIDF_PREFIX = "tfidf_"
+OLLAMA_BASE  = "http://localhost:11434"
 
 _FEATURE_LABELS = {
     "crit_1":  "critical-bug momentum (last build)",
@@ -120,7 +112,6 @@ _RISK_ADVICE = {
     "Low":      "Monitor — include in release-candidate pass.",
 }
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Risk feature loader
 # ─────────────────────────────────────────────────────────────────────────────
@@ -132,8 +123,8 @@ def load_risk_features(scored_csv: str) -> "pd.DataFrame | None":
         print(f"  WARNING: could not load scored CSV ({e}) — running without risk features.")
         return None
 
-    mod_col = "parsed_module" if "parsed_module" in rdf.columns else \
-              "module"        if "module"        in rdf.columns else None
+    mod_col = ("parsed_module" if "parsed_module" in rdf.columns
+               else "module" if "module" in rdf.columns else None)
     if mod_col is None:
         print("  WARNING: scored CSV has no module/parsed_module column — skipping.")
         return None
@@ -151,28 +142,21 @@ def load_risk_features(scored_csv: str) -> "pd.DataFrame | None":
     out = out.rename(columns={mod_col: "module"})
     out = out.drop_duplicates(subset=["module"]).set_index("module")
     print(f"  Loaded risk features for {len(out)} modules from {scored_csv}")
-    print(f"  Risk feature columns: {risk_cols}")
     return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Change 6 — TF-IDF text features from parsed_description
+# TF-IDF text features
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_tfidf_features(orig_df: pd.DataFrame,
                           mod_col: str = "parsed_module",
                           text_col: str = "parsed_description",
                           top_n: int = TFIDF_TOP_N) -> "pd.DataFrame | None":
-    """Aggregate parsed_description per module and compute mean TF-IDF weights.
-
-    Returns a DataFrame with one row per module and `top_n` numeric columns
-    named tfidf_<term>.  Returns None if the text column is missing or sparse.
-    """
     if text_col not in orig_df.columns or mod_col not in orig_df.columns:
         print(f"  NOTE: '{text_col}' column not found — skipping text features.")
         return None
 
-    # Concatenate all descriptions for each module into one document
     mod_docs = (
         orig_df[[mod_col, text_col]]
         .dropna(subset=[mod_col, text_col])
@@ -183,39 +167,28 @@ def build_tfidf_features(orig_df: pd.DataFrame,
     mod_docs = mod_docs[mod_docs[text_col].str.len() > 20]
 
     if len(mod_docs) < 5:
-        print("  WARNING: too few modules with descriptions for TF-IDF — skipping text features.")
+        print("  WARNING: too few modules with descriptions for TF-IDF — skipping.")
         return None
 
-    try:
-        vec = TfidfVectorizer(
-            max_features=top_n,
-            stop_words="english",
-            ngram_range=(1, 2),
-            min_df=2,
-            max_df=0.85,
-            sublinear_tf=True,
-        )
-        X = vec.fit_transform(mod_docs[text_col])
-    except ValueError:
+    for kwargs in [
+        dict(max_features=top_n, stop_words="english", ngram_range=(1, 2),
+             min_df=2, max_df=0.85, sublinear_tf=True),
+        dict(max_features=top_n, stop_words="english", ngram_range=(1, 1),
+             min_df=1, max_df=0.95, sublinear_tf=True),
+    ]:
         try:
-            vec = TfidfVectorizer(
-                max_features=top_n,
-                stop_words="english",
-                ngram_range=(1, 1),
-                min_df=1,
-                max_df=0.95,
-                sublinear_tf=True,
-            )
+            vec = TfidfVectorizer(**kwargs)
             X = vec.fit_transform(mod_docs[text_col])
+            terms = [f"{TFIDF_PREFIX}{t}" for t in vec.get_feature_names_out()]
+            tfidf_df = pd.DataFrame(X.toarray(), columns=terms)
+            tfidf_df.insert(0, "module", mod_docs[mod_col].values)
+            print(f"  TF-IDF: {len(terms)} text features across {len(mod_docs)} modules.")
+            return tfidf_df
         except ValueError:
-            print("  WARNING: TF-IDF vectorization failed — skipping text features.")
-            return None
+            continue
 
-    terms = [f"{TFIDF_PREFIX}{t}" for t in vec.get_feature_names_out()]
-    tfidf_df = pd.DataFrame(X.toarray(), columns=terms)
-    tfidf_df.insert(0, "module", mod_docs[mod_col].values)
-    print(f"  TF-IDF: {len(terms)} text features from descriptions across {len(mod_docs)} modules.")
-    return tfidf_df
+    print("  WARNING: TF-IDF vectorization failed — skipping text features.")
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -232,8 +205,7 @@ def build_features(df, build_col="Build#", mod_col="parsed_module",
     df[build_col] = df[build_col].astype(int)
     if non_numeric > 0:
         print(f"  WARNING: {non_numeric}/{total_before} rows dropped — "
-              f"'{build_col}' values could not be parsed as numbers. "
-              f"Prediction will use {len(df)} remaining rows.")
+              f"'{build_col}' could not be parsed as numbers.")
 
     agg = df.groupby([mod_col, build_col]).agg(
         bug_count=("severity_weight", "size"),
@@ -241,6 +213,7 @@ def build_features(df, build_col="Build#", mod_col="parsed_module",
         crit=("severity_num", lambda x: (x == 1).sum()),
         major=("severity_num", lambda x: (x == 2).sum()),
     ).reset_index()
+
     if "repro_rate" in df.columns:
         repro = df.groupby([mod_col, build_col])["repro_rate"].mean().reset_index()
         agg = agg.merge(repro, on=[mod_col, build_col], how="left")
@@ -262,21 +235,17 @@ def build_features(df, build_col="Build#", mod_col="parsed_module",
 
     fdf = pd.DataFrame(rows)
 
-    # Merge TF-IDF text features (module-level, broadcast to every build row)
     if tfidf_features is not None and not fdf.empty:
         fdf = fdf.merge(tfidf_features, on="module", how="left")
         tfidf_cols = [c for c in fdf.columns if c.startswith(TFIDF_PREFIX)]
         fdf[tfidf_cols] = fdf[tfidf_cols].fillna(0.0)
         print(f"  Text features merged: {len(tfidf_cols)} TF-IDF columns added.")
 
-    # Merge risk scores (module-level)
     if risk_features is not None and not fdf.empty:
         fdf = fdf.merge(risk_features, on="module", how="left")
         for col, default in [
-            ("impact_score",          3.0),
-            ("detectability_score",   3.0),
-            ("probability_score_auto",3.0),
-            ("risk_score_final",      0.0),
+            ("impact_score", 3.0), ("detectability_score", 3.0),
+            ("probability_score_auto", 3.0), ("risk_score_final", 0.0),
         ]:
             if col in fdf.columns:
                 fdf[col] = fdf[col].fillna(default)
@@ -287,7 +256,7 @@ def build_features(df, build_col="Build#", mod_col="parsed_module",
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Leading-indicator correlation (excludes TF-IDF to keep output readable)
+# Leading-indicator correlation
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_leading_indicators(fdf: pd.DataFrame) -> pd.Series:
@@ -318,21 +287,19 @@ def train_predict(fdf: pd.DataFrame, orig_df: pd.DataFrame):
     model = GradientBoostingRegressor(
         n_estimators=200, max_depth=4, learning_rate=0.1, random_state=42
     )
-    scores = cross_val_score(
-        model, X, y,
-        cv=TimeSeriesSplit(n_splits=3),
-        scoring="neg_mean_absolute_error",
-    )
+    scores = cross_val_score(model, X, y,
+                             cv=TimeSeriesSplit(n_splits=3),
+                             scoring="neg_mean_absolute_error")
     print(f"CV MAE: {-scores.mean():.2f} (+/- {scores.std():.2f})")
     model.fit(X, y)
 
     imp = pd.Series(model.feature_importances_, index=fcols).sort_values(ascending=False)
-    print(f"\nTop features (model importances):\n{imp.head(10)}")
+    print(f"\nTop features:\n{imp.head(10)}")
 
     leading = compute_leading_indicators(fdf)
-    print(f"\nLeading indicators (Pearson r with next-build bug count):")
+    print(f"\nLeading indicators (Pearson r):")
     for feat, r in leading.head(8).items():
-        print(f"  {feat:<20s}  r = {r:+.3f}  ({_FEATURE_LABELS.get(feat, feat)})")
+        print(f"  {feat:<20s} r = {r:+.3f}  ({_FEATURE_LABELS.get(feat, feat)})")
 
     latest = fdf.groupby("module").tail(1).copy()
     latest["predicted"] = model.predict(latest[fcols].fillna(0)).round(1)
@@ -352,14 +319,11 @@ def train_predict(fdf: pd.DataFrame, orig_df: pd.DataFrame):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Change 7 — Claude API narrative summary
+# Description sampler
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _sample_descriptions(orig_df: pd.DataFrame, module: str,
-                          mod_col: str = "parsed_module",
-                          text_col: str = "parsed_description",
-                          n: int = 12) -> list:
-    """Return up to n recent unique parsed_description strings for a module."""
+def _sample_descriptions(orig_df, module, mod_col="parsed_module",
+                          text_col="parsed_description", n=12):
     if text_col not in orig_df.columns:
         return []
     rows = orig_df[orig_df[mod_col] == module][text_col].dropna()
@@ -367,19 +331,20 @@ def _sample_descriptions(orig_df: pd.DataFrame, module: str,
     for s in rows.tail(n * 2).tolist():
         s = str(s).strip()
         if s and s not in seen and len(s) > 10:
-            seen.add(s)
-            out.append(s)
+            seen.add(s); out.append(s)
         if len(out) >= n:
             break
     return out
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Claude narrative (unchanged from v2.4)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def generate_ai_narrative(module, predicted, risk_level, dominant_bug_type,
                            leading_signal, descriptions, api_key) -> str:
-    """Call Claude to generate a plain-English risk narrative for one module."""
-    desc_block = "\n".join(f"  - {d}" for d in descriptions[:12]) if descriptions \
-        else "  (no description samples available)"
-
+    desc_block = "\n".join(f" - {d}" for d in descriptions[:12]) if descriptions \
+        else " (no description samples available)"
     prompt = (
         f"You are a QA lead writing a pre-build risk briefing for your team.\n\n"
         f"Module: {module}\n"
@@ -394,13 +359,11 @@ def generate_ai_narrative(module, predicted, risk_level, dominant_bug_type,
         f"3. Gives concrete, actionable testing advice (what flows/scenarios to prioritise).\n\n"
         f"Be specific and direct. Plain prose only. No bullet points. No headers."
     )
-
     payload = json.dumps({
         "model": "claude-sonnet-4-20250514",
         "max_tokens": 300,
         "messages": [{"role": "user", "content": prompt}],
     }).encode()
-
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
         data=payload,
@@ -413,19 +376,66 @@ def generate_ai_narrative(module, predicted, risk_level, dominant_bug_type,
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode())
-        return data["content"][0]["text"].strip()
+            return data["content"][0]["text"].strip()
     except Exception as e:
-        return f"[AI narrative unavailable: {e}]"
+        return f"[Claude narrative unavailable: {e}]"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ollama narrative (NEW — Change 8)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_ai_narrative_ollama(module, predicted, risk_level, dominant_bug_type,
+                                  leading_signal, descriptions,
+                                  model="llama3.1") -> str:
+    desc_block = "\n".join(f" - {d}" for d in descriptions[:12]) if descriptions \
+        else " (no description samples available)"
+    prompt = (
+        f"You are a QA lead writing a pre-build risk briefing for your team.\n\n"
+        f"Module: {module}\n"
+        f"Predicted bugs next build: {predicted:.0f}\n"
+        f"Risk level: {risk_level}\n"
+        f"Dominant bug type historically: {dominant_bug_type}\n"
+        f"Strongest predictive signal: {leading_signal}\n\n"
+        f"Sample of recent bug descriptions for this module:\n{desc_block}\n\n"
+        f"Write a concise 3-5 sentence paragraph that:\n"
+        f"1. States clearly why this module is high risk next build.\n"
+        f"2. Describes the specific kinds of issues to expect based on the descriptions above.\n"
+        f"3. Gives concrete, actionable testing advice (what flows/scenarios to prioritise).\n\n"
+        f"Be specific and direct. Plain prose only. No bullet points. No headers."
+    )
+    payload = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.3, "num_predict": 300},
+    }).encode()
+    req = urllib.request.Request(
+        f"{OLLAMA_BASE}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            raw = json.loads(resp.read().decode())
+            return raw.get("response", "").strip()
+    except Exception as e:
+        return f"[Ollama narrative unavailable: {e}]"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Focus summary — routes to ollama, claude, or template
+# ─────────────────────────────────────────────────────────────────────────────
 
 def generate_focus_summary(preds, leading, orig_df,
                             mod_col="parsed_module", top_n=8,
-                            api_key="", use_ai=True) -> str:
+                            api_key="", provider="none",
+                            model="llama3.1") -> str:
     lines = [
         "=" * 78,
-        "  PDR-I DEFECT PREDICTION — FOCUS SUMMARY FOR NEXT BUILD",
+        " PDR-I DEFECT PREDICTION — FOCUS SUMMARY FOR NEXT BUILD",
         "=" * 78, "",
-        "  Modules ranked by predicted bug count.", "",
+        " Modules ranked by predicted bug count.", "",
     ]
 
     sev_label_map = {1: "crash/Critical (S1)", 2: "Major functional (S2)",
@@ -449,12 +459,11 @@ def generate_focus_summary(preds, leading, orig_df,
         rl    = str(row["risk_level"])
         dtype = dom_type.get(mod, "mixed")
 
-        # Per-module leading signal
-        mod_rows = preds[preds["module"] == mod]
         fcols = [c for c in preds.columns
                  if c not in ["module", "build", "target", "predicted", "risk_level",
                                "dominant_bug_type", "leading_signal", "ai_narrative"]
                  and not c.startswith(TFIDF_PREFIX)]
+        mod_rows = preds[preds["module"] == mod]
         mod_feat_label = top_feat_label
         if fcols and len(mod_rows) > 1:
             best_corr, best_col = 0.0, fcols[0]
@@ -468,9 +477,19 @@ def generate_focus_summary(preds, leading, orig_df,
             mod_feat_label = _FEATURE_LABELS.get(best_col, best_col)
 
         lines.append(f"  {'─' * 74}")
-        lines.append(f"  📍 {mod}  →  predicted {pred:.0f} bugs  [{rl}]")
+        lines.append(f"  📍 {mod} → predicted {pred:.0f} bugs [{rl}]")
 
-        if use_ai and api_key:
+        if provider == "ollama":
+            descriptions = _sample_descriptions(orig_df, mod, mod_col=mod_col)
+            narrative = generate_ai_narrative_ollama(
+                module=mod, predicted=pred, risk_level=rl,
+                dominant_bug_type=dtype, leading_signal=mod_feat_label,
+                descriptions=descriptions, model=model,
+            )
+            for narrative_line in narrative.splitlines():
+                lines.append(f"  {narrative_line}")
+
+        elif provider == "claude" and api_key:
             descriptions = _sample_descriptions(orig_df, mod, mod_col=mod_col)
             narrative = generate_ai_narrative(
                 module=mod, predicted=pred, risk_level=rl,
@@ -478,11 +497,12 @@ def generate_focus_summary(preds, leading, orig_df,
                 descriptions=descriptions, api_key=api_key,
             )
             for narrative_line in narrative.splitlines():
-                lines.append(f"     {narrative_line}")
+                lines.append(f"  {narrative_line}")
+
         else:
-            lines.append(f"     Bug type to expect : {dtype}")
-            lines.append(f"     Leading signal     : {mod_feat_label}")
-            lines.append(f"     Testing advice     : {_RISK_ADVICE.get(rl, 'Review.')}")
+            lines.append(f"  Bug type to expect : {dtype}")
+            lines.append(f"  Leading signal     : {mod_feat_label}")
+            lines.append(f"  Testing advice     : {_RISK_ADVICE.get(rl, 'Review.')}")
 
     lines += ["", "=" * 78, ""]
     return "\n".join(lines)
@@ -496,18 +516,30 @@ def main():
     print(PREDICTION_GUIDE)
 
     if len(sys.argv) < 2:
-        print("Usage: python predict_defects.py <parsed_csv> [--no-ai] "
-              "[--scored-csv <path>] [--api-key <key>]")
+        print("Usage: python predict_defects.py <input_csv> "
+              "[--provider claude|ollama|none] [--model <name>] "
+              "[--no-ai] [--scored-csv <path>] [--api-key <key>]")
         sys.exit(1)
 
     args = sys.argv[1:]
     scored_csv_path = None
-    use_ai  = True
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    provider = "claude"
+    model    = "llama3.1"
+    api_key  = os.environ.get("ANTHROPIC_API_KEY", "")
 
     if "--no-ai" in args:
-        use_ai = False
+        provider = "none"
         args.remove("--no-ai")
+
+    if "--provider" in args:
+        idx = args.index("--provider")
+        provider = args[idx + 1]
+        args = args[:idx] + args[idx + 2:]
+
+    if "--model" in args:
+        idx = args.index("--model")
+        model = args[idx + 1]
+        args = args[:idx] + args[idx + 2:]
 
     if "--scored-csv" in args:
         idx = args.index("--scored-csv")
@@ -519,22 +551,26 @@ def main():
         api_key = args[idx + 1]
         args = args[:idx] + args[idx + 2:]
 
-    inp     = args[0]
+    inp = args[0]
     inp_dir = Path(inp).parent
     out_dir = inp_dir / "predictions"
     out_dir.mkdir(parents=True, exist_ok=True)
     out      = str(out_dir / (Path(inp).stem + "_predictions.csv"))
     out_stem = out_dir / Path(inp).stem
 
-    if use_ai and not api_key:
-        print("  NOTE: ANTHROPIC_API_KEY not set — falling back to template summary.")
-        print("        Set the env var or pass --api-key to enable AI narratives.\n")
-        use_ai = False
+    if provider == "claude" and not api_key:
+        print("  NOTE: --provider claude but ANTHROPIC_API_KEY not set — falling back to none.")
+        provider = "none"
+
+    if provider not in ("claude", "ollama", "none"):
+        print(f"  ERROR: unknown --provider '{provider}'. Choose: claude, ollama, none")
+        sys.exit(1)
+
+    print(f"AI provider: {provider}" + (f" (model={model})" if provider == "ollama" else ""))
 
     orig_df = pd.read_csv(inp)
     print(f"Loaded {len(orig_df)} bugs")
 
-    # Auto-detect risk scores
     risk_features = None
     if scored_csv_path:
         print(f"\nLoading risk scores from: {scored_csv_path}")
@@ -545,7 +581,6 @@ def main():
             print(f"\nAuto-detected risk scores: {auto_path}")
             risk_features = load_risk_features(str(auto_path))
 
-    # Change 6: TF-IDF text features
     print("\nBuilding TF-IDF text features from parsed_description...")
     tfidf_features = build_tfidf_features(orig_df)
 
@@ -553,10 +588,10 @@ def main():
     print(f"Feature matrix: {fdf.shape}")
 
     if len(fdf) < 20:
-        print("Not enough data for prediction. Need more build history (≥5 builds per module).")
+        print("Not enough data for prediction. Need ≥5 builds per module.")
         sys.exit(1)
 
-    model, preds, imp, leading = train_predict(fdf, orig_df)
+    model_obj, preds, imp, leading = train_predict(fdf, orig_df)
 
     preds = preds.sort_values("predicted", ascending=False)
     preds["risk_level"] = pd.cut(
@@ -566,66 +601,67 @@ def main():
     )
 
     print("\n" + "─" * 78)
-    print("  PREDICTED BUG COUNT — next build estimate per module")
-    print("  target    = actual bugs in most recent build (ground truth)")
-    print("  predicted = model forecast for NEXT build")
-    print("  risk_level thresholds: Low <3 | Medium 3-5 | High 6-10 | Critical >10")
+    print(" PREDICTED BUG COUNT — next build estimate per module")
+    print(" target = actual bugs in most recent build | predicted = next build forecast")
+    print(" risk_level thresholds: Low <3 | Medium 3-5 | High 6-10 | Critical >10")
     print("─" * 78)
     display_cols = ["module", "target", "predicted", "risk_level",
                     "dominant_bug_type", "leading_signal"]
     display_cols = [c for c in display_cols if c in preds.columns]
     print(preds[display_cols].head(20).to_string(index=False))
 
-    # Change 7: AI-powered focus summary
-    if use_ai:
-        print(f"\nGenerating AI narratives for top high-risk modules...")
+    use_ai = provider in ("claude", "ollama")
+    print(f"\nGenerating focus summary (provider={provider})...")
     summary_text = generate_focus_summary(
         preds, leading, orig_df,
-        top_n=8, api_key=api_key, use_ai=use_ai,
+        top_n=8, api_key=api_key,
+        provider=provider, model=model,
     )
     print("\n" + summary_text)
 
-    # Attach ai_narrative column to the predictions CSV
     preds["ai_narrative"] = ""
-    if use_ai and api_key:
+    if use_ai:
         high_risk_mods = (
             preds[preds["risk_level"].isin(["Critical", "High"])]
             .head(8)["module"].tolist()
         )
         for mod in high_risk_mods:
             row = preds[preds["module"] == mod].iloc[0]
-            narrative = generate_ai_narrative(
+            descriptions = _sample_descriptions(orig_df, mod)
+            kwargs = dict(
                 module=mod,
                 predicted=float(row["predicted"]),
                 risk_level=str(row["risk_level"]),
                 dominant_bug_type=str(row.get("dominant_bug_type", "mixed")),
                 leading_signal=str(row.get("leading_signal", "")),
-                descriptions=_sample_descriptions(orig_df, mod),
-                api_key=api_key,
+                descriptions=descriptions,
             )
+            if provider == "ollama":
+                narrative = generate_ai_narrative_ollama(**kwargs, model=model)
+            else:
+                narrative = generate_ai_narrative(**kwargs, api_key=api_key)
             preds.loc[preds["module"] == mod, "ai_narrative"] = narrative
 
-    # Save — drop tfidf columns from CSV to keep it readable
     summary_path = str(out_stem) + "_focus_summary.txt"
     Path(summary_path).write_text(summary_text, encoding="utf-8")
 
     save_cols = [c for c in preds.columns if not c.startswith(TFIDF_PREFIX)]
     preds[save_cols].to_csv(out, index=False, encoding="utf-8-sig")
 
-    imp_path = str(out_stem) + "_importance.csv"
+    imp_path     = str(out_stem) + "_importance.csv"
+    leading_path = str(out_stem) + "_leading_indicators.csv"
     imp.to_csv(imp_path, encoding="utf-8-sig")
 
-    leading_path = str(out_stem) + "_leading_indicators.csv"
     leading_df = leading.reset_index()
     leading_df.columns = ["feature", "pearson_r"]
     leading_df["label"] = leading_df["feature"].map(_FEATURE_LABELS).fillna(leading_df["feature"])
     leading_df.to_csv(leading_path, index=False, encoding="utf-8-sig")
 
     print(f"\nOutputs:")
-    print(f"  {out}          ← main predictions (includes ai_narrative column)")
-    print(f"  {imp_path}     ← model feature importances")
-    print(f"  {leading_path} ← leading indicator correlations")
-    print(f"  {summary_path} ← plain-English focus summary")
+    print(f"  {out}           ← main predictions (includes ai_narrative column)")
+    print(f"  {imp_path}      ← model feature importances")
+    print(f"  {leading_path}  ← leading indicator correlations")
+    print(f"  {summary_path}  ← plain-English focus summary")
 
 
 if __name__ == "__main__":
