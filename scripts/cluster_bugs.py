@@ -66,16 +66,41 @@ def _compute_fingerprint(df: pd.DataFrame) -> str:
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
+def _fp_file(cluster_dir: Path) -> Path:
+    """Path to the lightweight fingerprint file (used by both tfidf and ollama)."""
+    return cluster_dir / "cluster_fingerprint.json"
+
+
 def _load_fingerprint(cache_path: Path) -> str:
-    """Read the fingerprint stored in the embedding cache file, or ''."""
-    if not cache_path.exists():
-        return ""
-    try:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data.get("_fingerprint", "")
-    except Exception:
-        return ""
+    """Read the fingerprint stored in the embedding cache file OR the standalone
+    fingerprint file.  The embedding cache only exists in Ollama mode, so TF-IDF
+    mode uses cluster_fingerprint.json instead.  Both locations are checked so
+    that a previous Ollama run's fingerprint is still honoured when switching to
+    TF-IDF mode on the next run.
+    """
+    for path in [cache_path, cache_path.parent / "cluster_fingerprint.json"]:
+        if not path.exists():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            fp = data.get("_fingerprint", "")
+            if fp:
+                return fp
+        except Exception:
+            pass
+    return ""
+
+
+def _save_fingerprint(cluster_dir: Path, fingerprint: str) -> None:
+    """Persist only the fingerprint to a tiny standalone JSON file.
+    Used by TF-IDF mode (which has no embedding cache to piggyback on).
+    """
+    fp_path = _fp_file(cluster_dir)
+    tmp = fp_path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"_fingerprint": fingerprint}, f)
+    tmp.replace(fp_path)
 
 
 def _save_cache(cache_path: Path, embeddings: dict, fingerprint: str) -> None:
@@ -417,11 +442,16 @@ def main():
         cached_fp = _load_fingerprint(cache_path)
         if cached_fp == fingerprint and out.exists():
             print(
-                f"\n  Input fingerprint unchanged ({fingerprint}) and output already exists.\n"
-                f"  Nothing to do. Use --force to re-cluster regardless.\n"
+                f"\n  ✅ Cache hit — input fingerprint unchanged ({fingerprint}).\n"
+                f"  Provider={args.provider}  Output already exists → skipping re-cluster.\n"
+                f"  Use --force to re-cluster regardless.\n"
                 f"  Output: {out}"
             )
             return
+        elif cached_fp:
+            print(f"  Fingerprint changed: cached={cached_fp!r} → current={fingerprint!r} — re-clustering.")
+        else:
+            print(f"  No cached fingerprint found — running full cluster (provider={args.provider}).")
 
     if args.force:
         print(f"  --force: skipping fingerprint check, running full re-cluster.")
@@ -462,6 +492,11 @@ def main():
     if args.provider == "ollama" and not args.no_cache:
         _save_cache(cache_path, embed_cache, fingerprint)
         print(f"  Embedding cache saved: {len(embed_cache):,} vectors → {cache_path}")
+    elif args.provider == "tfidf" and not args.no_cache:
+        # TF-IDF has no embedding vectors to persist, but we still save the
+        # fingerprint so the next run can skip re-clustering unchanged input.
+        _save_fingerprint(cluster_dir, fingerprint)
+        print(f"  Fingerprint saved → {_fp_file(cluster_dir)}")
 
     # ── Summary + summary CSV ─────────────────────────────────────────────────
     summary = summarize(df)
