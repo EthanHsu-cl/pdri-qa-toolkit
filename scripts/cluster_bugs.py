@@ -1,11 +1,38 @@
 #!/usr/bin/env python3
-"""PDR-I NLP Defect Clustering v2.3 - Ollama semantic embeddings + LLM cluster labels
+"""PDR-I NLP Defect Clustering v2.4 - Resume support + embedding cache
+
+Changes from v2.3:
+  - Input fingerprint check: hashes row count + newest Create Date from the
+    input CSV. If both match the last run's fingerprint (stored in the cluster
+    cache file), the script exits immediately with "Nothing changed" and
+    returns without touching any output files. This makes daily cron runs
+    essentially free when the bug data hasn't been refreshed.
+  - Embedding cache: Ollama embedding vectors are persisted to
+    <cluster_dir>/embedding_cache.json, keyed by BugCode. On subsequent runs
+    only NEW bugs (BugCode not in the cache) are sent to Ollama for embedding;
+    all existing bugs reuse their cached vectors. This is the main time-saver:
+    a corpus of 10,000 bugs where 200 are new takes the same time as embedding
+    200 bugs from scratch rather than all 10,000.
+  - Cache is written every EMBED_CHECKPOINT_EVERY embeddings (default 50) so
+    a crash mid-run preserves all work done so far.
+  - --force flag overrides the fingerprint check and runs a full re-cluster
+    even when the input is unchanged. Use this after updating the Ollama model
+    or when you want fresh cluster assignments regardless.
+  - --no-cache flag skips loading AND saving the embedding cache (runs exactly
+    like v2.3, useful for debugging or one-off runs on a different machine).
+  - Dropped bugs warning: if BugCodes present in the embedding cache are
+    absent from the current input, a count is printed (same pattern as the
+    scorer's module-dropped warning). The stale entries are retained in the
+    cache file so they don't need to be re-embedded if the bug reappears.
+
 Usage:
   python cluster_bugs.py <input_csv> <output_csv>                          # TF-IDF (default)
   python cluster_bugs.py <input_csv> <output_csv> --provider ollama        # Ollama embeddings
   python cluster_bugs.py <input_csv> <output_csv> --provider ollama --model llama3.1
+  python cluster_bugs.py <input_csv> <output_csv> --provider ollama --force  # ignore cache
+  python cluster_bugs.py <input_csv> <output_csv> --provider ollama --no-cache
 """
-import sys, json, argparse, urllib.request, time
+import sys, json, hashlib, argparse, urllib.request, time
 import pandas as pd, numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import DBSCAN, KMeans
@@ -14,10 +41,70 @@ from sklearn.preprocessing import normalize
 from pathlib import Path
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ollama helpers
+# Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-OLLAMA_BASE = "http://localhost:11434"
+OLLAMA_BASE            = "http://localhost:11434"
+EMBED_CHECKPOINT_EVERY = 50   # save cache to disk this often during embedding
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Input fingerprint helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_fingerprint(df: pd.DataFrame) -> str:
+    """Return a short hash that changes when bug data is added or removed.
+
+    Uses row count + max(Create Date) rather than hashing all cell values —
+    fast enough on 10k+ rows, stable across column reordering.
+    """
+    n = len(df)
+    latest = ""
+    if "Create Date" in df.columns:
+        latest = str(pd.to_datetime(df["Create Date"], errors="coerce").max())
+    raw = f"{n}|{latest}"
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
+
+
+def _load_fingerprint(cache_path: Path) -> str:
+    """Read the fingerprint stored in the embedding cache file, or ''."""
+    if not cache_path.exists():
+        return ""
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("_fingerprint", "")
+    except Exception:
+        return ""
+
+
+def _save_cache(cache_path: Path, embeddings: dict, fingerprint: str) -> None:
+    """Persist embedding cache + fingerprint atomically (write-then-rename)."""
+    tmp = cache_path.with_suffix(".tmp")
+    payload = {"_fingerprint": fingerprint, "embeddings": embeddings}
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    tmp.replace(cache_path)
+
+
+def _load_cache(cache_path: Path) -> dict:
+    """Load embedding cache dict (keyed by BugCode → list[float]).
+    Returns empty dict on any error.
+    """
+    if not cache_path.exists():
+        return {}
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("embeddings", {})
+    except Exception as e:
+        print(f"  Warning: could not load embedding cache ({e}) — starting fresh.")
+        return {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ollama helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _ollama_embed(text: str, model: str = "llama3.1") -> "list[float] | None":
     """Return embedding vector for a single text string via Ollama /api/embeddings."""
@@ -35,22 +122,75 @@ def _ollama_embed(text: str, model: str = "llama3.1") -> "list[float] | None":
         return None
 
 
-def get_ollama_embeddings(texts: "list[str]", model: str = "llama3.1",
-                          batch_delay: float = 0.1) -> "np.ndarray | None":
-    """Embed a list of texts. Returns (N, D) array or None on failure."""
-    print(f"  Getting Ollama embeddings for {len(texts)} texts (model={model})...")
+def get_ollama_embeddings(
+    texts: "list[str]",
+    bug_codes: "list[str]",
+    model: str = "llama3.1",
+    cache: "dict | None" = None,
+    cache_path: "Path | None" = None,
+    fingerprint: str = "",
+    batch_delay: float = 0.1,
+) -> "np.ndarray | None":
+    """Embed a list of texts, reusing cached vectors by BugCode.
+
+    Args:
+        texts:       One description per bug (parallel to bug_codes).
+        bug_codes:   Unique identifier per bug — used as cache key.
+        model:       Ollama model name.
+        cache:       Mutable dict of previously computed vectors (modified in-place).
+        cache_path:  Path to persist the cache; checkpointed every
+                     EMBED_CHECKPOINT_EVERY new embeddings.
+        fingerprint: Written back to the cache file so the next run can
+                     detect unchanged input.
+        batch_delay: Seconds to sleep every 20 requests (avoids hammering Ollama).
+
+    Returns:
+        (N, D) float32 array of embedding vectors, or None on failure.
+    """
+    if cache is None:
+        cache = {}
+
+    # Identify which bugs are new (not in cache)
+    new_indices = [i for i, code in enumerate(bug_codes) if str(code) not in cache]
+    cached_count = len(texts) - len(new_indices)
+
+    if cached_count:
+        print(f"  Embedding cache: {cached_count:,} reused, {len(new_indices):,} new bugs to embed.")
+    else:
+        print(f"  No cache hits — embedding all {len(texts):,} bugs (model={model}).")
+
+    if new_indices:
+        print(f"  Sending {len(new_indices):,} new bugs to Ollama...")
+
+    new_done = 0
+    for i in new_indices:
+        code = str(bug_codes[i])
+        vec = _ollama_embed(texts[i][:512], model=model)
+        if vec is None:
+            print(f"  Embedding failed at bug index {i} (BugCode={code}) — falling back to TF-IDF.")
+            return None
+        cache[code] = vec
+        new_done += 1
+
+        # Progress + checkpoint
+        if batch_delay and new_done % 20 == 0:
+            print(f"    {new_done}/{len(new_indices)} new embeddings done...")
+            time.sleep(batch_delay)
+        if cache_path and new_done % EMBED_CHECKPOINT_EVERY == 0:
+            _save_cache(cache_path, cache, fingerprint)
+            print(f"    Cache checkpointed at {new_done} new embeddings.")
+
+    # Assemble full array in original order
     vecs = []
-    for i, t in enumerate(texts):
-        v = _ollama_embed(t[:512], model=model)  # truncate to avoid slow long prompts
+    for i, code in enumerate(bug_codes):
+        v = cache.get(str(code))
         if v is None:
-            print(f"  Embedding failed at index {i} — falling back to TF-IDF.")
+            print(f"  BugCode {code} still missing from cache after embedding — aborting Ollama path.")
             return None
         vecs.append(v)
-        if batch_delay and i % 20 == 0 and i > 0:
-            print(f"    {i}/{len(texts)} embedded...")
-            time.sleep(batch_delay)
+
     arr = np.array(vecs, dtype=np.float32)
-    print(f"  Embeddings ready: shape={arr.shape}")
+    print(f"  Embeddings ready: shape={arr.shape}  (new={len(new_indices)}, cached={cached_count})")
     return arr
 
 
@@ -103,9 +243,24 @@ def _tfidf_matrix(texts: "list[str]"):
     return None, None
 
 
-def cluster_bugs(df, text_col="parsed_description", method="kmeans",
-                 n_clusters=25, eps=0.7, min_samples=3,
-                 provider="tfidf", model="llama3.1"):
+def cluster_bugs(
+    df,
+    text_col="parsed_description",
+    method="kmeans",
+    n_clusters=25,
+    eps=0.7,
+    min_samples=3,
+    provider="tfidf",
+    model="llama3.1",
+    embed_cache: "dict | None" = None,
+    cache_path: "Path | None" = None,
+    fingerprint: str = "",
+):
+    """Cluster bugs by description similarity.
+
+    embed_cache, cache_path, fingerprint are passed through to
+    get_ollama_embeddings() and are only used in Ollama mode.
+    """
     df = df.copy()
     mask = df[text_col].notna() & (df[text_col].str.len() > 5)
     valid_idx = df[mask].index.tolist()
@@ -121,7 +276,20 @@ def cluster_bugs(df, text_col="parsed_description", method="kmeans",
 
     # ── Ollama semantic embeddings ──────────────────────────────────────────
     if provider == "ollama":
-        arr = get_ollama_embeddings(texts, model=model)
+        # Build a stable per-row key: prefer BugCode, fall back to row index
+        if "BugCode" in df.columns:
+            bug_codes = df.loc[valid_idx, "BugCode"].fillna("").astype(str).tolist()
+        else:
+            bug_codes = [str(i) for i in valid_idx]
+
+        arr = get_ollama_embeddings(
+            texts,
+            bug_codes=bug_codes,
+            model=model,
+            cache=embed_cache,
+            cache_path=cache_path,
+            fingerprint=fingerprint,
+        )
         if arr is not None:
             X_dense = normalize(arr)
             embed_source = "ollama"
@@ -216,46 +384,115 @@ def summarize(df):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="PDR-I Defect Clustering v2.3")
+    parser = argparse.ArgumentParser(description="PDR-I Defect Clustering v2.4")
     parser.add_argument("input_csv")
     parser.add_argument("output_csv")
     parser.add_argument("--provider", choices=["tfidf", "ollama"], default="tfidf",
                         help="Embedding source: tfidf (default) or ollama")
     parser.add_argument("--model", default="llama3.1",
                         help="Ollama model for embeddings and labels (default: llama3.1)")
+    parser.add_argument("--force", action="store_true",
+                        help="Ignore fingerprint check and re-cluster even if input is unchanged")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Skip loading and saving the embedding cache (always embeds from scratch)")
     args = parser.parse_args()
 
-    inp = args.input_csv
-    out = args.output_csv
-    inp_dir = Path(inp).parent
-    out_dir = Path(out).parent
-    out_dir.mkdir(parents=True, exist_ok=True)
+    inp = Path(args.input_csv)
+    out = Path(args.output_csv)
+    out.parent.mkdir(parents=True, exist_ok=True)
 
-    cluster_dir = inp_dir / "clusters"
+    cluster_dir = inp.parent / "clusters"
     cluster_dir.mkdir(parents=True, exist_ok=True)
 
-    df = pd.read_csv(inp)
-    print(f"Loaded {len(df)} bugs | provider={args.provider} model={args.model}")
+    cache_path = cluster_dir / "embedding_cache.json"
 
-    df = cluster_bugs(df, method="kmeans", n_clusters=25,
-                      provider=args.provider, model=args.model)
+    # ── Load input ────────────────────────────────────────────────────────────
+    df = pd.read_csv(str(inp))
+    print(f"Loaded {len(df):,} bugs | provider={args.provider} model={args.model}")
+
+    # ── Fingerprint check ─────────────────────────────────────────────────────
+    fingerprint = _compute_fingerprint(df)
+
+    if not args.force and not args.no_cache:
+        cached_fp = _load_fingerprint(cache_path)
+        if cached_fp == fingerprint and out.exists():
+            print(
+                f"\n  Input fingerprint unchanged ({fingerprint}) and output already exists.\n"
+                f"  Nothing to do. Use --force to re-cluster regardless.\n"
+                f"  Output: {out}"
+            )
+            return
+
+    if args.force:
+        print(f"  --force: skipping fingerprint check, running full re-cluster.")
+
+    # ── Load embedding cache (Ollama mode only) ───────────────────────────────
+    embed_cache: dict = {}
+    if args.provider == "ollama" and not args.no_cache:
+        embed_cache = _load_cache(cache_path)
+        if embed_cache:
+            # Warn about BugCodes in cache that are no longer in the input
+            if "BugCode" in df.columns:
+                current_codes  = set(df["BugCode"].dropna().astype(str))
+                cached_codes   = set(embed_cache.keys()) - {"_fingerprint"}
+                stale_codes    = cached_codes - current_codes
+                if stale_codes:
+                    print(
+                        f"  Note: {len(stale_codes):,} BugCodes in embedding cache are absent from "
+                        f"current input (bugs closed/removed). They are retained in the cache in case "
+                        f"they reappear, but will not affect this run's output."
+                    )
+            print(f"  Embedding cache loaded: {len(embed_cache):,} existing vectors.")
+        else:
+            print(f"  No embedding cache found — all bugs will be embedded from scratch.")
+
+    # ── Global clustering ─────────────────────────────────────────────────────
+    df = cluster_bugs(
+        df,
+        method="kmeans",
+        n_clusters=25,
+        provider=args.provider,
+        model=args.model,
+        embed_cache=embed_cache,
+        cache_path=cache_path if not args.no_cache else None,
+        fingerprint=fingerprint,
+    )
+
+    # ── Save final embedding cache + fingerprint ──────────────────────────────
+    if args.provider == "ollama" and not args.no_cache:
+        _save_cache(cache_path, embed_cache, fingerprint)
+        print(f"  Embedding cache saved: {len(embed_cache):,} vectors → {cache_path}")
+
+    # ── Summary + summary CSV ─────────────────────────────────────────────────
     summary = summarize(df)
     if len(summary) > 0:
-        summary.to_csv(
-            str(cluster_dir / (Path(inp).stem + "_cluster_summary.csv")),
-            encoding="utf-8-sig"
-        )
+        summary_path = cluster_dir / (inp.stem + "_cluster_summary.csv")
+        summary.to_csv(str(summary_path), encoding="utf-8-sig")
+        print(f"  Cluster summary → {summary_path}")
 
+    # ── Per-module DBSCAN clustering (top 5 modules) ──────────────────────────
     if "parsed_module" in df.columns:
         for mod in df["parsed_module"].value_counts().head(5).index.tolist():
             mdf = df[df["parsed_module"] == mod].copy()
             if len(mdf) >= 20:
-                print(f"\nClustering within: {mod} ({len(mdf)} bugs)")
-                mdf = cluster_bugs(mdf, method="dbscan", eps=0.6, min_samples=2,
-                                   provider=args.provider, model=args.model)
+                print(f"\nClustering within module: {mod} ({len(mdf):,} bugs)")
+                # Per-module clustering reuses the same embed_cache that was
+                # populated during the global pass, so no new Ollama calls needed.
+                mdf = cluster_bugs(
+                    mdf,
+                    method="dbscan",
+                    eps=0.6,
+                    min_samples=2,
+                    provider=args.provider,
+                    model=args.model,
+                    embed_cache=embed_cache,
+                    cache_path=None,  # don't re-checkpoint for per-module passes
+                    fingerprint=fingerprint,
+                )
                 summarize(mdf)
 
-    df.to_csv(out, index=False, encoding="utf-8-sig")
+    # ── Write output ──────────────────────────────────────────────────────────
+    df.to_csv(str(out), index=False, encoding="utf-8-sig")
     print(f"\nSaved to: {out}")
 
 

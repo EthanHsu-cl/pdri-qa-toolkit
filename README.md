@@ -851,7 +851,7 @@ Results are published to Allure automatically. Each test shows:
 ```bash
 source .venv/bin/activate && \
 python scripts/fetch_from_n8n.py \
-  --scope auto --then-parse && \
+  --scope all --then-parse && \
 python scripts/compute_risk_scores.py data/ecl_parsed.csv data/risk_register_all.csv && \
 ollama serve &>/dev/null & sleep 5 && \
 python scripts/ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv --provider ollama --model llama3.1 && \
@@ -860,7 +860,8 @@ python scripts/auto_tag_tests.py data/risk_register_scored_all.csv \
 python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv \
   --provider ollama --model llama3.1 && \
 python scripts/predict_defects.py data/ecl_parsed.csv data/ecl_parsed_predictions.csv \
-  --provider ollama --model llama3.1
+  --provider ollama --model llama3.1 && \
+pkill -f streamlit && \
 streamlit run scripts/bug_heatmap_dashboard.py --server.address 0.0.0.0 --server.port 8501
 ```
 
@@ -875,6 +876,7 @@ python scripts/auto_tag_tests.py data/risk_register_scored_all.csv \
   --generate-skeletons tests/generated/ --summary && \
 python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv && \
 python scripts/predict_defects.py data/ecl_parsed.csv data/ecl_parsed_predictions.csv && \
+pkill -f streamlit && \
 streamlit run scripts/bug_heatmap_dashboard.py --server.address 0.0.0.0 --server.port 8501
 ```
 

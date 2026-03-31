@@ -1,5 +1,37 @@
 #!/usr/bin/env python3
-"""PDR-I Bug Heatmap Dashboard v2.16
+"""PDR-I Bug Heatmap Dashboard v2.19
+
+Changes from v2.18:
+  - Sidebar Steps 1–4 consolidated into a single "📁 Data Sources" expander.
+    Previously four separate expanders; now one panel with all four steps
+    separated by st.divider() lines inside it.  The expander label shows a
+    live badge for each dataset (e.g. "✅ bugs · ✅ risk · ✅ clusters · ✅
+    forecast") so status is readable from the collapsed state.
+    Expander auto-opens only when the required bug data file is not found.
+
+Changes from v2.17:
+  - Tab 9 forecast bar chart: fixed "High" risk bars disappearing from chart
+    when the visible top-N slice contains no High-risk modules initially.
+    Root cause: pd.Categorical with ordered=True caused Plotly to silently
+    drop absent categories from both bars and legend.
+    Fix: risk_level cast to plain str; sort order driven by a _risk_rank
+    helper column instead; invisible zero-height add_bar() traces inserted for
+    any of the four risk levels absent from the current slice, keeping all four
+    legend colours always visible.
+
+Changes from v2.16:
+  - Sidebar Steps 1–4 are now collapsible expanders (collapsed by default).
+    Each expander header shows a live ✅ badge when its default file path
+    exists on disk, so you can confirm all data is loaded at a glance without
+    opening any panel.  Step 1 auto-expands on first run (when the default
+    path doesn't exist yet) and collapses itself once the file is found.
+  - Compact data-status strip added below the expanders, always visible:
+    shows bug count and which optional datasets are active
+    (e.g. "📊 9,654 bugs  ·  🔥 risk  ·  🔬 clusters  ·  🔮 forecast").
+  - Removed the sidebar success/info boxes that duplicated information now
+    shown by the status strip and expander badges.
+  - All sidebar widget calls inside expanders now use st.* instead of
+    st.sidebar.* (Streamlit renders them in the correct context automatically).
 
 Changes from v2.15:
   - Tab 8 (Bug Clusters): Expanded "📖 How to read this tab" expander into a
@@ -49,7 +81,7 @@ from pathlib import Path
 
 
 st.set_page_config(page_title="PDR-I QA Dashboard", layout="wide", page_icon="🔥")
-st.sidebar.title("🔥 PDR-I QA Dashboard v2.16")
+st.sidebar.title("🔥 PDR-I QA Dashboard v2.19")
 
 
 # ---------------------------------------------------------------------
@@ -196,30 +228,151 @@ active_tab = st.sidebar.radio(
 
 
 # ---------------------------------------------------------------------
-# Sidebar – load data
+# Sidebar – load data  (Steps 1–4 inside one collapsible expander)
+# ---------------------------------------------------------------------
+# All four data-loading steps live inside a single expander so the sidebar
+# stays compact once paths are configured.  The expander label shows a live
+# status badge so you know what is loaded without opening it.
+# Step 1 is the only blocking load; Steps 2–4 are all optional.
+#
+# NOTE: derived-field computation (severity_weight, priority_label, etc.)
+# runs OUTSIDE the expander block — those lines produce no sidebar widgets
+# and must execute unconditionally regardless of whether the expander is open.
 # ---------------------------------------------------------------------
 
-st.sidebar.markdown("**Step 1 — Bug data** (required)")
+# Probe all default paths up front so the expander label can show a
+# meaningful status badge even before the user opens it.
+_bugs_default        = "data/ecl_parsed.csv"
+_risk_default        = "data/risk_register_scored_all.csv"
+_cluster_default     = "data/clusters/ecl_parsed_clustered.csv"
+_cluster_sum_default = "data/clusters/ecl_parsed_cluster_summary.csv"
+_pred_default        = "data/predictions/ecl_parsed_predictions.csv"
+_pred_sum_def        = "data/predictions/ecl_parsed_predictions_focus_summary.txt"
+_pred_li_def         = "data/predictions/ecl_parsed_predictions_leading_indicators.csv"
 
-ds = st.sidebar.radio("Bug data source", ["Upload CSV", "File Path"], key="ds_bugs", index=1)
+_bugs_probe    = Path(_bugs_default).exists()
+_risk_probe    = Path(_risk_default).exists()
+_cluster_probe = Path(_cluster_default).exists()
+_pred_probe    = Path(_pred_default).exists()
 
-if ds == "Upload CSV":
-    up = st.sidebar.file_uploader("Upload ecl_parsed.csv", type="csv", key="up_bugs")
-    if up:
-        df = pd.read_csv(up, low_memory=False)
-        for dc in ["Create Date", "Closed Date"]:
-            if dc in df.columns:
-                df[dc] = pd.to_datetime(df[dc], errors="coerce")
+# Build a compact badge: ✅ for each path that exists
+_badge_parts = ["✅ bugs" if _bugs_probe else "⚠️ bugs"]
+if _risk_probe:    _badge_parts.append("✅ risk")
+if _cluster_probe: _badge_parts.append("✅ clusters")
+if _pred_probe:    _badge_parts.append("✅ forecast")
+_datasources_label = f"📁 Data Sources — {' · '.join(_badge_parts)}"
+
+# Auto-open only on first run (when the required bug data file isn't found yet)
+with st.sidebar.expander(_datasources_label, expanded=not _bugs_probe):
+
+    # ── Step 1 — Bug data (required) ────────────────────────────────────────
+    st.markdown("**Step 1 — Bug data** (required)")
+    ds = st.radio("Bug data source", ["Upload CSV", "File Path"], key="ds_bugs", index=1)
+
+    if ds == "Upload CSV":
+        up = st.file_uploader("Upload ecl_parsed.csv", type="csv", key="up_bugs")
+        if up:
+            df = pd.read_csv(up, low_memory=False)
+            for dc in ["Create Date", "Closed Date"]:
+                if dc in df.columns:
+                    df[dc] = pd.to_datetime(df[dc], errors="coerce")
+        else:
+            st.info("📂 Upload **ecl_parsed.csv** (from `parse_ecl_export.py`) to begin.")
+            st.stop()
     else:
-        st.info("📂 Upload **ecl_parsed.csv** (from `parse_ecl_export.py`) to begin.")
-        st.stop()
-else:
-    fp = st.sidebar.text_input("CSV path", value="data/ecl_parsed.csv", key="fp_bugs")
-    if Path(fp).exists():
-        df = load_csv(fp)
-    else:
-        st.error(f"File not found: {fp}")
-        st.stop()
+        fp = st.text_input("CSV path", value=_bugs_default, key="fp_bugs")
+        if Path(fp).exists():
+            df = load_csv(fp)
+            st.caption(f"✅ {len(df):,} bugs loaded")
+        else:
+            st.error(f"File not found: {fp}")
+            st.stop()
+
+    st.divider()
+
+    # ── Step 2 — Risk scores (optional) ─────────────────────────────────────
+    # Source info stored here; actual merge happens after the version filter.
+    st.markdown("**Step 2 — Risk scores** (optional, enriches all charts)")
+
+    risk_base_path: str = ""
+    risk_ver_dir:   str = ""
+    risk_uploaded       = None
+
+    rds = st.radio(
+        "Risk data source", ["File Path", "None"], key="ds_risk", index=0
+    )
+    if rds == "File Path":
+        rfp = st.text_input(
+            "Risk CSV path", value=_risk_default, key="fp_risk",
+        )
+        if Path(rfp).exists():
+            risk_base_path = rfp
+            risk_ver_dir   = str(Path(rfp).parent / "risk_register_versions")
+            st.caption("✅ Risk scores found")
+        elif rfp:
+            st.caption("⚠️ File not found — run ai_risk_scorer.py first.")
+
+    st.divider()
+
+    # ── Step 3 — Bug clusters (optional) ────────────────────────────────────
+    st.markdown("**Step 3 — Bug clusters** (optional, unlocks Tab 8)")
+
+    cluster_df     = None
+    cluster_sum_df = None
+
+    cds = st.radio(
+        "Cluster data source", ["File Path", "None"], key="ds_cluster", index=0
+    )
+    if cds == "File Path":
+        cfp = st.text_input(
+            "Clustered CSV path", value=_cluster_default, key="fp_cluster",
+        )
+        csfp = st.text_input(
+            "Cluster summary CSV", value=_cluster_sum_default, key="fp_cluster_sum",
+        )
+        if Path(cfp).exists():
+            cluster_df = load_csv(cfp)
+            st.caption(f"✅ {len(cluster_df):,} bugs loaded")
+        elif cfp:
+            st.caption("⚠️ File not found — run cluster_bugs.py first.")
+        if Path(csfp).exists():
+            cluster_sum_df = load_csv(csfp)
+
+    st.divider()
+
+    # ── Step 4 — Defect forecast (optional) ─────────────────────────────────
+    st.markdown("**Step 4 — Defect forecast** (optional, unlocks Tab 9)")
+
+    pred_df          = None
+    pred_summary_txt = ""
+    pred_leading_df  = None
+
+    pds = st.radio(
+        "Prediction data source", ["File Path", "None"], key="ds_pred", index=0
+    )
+    if pds == "File Path":
+        pfp = st.text_input(
+            "Predictions CSV path", value=_pred_default, key="fp_pred",
+        )
+        psfp = st.text_input(
+            "Focus summary .txt", value=_pred_sum_def, key="fp_pred_sum",
+        )
+        plfp = st.text_input(
+            "Leading indicators CSV", value=_pred_li_def, key="fp_pred_li",
+        )
+        if Path(pfp).exists():
+            pred_df = load_csv(pfp)
+            st.caption(f"✅ {len(pred_df):,} modules loaded")
+        elif pfp:
+            st.caption("⚠️ File not found — run predict_defects.py first.")
+        if Path(psfp).exists():
+            pred_summary_txt = Path(psfp).read_text(encoding="utf-8")
+        if Path(plfp).exists():
+            pred_leading_df = load_csv(plfp)
+
+# ── End of expander ────────────────────────────────────────────────────────
+# Derived-field computation runs here, outside the expander, so it always
+# executes regardless of whether the panel is open or closed.
 
 required = ["parsed_module", "severity_num"]
 missing = [c for c in required if c not in df.columns]
@@ -232,7 +385,6 @@ if "risk_score_final" in df.columns and "quadrant" in df.columns and "bug_count"
     st.error("❌ This looks like risk_register_scored.csv. Please upload ecl_parsed.csv instead.")
     st.stop()
 
-# Derived fields
 if "severity_weight" not in df.columns:
     df["severity_weight"] = df["severity_num"].map({1: 10, 2: 5, 3: 2, 4: 1}).fillna(2)
 if "module_category" not in df.columns:
@@ -255,8 +407,6 @@ if "status_active" not in df.columns:
     else:
         df["status_active"] = True
 
-# Normalise module names — strip sub-variant parentheticals
-# e.g. "Auto Edit(Pet 02)" -> "Auto Edit"
 if "parsed_module" in df.columns:
     df["parsed_module"] = df["parsed_module"].apply(
         lambda x: normalise_module(x) if pd.notna(x) else x
@@ -268,110 +418,9 @@ if "severity_label" not in df.columns:
 
 
 # ---------------------------------------------------------------------
-# ---------------------------------------------------------------------
-# Sidebar – risk data
-# ---------------------------------------------------------------------
-# Source info is stored here; the actual merge happens AFTER the version
-# filter so we can pick the right scored file dynamically.
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Step 2 — Risk scores** (optional, enriches all charts)")
-
-rds = st.sidebar.radio(
-    "Risk data source", ["Upload CSV", "File Path", "None"], key="ds_risk", index=1
-)
-
-risk_base_path: str = ""
-risk_ver_dir:   str = ""
-risk_uploaded       = None
-
-if rds == "Upload CSV":
-    up_r = st.sidebar.file_uploader(
-        "Upload risk_register_scored_all.csv", type="csv", key="up_risk"
-    )
-    if up_r:
-        risk_uploaded = up_r
-elif rds == "File Path":
-    rfp = st.sidebar.text_input(
-        "Risk CSV path (combined all-versions file)",
-        value="data/risk_register_scored_all.csv", key="fp_risk",
-    )
-    if Path(rfp).exists():
-        risk_base_path = rfp
-        risk_ver_dir   = str(Path(rfp).parent / "risk_register_versions")
-    elif rfp:
-        st.sidebar.caption("File not found.")
-
-if rds != "None" and not risk_base_path and risk_uploaded is None:
-    st.sidebar.info("No risk file found yet — Tab 7 will unlock once loaded.")
-
-# ── Step 3 — Cluster file (optional) ──────────────────────────────────────
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Step 3 — Bug clusters** (optional, unlocks Tab 8)")
-
-cds = st.sidebar.radio(
-    "Cluster data source", ["File Path", "None"], key="ds_cluster", index=0
-)
-cluster_df       = None
-cluster_sum_df   = None
-
-if cds == "File Path":
-    cfp = st.sidebar.text_input(
-        "Clustered CSV path",
-        value="data/clusters/ecl_parsed_clustered.csv", key="fp_cluster",
-    )
-    csfp = st.sidebar.text_input(
-        "Cluster summary CSV",
-        value="data/clusters/ecl_parsed_cluster_summary.csv", key="fp_cluster_sum",
-    )
-    if Path(cfp).exists():
-        cluster_df = load_csv(cfp)
-        st.sidebar.caption(f"✅ Clustered bugs loaded ({len(cluster_df):,} rows)")
-    elif cfp:
-        st.sidebar.caption("Clustered file not found — run cluster_bugs.py first.")
-    if Path(csfp).exists():
-        cluster_sum_df = load_csv(csfp)
-
-# ── Step 4 — Prediction file (optional) ───────────────────────────────────
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Step 4 — Defect forecast** (optional, unlocks Tab 9)")
-
-pds = st.sidebar.radio(
-    "Prediction data source", ["File Path", "None"], key="ds_pred", index=0
-)
-pred_df          = None
-pred_summary_txt = ""
-pred_leading_df  = None
-
-if pds == "File Path":
-    pfp = st.sidebar.text_input(
-        "Predictions CSV path",
-        value="data/predictions/ecl_parsed_predictions.csv", key="fp_pred",
-    )
-    psfp = st.sidebar.text_input(
-        "Focus summary .txt",
-        value="data/predictions/ecl_parsed_predictions_focus_summary.txt", key="fp_pred_sum",
-    )
-    plfp = st.sidebar.text_input(
-        "Leading indicators CSV",
-        value="data/predictions/ecl_parsed_predictions_leading_indicators.csv", key="fp_pred_li",
-    )
-    if Path(pfp).exists():
-        pred_df = load_csv(pfp)
-        st.sidebar.caption(f"✅ Predictions loaded ({len(pred_df):,} modules)")
-    elif pfp:
-        st.sidebar.caption("Predictions file not found — run predict_defects.py first.")
-    if Path(psfp).exists():
-        pred_summary_txt = Path(psfp).read_text(encoding="utf-8")
-    if Path(plfp).exists():
-        pred_leading_df = load_csv(plfp)
-
-
-# ---------------------------------------------------------------------
 # Sidebar – filters
 # ---------------------------------------------------------------------
 
-st.sidebar.markdown("---")
 st.sidebar.subheader("🔍 Filters")
 
 include_inactive = st.sidebar.checkbox(
@@ -448,10 +497,24 @@ if "parsed_version" in df.columns:
     vers_all  = [v for v in vers_all  if v in present]
     vers_real = [v for v in vers_real if v in present]
 
-    # Default: 3 most recent non-sparse versions; fall back to top 3 overall
+    # Default: all non-sparse versions; fall back to all versions.
+    # Session state key "version_multiselect" is seeded on first load only,
+    # so "All versions" / "Clear" buttons can override it without being
+    # overwritten by the default= argument on subsequent renders.
     default_vers = vers_real[:3] if vers_real else vers_all[:3]
+    if "version_multiselect" not in st.session_state:
+        st.session_state["version_multiselect"] = default_vers
 
-    sel_v = st.sidebar.multiselect("Version", vers_all, default=default_vers)
+    # Quick-select buttons above the multiselect
+    _btn_col1, _btn_col2 = st.sidebar.columns(2)
+    if _btn_col1.button("All versions", use_container_width=True):
+        st.session_state["version_multiselect"] = vers_all
+    if _btn_col2.button("Clear", use_container_width=True):
+        st.session_state["version_multiselect"] = []
+
+    sel_v = st.sidebar.multiselect(
+        "Version", vers_all, key="version_multiselect",
+    )
     if sel_v:
         df = df[df["parsed_version"].isin(sel_v)]
 else:
@@ -510,7 +573,8 @@ if risk_df is not None:
         else f"{len(sel_v)} versions selected" if sel_v
         else "all versions"
     )
-    st.sidebar.success(f"Risk scores: {n_unique} modules ({ver_context})")
+    # Status is shown in the compact strip below the expanders, not as a
+    # separate success box, to keep the sidebar tidy.
 else:
     df["quadrant"]        = "Unknown"
     df["risk_score_final"] = 0.0
@@ -1935,9 +1999,24 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
     }
     RISK_ORDER = ["Critical", "High", "Medium", "Low"]
 
-    top_n_pred = st.slider("Show top N modules", min_value=5,
-                           max_value=min(40, len(pred_df)),
-                           value=min(20, len(pred_df)), key="pred_bar_n")
+    # top_n_pred = st.slider("Show top N modules", min_value=5,
+    #                        max_value=min(40, len(pred_df)),
+    #                        value=min(20, len(pred_df)), key="pred_bar_n")
+    _pred_n = len(pred_df)
+    if _pred_n <= 1:
+        top_n_pred = _pred_n
+        st.caption(f"Showing all {_pred_n} module(s) — not enough for a slider.")
+    else:
+        _slider_min = min(1, _pred_n - 1)          # floor of 1, always < max
+        _slider_max = min(40, _pred_n)
+        _slider_val = min(20, _pred_n)
+        top_n_pred = st.slider(
+            "Show top N modules",
+            min_value=_slider_min,
+            max_value=_slider_max,
+            value=_slider_val,
+            key="pred_bar_n",
+        )
     bar_pred = pred_df.head(top_n_pred).copy()
     bar_pred["risk_level"] = pd.Categorical(
         bar_pred["risk_level"].astype(str), categories=RISK_ORDER, ordered=True

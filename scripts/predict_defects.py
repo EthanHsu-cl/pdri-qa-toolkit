@@ -1,17 +1,30 @@
 #!/usr/bin/env python3
-"""PDR-I Defect Prediction v2.5
+"""PDR-I Defect Prediction v2.6
 
-Changes from v2.4
+Changes from v2.5
 ─────────────────
-Change 8 — Ollama narrative provider
-• Added --provider flag: claude (default), ollama, none
-• Added --model flag (default: llama3.1)
-• New generate_ai_narrative_ollama() mirrors generate_ai_narrative() but
-  calls http://localhost:11434/api/generate instead of the Anthropic API.
-• generate_focus_summary() and main() route to the correct provider automatically.
-• --no-ai is kept for backwards compat and maps to --provider none.
+Change 9 — Per-module leading_signal (fixes all modules showing the same signal)
+• train_predict() now computes leading_signal independently for each module by
+  correlating each lag feature against that module's own build history.
+  Only core lag features (bugs_N, sev_N, crit_N, trend) are candidates —
+  risk-score and TF-IDF columns are excluded because they are module-constant
+  and would produce misleading correlations.
+  Falls back to the global top-Pearson-r signal when a module has fewer than
+  4 build rows (not enough history for a per-module correlation).
+• generate_focus_summary() reads leading_signal from the preds dataframe
+  (already computed above) rather than re-deriving it independently.
 
-All other behaviour is unchanged from v2.4.
+Change 10 — Recency-weighted dominant_bug_type (fixes all modules showing "Major")
+• dominant_bug_type is now weighted so recent builds count more:
+  last build ×5, last third of builds ×3, earlier builds ×1.
+  A module that accumulated many Normal bugs historically but is now producing
+  Critical bugs will correctly show "crash/Critical (S1)" rather than its
+  all-time mode.
+• generate_focus_summary() reads dominant_bug_type from the preds dataframe
+  rather than recomputing it with all-history mode, ensuring the focus summary
+  and the CSV always agree.
+
+All other behaviour is unchanged from v2.5.
 
 Output paths (unchanged):
   data/predictions/ecl_parsed_predictions.csv
@@ -304,16 +317,89 @@ def train_predict(fdf: pd.DataFrame, orig_df: pd.DataFrame):
     latest = fdf.groupby("module").tail(1).copy()
     latest["predicted"] = model.predict(latest[fcols].fillna(0)).round(1)
 
-    sev_label_map = {1: "crash/Critical", 2: "Major", 3: "Normal", 4: "Minor"}
+    # ── dominant_bug_type: recency-weighted, per module ───────────────────────
+    # Weight recent bugs more heavily (last 3 builds × 3, last build × 5) so a
+    # module that used to have many Normal bugs but is now producing Critical
+    # bugs correctly shows "crash/Critical" rather than its all-time mode.
+    sev_label_map = {1: "crash/Critical (S1)", 2: "Major functional (S2)",
+                     3: "Normal (S3)", 4: "Minor/cosmetic (S4)"}
     dom_type = {}
     if "severity_num" in orig_df.columns and "parsed_module" in orig_df.columns:
-        for mod, grp in orig_df.groupby("parsed_module"):
-            mode_sev = grp["severity_num"].mode()
-            dom_type[mod] = sev_label_map.get(int(mode_sev.iloc[0]), "mixed") if len(mode_sev) else "mixed"
+        if "Build#" in orig_df.columns:
+            # Use numeric Build# for recency ordering when available
+            orig_sorted = orig_df.copy()
+            orig_sorted["_build_num"] = pd.to_numeric(
+                orig_sorted["Build#"], errors="coerce"
+            )
+        else:
+            orig_sorted = orig_df.copy()
+            orig_sorted["_build_num"] = np.nan
+
+        for mod, grp in orig_sorted.groupby("parsed_module"):
+            grp = grp.dropna(subset=["severity_num"])
+            if grp.empty:
+                dom_type[mod] = "mixed"
+                continue
+            # If we have build numbers, weight recent builds more heavily
+            if grp["_build_num"].notna().sum() >= 3:
+                grp = grp.sort_values("_build_num")
+                n = len(grp)
+                # Last build: weight 5, second-last third: weight 3, rest: weight 1
+                weights = np.ones(n)
+                cutoff_1 = grp["_build_num"].nlargest(1).min()
+                cutoff_3 = grp["_build_num"].nlargest(
+                    max(1, int(n * 0.33))
+                ).min()
+                weights[grp["_build_num"] >= cutoff_3]  = 3
+                weights[grp["_build_num"] >= cutoff_1]  = 5
+                sev_vals = grp["severity_num"].astype(int).values
+                # Weighted mode: sum weights per severity level
+                sev_weights = {}
+                for sv, w in zip(sev_vals, weights):
+                    sev_weights[sv] = sev_weights.get(sv, 0.0) + w
+                best_sev = min(sev_weights, key=lambda s: (-sev_weights[s], s))
+            else:
+                mode_sev = grp["severity_num"].mode()
+                best_sev = int(mode_sev.iloc[0]) if len(mode_sev) else 3
+            dom_type[mod] = sev_label_map.get(int(best_sev), "mixed")
+
     latest["dominant_bug_type"] = latest["module"].map(dom_type).fillna("mixed")
 
-    top_signal = leading.index[0] if len(leading) else ""
-    latest["leading_signal"] = _FEATURE_LABELS.get(top_signal, top_signal)
+    # ── leading_signal: per-module, not global ────────────────────────────────
+    # For each module, find the feature that has the highest absolute Pearson
+    # correlation with that module's own target values across its build history.
+    # Falls back to the global top signal when a module has too few rows for
+    # a meaningful per-module correlation (< 4 build rows).
+    global_top_signal = leading.index[0] if len(leading) else ""
+    global_top_label  = _FEATURE_LABELS.get(global_top_signal, global_top_signal)
+
+    # Only consider the core numeric lag features for per-module signal —
+    # tfidf and risk score columns are module-constant and would mislead.
+    signal_candidates = [
+        c for c in fcols
+        if not c.startswith(TFIDF_PREFIX)
+        and c not in ("impact_score", "detectability_score",
+                      "probability_score_auto", "risk_score_final")
+    ]
+
+    def _per_module_signal(mod: str) -> str:
+        mod_rows = fdf[fdf["module"] == mod]
+        if len(mod_rows) < 4 or not signal_candidates:
+            return global_top_label
+        y_mod = mod_rows["target"].fillna(0)
+        if y_mod.std() == 0:
+            # All target values identical — no signal is meaningful
+            return global_top_label
+        best_r, best_col = 0.0, global_top_signal
+        for fc in signal_candidates:
+            x_mod = mod_rows[fc].fillna(0)
+            if x_mod.std() > 0:
+                r = abs(float(np.corrcoef(x_mod, y_mod)[0, 1]))
+                if r > best_r:
+                    best_r, best_col = r, fc
+        return _FEATURE_LABELS.get(best_col, best_col)
+
+    latest["leading_signal"] = latest["module"].apply(_per_module_signal)
 
     return model, latest, imp, leading
 
@@ -440,11 +526,11 @@ def generate_focus_summary(preds, leading, orig_df,
 
     sev_label_map = {1: "crash/Critical (S1)", 2: "Major functional (S2)",
                      3: "Normal (S3)", 4: "Minor/cosmetic (S4)"}
-    dom_type = {}
-    if "severity_num" in orig_df.columns and mod_col in orig_df.columns:
-        for mod, grp in orig_df.groupby(mod_col):
-            mode_sev = grp["severity_num"].mode()
-            dom_type[mod] = sev_label_map.get(int(mode_sev.iloc[0]), "mixed") if len(mode_sev) else "mixed"
+
+    # dominant_bug_type is already computed per-module with recency weighting
+    # in train_predict() and stored in the preds dataframe — read it from there
+    # rather than recomputing from all-history mode here.
+    dom_type_series = preds.set_index("module").get("dominant_bug_type", pd.Series(dtype=str))
 
     top_feat = leading.index[0] if len(leading) else "bug_count"
     top_feat_label = _FEATURE_LABELS.get(top_feat, top_feat)
@@ -457,24 +543,30 @@ def generate_focus_summary(preds, leading, orig_df,
         mod   = row["module"]
         pred  = row["predicted"]
         rl    = str(row["risk_level"])
-        dtype = dom_type.get(mod, "mixed")
+        dtype = str(row.get("dominant_bug_type", dom_type_series.get(mod, "mixed")))
 
-        fcols = [c for c in preds.columns
-                 if c not in ["module", "build", "target", "predicted", "risk_level",
-                               "dominant_bug_type", "leading_signal", "ai_narrative"]
-                 and not c.startswith(TFIDF_PREFIX)]
-        mod_rows = preds[preds["module"] == mod]
-        mod_feat_label = top_feat_label
-        if fcols and len(mod_rows) > 1:
-            best_corr, best_col = 0.0, fcols[0]
-            y_mod = mod_rows["target"].fillna(0)
-            for fc in fcols:
-                x_mod = mod_rows[fc].fillna(0)
-                if x_mod.std() > 0 and y_mod.std() > 0:
-                    r = abs(float(np.corrcoef(x_mod, y_mod)[0, 1]))
-                    if r > best_corr:
-                        best_corr, best_col = r, fc
-            mod_feat_label = _FEATURE_LABELS.get(best_col, best_col)
+        # leading_signal is already computed per-module in train_predict();
+        # read it from the preds row. Only fall back to per-summary correlation
+        # if the column is absent (e.g. older predictions file).
+        if "leading_signal" in row and str(row["leading_signal"]) not in ("", "nan"):
+            mod_feat_label = str(row["leading_signal"])
+        else:
+            fcols = [c for c in preds.columns
+                     if c not in ["module", "build", "target", "predicted", "risk_level",
+                                   "dominant_bug_type", "leading_signal", "ai_narrative"]
+                     and not c.startswith(TFIDF_PREFIX)]
+            mod_rows = preds[preds["module"] == mod]
+            mod_feat_label = top_feat_label
+            if fcols and len(mod_rows) > 1:
+                best_corr, best_col = 0.0, fcols[0]
+                y_mod = mod_rows["target"].fillna(0)
+                for fc in fcols:
+                    x_mod = mod_rows[fc].fillna(0)
+                    if x_mod.std() > 0 and y_mod.std() > 0:
+                        r = abs(float(np.corrcoef(x_mod, y_mod)[0, 1]))
+                        if r > best_corr:
+                            best_corr, best_col = r, fc
+                mod_feat_label = _FEATURE_LABELS.get(best_col, best_col)
 
         lines.append(f"  {'─' * 74}")
         lines.append(f"  📍 {mod} → predicted {pred:.0f} bugs [{rl}]")

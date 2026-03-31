@@ -51,12 +51,33 @@ done
 mkdir -p "$STAGING" "$LOGS"
 
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
+
+# run CMD
+#   Executes CMD and pipes both stdout and stderr through `tee -a` so output
+#   appears in the terminal in real time AND is captured in the log file.
+#   This means you always see ai_risk_scorer's progress table, cluster_bugs'
+#   embedding counter, etc. as they happen — not just after the fact.
 run() {
   if $DRY_RUN; then
     log "  [DRY-RUN] $*"
   else
     log "  Running: $*"
+    eval "$*" 2>&1 | tee -a "$LOG_FILE"
+    # Propagate the exit code of the command, not of tee.
+    # (set -euo pipefail would catch tee's exit code otherwise.)
+    return "${PIPESTATUS[0]}"
+  fi
+}
+
+# run_silent CMD
+#   Like run() but suppresses terminal output — used for fast/noisy commands
+#   where live streaming adds no value (e.g. auto_tag_tests, sleep).
+run_silent() {
+  if $DRY_RUN; then
+    log "  [DRY-RUN] $*"
+  else
     eval "$*" >> "$LOG_FILE" 2>&1
+    return $?
   fi
 }
 
@@ -126,7 +147,7 @@ log ""
 log "── Stage 1: Fetch + Parse ──────────────────────────────"
 
 run "python scripts/fetch_from_n8n.py \
-  --scope auto \
+  --scope all \
   --output '$STAGING/ecl_raw.json' \
   --parsed-output '$STAGING/ecl_parsed.csv' \
   --then-parse"
@@ -158,8 +179,25 @@ promote_dir "$STAGING/risk_register_versions" "$DATA/risk_register_versions"
 log "Stage 2 complete."
 
 # ── Stage 3: AI Risk Scoring ──────────────────────────────────────────────────
+# Cache fix: ai_risk_scorer reads its checkpoint from the OUTPUT path it is
+# given. We pass the STAGING path as output so new data lands there safely,
+# but we first COPY the previous live scored file into staging so the scorer
+# finds its cache and can skip already-scored modules.
 log ""
 log "── Stage 3: AI Risk Scoring ────────────────────────────"
+
+# Seed staging with the last good scored file so resume/checkpoint works.
+if [ -f "$DATA/risk_register_scored_all.csv" ]; then
+  cp "$DATA/risk_register_scored_all.csv" "$STAGING/risk_register_scored_all.csv"
+  log "  Seeded staging with previous scored file (resume cache active)."
+fi
+# Same for per-version scored files.
+if [ -d "$DATA/risk_register_versions" ]; then
+  mkdir -p "$STAGING/risk_register_versions"
+  for f in "$DATA/risk_register_versions"/risk_register_scored_*.csv; do
+    [ -f "$f" ] && cp "$f" "$STAGING/risk_register_versions/$(basename "$f")"
+  done
+fi
 
 if $SKIP_OLLAMA; then
   log "  Using heuristic scorer (--skip-ollama)"
@@ -171,8 +209,8 @@ else
   # Start Ollama if not already running
   if ! pgrep -x ollama >/dev/null 2>&1; then
     log "  Starting Ollama..."
-    run "ollama serve &>/dev/null &"
-    run "sleep 5"
+    run_silent "ollama serve &>/dev/null &"
+    run_silent "sleep 5"
   else
     log "  Ollama already running."
   fi
@@ -193,7 +231,7 @@ log "Stage 3 complete."
 log ""
 log "── Stage 4: Test Skeletons + Summary ───────────────────"
 
-run "python scripts/auto_tag_tests.py \
+run_silent "python scripts/auto_tag_tests.py \
   '$DATA/risk_register_scored_all.csv' \
   --generate-skeletons tests/generated/ \
   --summary"
@@ -208,24 +246,27 @@ else
   log ""
   log "── Stage 5: Clustering ─────────────────────────────────"
 
-  CLUSTER_STAGING="$STAGING/clusters"
-  mkdir -p "$CLUSTER_STAGING"
+  # Cache fix: cluster_bugs.py stores embedding_cache.json and reads the
+  # fingerprint from data/clusters/ (relative to the INPUT csv's directory).
+  # Writing output directly to data/clusters/ means the fingerprint check
+  # can find the previous output file and exit early when nothing has changed.
+  # The script does its own safe write for the cache (write-to-tmp then rename)
+  # and the clustered CSV is written in one shot at the very end, so there is
+  # no partial-write window that Streamlit could catch.
+  CLUSTER_OUT="$DATA/clusters"
+  mkdir -p "$CLUSTER_OUT"
 
   if $SKIP_OLLAMA; then
     run "python scripts/cluster_bugs.py \
       '$DATA/ecl_parsed.csv' \
-      '$CLUSTER_STAGING/ecl_parsed_clustered.csv'"
+      '$CLUSTER_OUT/ecl_parsed_clustered.csv'"
   else
     run "python scripts/cluster_bugs.py \
       '$DATA/ecl_parsed.csv' \
-      '$CLUSTER_STAGING/ecl_parsed_clustered.csv' \
+      '$CLUSTER_OUT/ecl_parsed_clustered.csv' \
       --provider ollama \
       --model '$OLLAMA_MODEL'"
   fi
-
-  # cluster_bugs.py writes summary to clusters/ subdir relative to input
-  # Move all cluster output files into place atomically
-  promote_dir "$CLUSTER_STAGING" "$DATA/clusters"
 
   log "Stage 5 complete."
 fi
@@ -258,12 +299,48 @@ else
   log "Stage 6 complete."
 fi
 
+# ── Restart Streamlit ────────────────────────────────────────────────────────
+# Kill and relaunch Streamlit so it starts fresh with no stale session-state
+# cache from the previous run.  All data files are already promoted to data/
+# at this point, so the restarted process reads the latest versions immediately.
+log ""
+log "── Restarting Streamlit ────────────────────────────────"
+
+STREAMLIT_PID=$(lsof -ti tcp:"$STREAMLIT_PORT" 2>/dev/null || true)
+if [ -n "$STREAMLIT_PID" ]; then
+  if $DRY_RUN; then
+    log "  [DRY-RUN] kill $STREAMLIT_PID"
+  else
+    kill "$STREAMLIT_PID" 2>/dev/null || true
+    # Wait up to 10 s for the port to become free
+    for _i in $(seq 1 10); do
+      lsof -ti tcp:"$STREAMLIT_PORT" >/dev/null 2>&1 || break
+      sleep 1
+    done
+    log "  Stopped Streamlit (PID $STREAMLIT_PID)"
+  fi
+else
+  log "  Streamlit was not running — nothing to kill."
+fi
+
+if $DRY_RUN; then
+  log "  [DRY-RUN] streamlit run scripts/bug_heatmap_dashboard.py"
+else
+  nohup streamlit run "$SCRIPT_DIR/scripts/bug_heatmap_dashboard.py" \
+    --server.address 0.0.0.0 \
+    --server.port "$STREAMLIT_PORT" \
+    --server.headless true \
+    >> "$LOGS/streamlit.log" 2>&1 &
+  NEW_PID=$!
+  sleep 3
+  log "  Streamlit restarted (PID $NEW_PID) on :$STREAMLIT_PORT"
+fi
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 log ""
 log "======================================================"
 log "Refresh complete  $(date '+%Y-%m-%d %H:%M:%S')"
-log "Streamlit is still running on :$STREAMLIT_PORT"
-log "Users will see updated data on their next page interaction."
+log "Streamlit restarted fresh — no stale cache."
 log "Log: $LOG_FILE"
 log "======================================================"
 
