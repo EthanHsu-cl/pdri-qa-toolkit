@@ -242,13 +242,17 @@ active_tab = st.sidebar.radio(
 
 # Probe all default paths up front so the expander label can show a
 # meaningful status badge even before the user opens it.
-_bugs_default        = "data/ecl_parsed.csv"
-_risk_default        = "data/risk_register_scored_all.csv"
-_cluster_default     = "data/clusters/ecl_parsed_clustered.csv"
-_cluster_sum_default = "data/clusters/ecl_parsed_cluster_summary.csv"
-_pred_default        = "data/predictions/ecl_parsed_predictions.csv"
-_pred_sum_def        = "data/predictions/ecl_parsed_predictions_focus_summary.txt"
-_pred_li_def         = "data/predictions/ecl_parsed_predictions_leading_indicators.csv"
+_bugs_default         = "data/ecl_parsed.csv"
+_risk_default         = "data/risk_register_scored_all.csv"
+_cluster_default      = "data/clusters/ecl_parsed_clustered.csv"
+_cluster_sum_default  = "data/clusters/ecl_parsed_cluster_summary.csv"
+_cluster_ent_default  = "data/clusters/ecl_parsed_module_entropy.csv"      # v3.0 NEW
+_cluster_s12_default  = "data/clusters/ecl_parsed_cluster_summary_s12.csv" # v3.0 NEW
+_cluster_s34_default  = "data/clusters/ecl_parsed_cluster_summary_s34.csv" # v3.0 NEW
+_pred_default         = "data/predictions/ecl_parsed_predictions.csv"
+_pred_sum_def         = "data/predictions/ecl_parsed_predictions_focus_summary.txt"
+_pred_li_def          = "data/predictions/ecl_parsed_predictions_leading_indicators.csv"
+_pred_cluster_def     = "data/predictions/ecl_parsed_predictions_by_cluster.csv" # v3.0 NEW
 
 _bugs_probe    = Path(_bugs_default).exists()
 _risk_probe    = Path(_risk_default).exists()
@@ -317,8 +321,11 @@ with st.sidebar.expander(_datasources_label, expanded=not _bugs_probe):
     # ── Step 3 — Bug clusters (optional) ────────────────────────────────────
     st.markdown("**Step 3 — Bug clusters** (optional, unlocks Tab 8)")
 
-    cluster_df     = None
-    cluster_sum_df = None
+    cluster_df      = None
+    cluster_sum_df  = None
+    cluster_ent_df  = None   # v3.0: module entropy
+    cluster_s12_df  = None   # v3.0: S1/S2 stratified summary
+    cluster_s34_df  = None   # v3.0: S3/S4 stratified summary
 
     cds = st.radio(
         "Cluster data source", ["File Path", "None"], key="ds_cluster", index=0
@@ -330,6 +337,9 @@ with st.sidebar.expander(_datasources_label, expanded=not _bugs_probe):
         csfp = st.text_input(
             "Cluster summary CSV", value=_cluster_sum_default, key="fp_cluster_sum",
         )
+        cefp = st.text_input(
+            "Module entropy CSV (v3.0)", value=_cluster_ent_default, key="fp_cluster_ent",
+        )
         if Path(cfp).exists():
             cluster_df = load_csv(cfp)
             st.caption(f"✅ {len(cluster_df):,} bugs loaded")
@@ -337,15 +347,23 @@ with st.sidebar.expander(_datasources_label, expanded=not _bugs_probe):
             st.caption("⚠️ File not found — run cluster_bugs.py first.")
         if Path(csfp).exists():
             cluster_sum_df = load_csv(csfp)
+        if Path(cefp).exists():
+            cluster_ent_df = load_csv(cefp)
+        # Optional stratified summaries (auto-loaded if present, no UI input needed)
+        if Path(_cluster_s12_default).exists():
+            cluster_s12_df = load_csv(_cluster_s12_default)
+        if Path(_cluster_s34_default).exists():
+            cluster_s34_df = load_csv(_cluster_s34_default)
 
     st.divider()
 
     # ── Step 4 — Defect forecast (optional) ─────────────────────────────────
     st.markdown("**Step 4 — Defect forecast** (optional, unlocks Tab 9)")
 
-    pred_df          = None
-    pred_summary_txt = ""
-    pred_leading_df  = None
+    pred_df             = None
+    pred_summary_txt    = ""
+    pred_leading_df     = None
+    pred_cluster_df     = None   # v3.0: per-cluster bug-type predictions
 
     pds = st.radio(
         "Prediction data source", ["File Path", "None"], key="ds_pred", index=0
@@ -360,6 +378,9 @@ with st.sidebar.expander(_datasources_label, expanded=not _bugs_probe):
         plfp = st.text_input(
             "Leading indicators CSV", value=_pred_li_def, key="fp_pred_li",
         )
+        pcfp = st.text_input(
+            "Bug-type predictions CSV (v3.0)", value=_pred_cluster_def, key="fp_pred_cluster",
+        )
         if Path(pfp).exists():
             pred_df = load_csv(pfp)
             st.caption(f"✅ {len(pred_df):,} modules loaded")
@@ -369,6 +390,8 @@ with st.sidebar.expander(_datasources_label, expanded=not _bugs_probe):
             pred_summary_txt = Path(psfp).read_text(encoding="utf-8")
         if Path(plfp).exists():
             pred_leading_df = load_csv(plfp)
+        if Path(pcfp).exists():
+            pred_cluster_df = load_csv(pcfp)
 
 # ── End of expander ────────────────────────────────────────────────────────
 # Derived-field computation runs here, outside the expander, so it always
@@ -1634,14 +1657,24 @@ Run the clustering script, then point the sidebar to the output files:
 # Default (TF-IDF, fast, no Ollama required):
 python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv
 
+# With severity stratification (v3.0 — adds S1/S2 and S3/S4 sub-clusters):
+python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv \\
+  --stratify-severity
+
 # Ollama mode (richer labels, recommended when RAM is available):
 python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv \\
-  --provider ollama --model qwen3:7b
+  --provider ollama --model qwen3:7b --stratify-severity
 ```
 
-Then in the sidebar: **Step 3** → set paths to `ecl_parsed_clustered.csv` and `ecl_parsed_cluster_summary.csv`.
+v3.0 produces additional output files automatically:
+- `clusters/ecl_parsed_cluster_summary.csv` — includes velocity, trend, recurrence
+- `clusters/ecl_parsed_module_entropy.csv` — per-module theme-spread index
+- `clusters/ecl_parsed_cluster_summary_s12.csv` — critical/major tier (with `--stratify-severity`)
+- `clusters/ecl_parsed_cluster_summary_s34.csv` — normal/minor tier (with `--stratify-severity`)
 
-Recommend re-running clustering **every Friday** or whenever a new batch of builds has been parsed, so the themes reflect the latest patterns.
+Then in the sidebar: **Step 3** → set paths to the above files. The module entropy and stratified summaries load automatically from their default paths.
+
+Recommend re-running clustering **every Friday** or whenever a new batch of builds has been parsed.
 """)
 
     if cluster_df is None:
@@ -1671,8 +1704,6 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
                help="Bugs whose descriptions were too short or too unique to cluster")
 
     st.markdown("---")
-
-    # ── Build summary table if not pre-loaded from CSV ───────────────────
     if cluster_sum_df is not None and not cluster_sum_df.empty:
         summary = cluster_sum_df.copy()
         # normalise column names that come from the CSV vs computed inline
@@ -1691,13 +1722,40 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
             .sort_values("count", ascending=False)
             .reset_index()
         )
+        # When built inline, velocity/trend/recurrence are not in the summary CSV.
+        # Compute velocity from the raw clustered bugs if Build# is available.
+        if "Build#" in cluster_df.columns:
+            _build_num = pd.to_numeric(cluster_df["Build#"], errors="coerce")
+            _max_build = _build_num.max()
+            _vel_rows = []
+            for _cid in summary["cluster_id"].unique():
+                _cmask = (cluster_df["cluster_id"] == _cid)
+                _cb = _build_num[_cmask]
+                _recent = int((_cb >= _max_build - 2).sum())
+                _prior  = int(((_cb >= _max_build - 5) & (_cb < _max_build - 2)).sum())
+                _ratio  = round(_recent / max(_prior, 1), 2)
+                _trend  = "growing" if _ratio >= 1.5 else "declining" if _ratio <= 0.67 else "stable"
+                # Recurrence: fraction of recent bugs from modules that also appeared in prior window
+                _r_mods = set(cluster_df.loc[_cmask & (_build_num >= _max_build - 2), "parsed_module"].dropna())
+                _p_mods = set(cluster_df.loc[_cmask & (_build_num >= _max_build - 5) & (_build_num < _max_build - 2), "parsed_module"].dropna())
+                _recur  = round(len(_r_mods & _p_mods) / max(len(_r_mods), 1), 3)
+                _vel_rows.append({"cluster_id": _cid, "cluster_velocity_ratio": _ratio,
+                                  "cluster_trend": _trend, "recurrence_rate": _recur})
+            _vel_df = pd.DataFrame(_vel_rows)
+            summary = summary.merge(_vel_df, on="cluster_id", how="left")
+        else:
+            summary["cluster_velocity_ratio"] = 1.0
+            summary["cluster_trend"]          = "stable"
+            summary["recurrence_rate"]         = 0.0
 
     if summary.empty:
         st.info("No clusters found in the loaded data.")
         st.stop()
 
-    # Ensure required columns exist
-    for col, default in [("count", 0), ("avg_sev", 3.0), ("modules", "")]:
+    # Ensure all required display columns exist
+    for col, default in [("count", 0), ("avg_sev", 3.0), ("modules", ""),
+                         ("cluster_velocity_ratio", 1.0), ("cluster_trend", "stable"),
+                         ("recurrence_rate", 0.0)]:
         if col not in summary.columns:
             summary[col] = default
 
@@ -1724,6 +1782,34 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
     summary["label_short"] = summary["cluster_label"].apply(
         lambda s: s[:45] + "…" if isinstance(s, str) and len(s) > 45 else s
     )
+
+    # ── Growing-cluster alert banners ────────────────────────────────────
+    # Show immediately visible alerts for any theme growing ≥1.5× so users
+    # don't have to scroll through cards to find the urgent signals.
+    summary["cluster_velocity_ratio"] = pd.to_numeric(
+        summary["cluster_velocity_ratio"], errors="coerce").fillna(1.0)
+    _growing = summary[
+        (summary["cluster_trend"] == "growing") &
+        (summary["cluster_velocity_ratio"] >= 1.5)
+    ].sort_values("cluster_velocity_ratio", ascending=False)
+    _high_recur = summary[summary["recurrence_rate"] >= 0.6].sort_values(
+        "recurrence_rate", ascending=False)
+
+    if not _growing.empty:
+        for _, _gr in _growing.head(3).iterrows():
+            st.warning(
+                f"🔺 **Growing theme:** _{_gr['label_short']}_ — "
+                f"{_gr['cluster_velocity_ratio']:.1f}× increase in recent builds "
+                f"({int(_gr['count'])} total bugs, avg sev {_gr['avg_sev']:.1f}). "
+                f"Modules: {_gr['modules']}"
+            )
+    if not _high_recur.empty:
+        for _, _rr in _high_recur.head(2).iterrows():
+            st.error(
+                f"🔁 **Fix not holding:** _{_rr['label_short']}_ — "
+                f"{_rr['recurrence_rate'] * 100:.0f}% recurrence rate. "
+                f"The same modules keep producing this type of bug. Escalate root-cause review."
+            )
 
     # ── Overview bar chart ───────────────────────────────────────────────
     st.subheader("📊 Theme Overview — How Many Bugs per Theme?")
@@ -1778,11 +1864,18 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
         rank   = summary.index[summary["cluster_label"] == label].tolist()
         rank_n = (rank[0] + 1) if rank else "?"
 
-        # Severity emoji for card header
-        sev_icon = {"🔴 Mostly Critical": "🔴", "🟠 Mostly Major": "🟠",
-                    "🟡 Mostly Normal": "🟡", "🟢 Mostly Minor": "🟢"}.get(sband, "⚪")
+        # Pre-compute velocity/trend/recurrence so they can appear in the header
+        vel_val    = float(row.get("cluster_velocity_ratio", 1.0))
+        trend_val  = str(row.get("cluster_trend", "stable"))
+        recur_val  = float(row.get("recurrence_rate", 0.0))
+        trend_icon = {"growing": "🔺", "declining": "✅", "stable": "➡️"}.get(trend_val, "➡️")
+        sev_icon   = {"🔴 Mostly Critical": "🔴", "🟠 Mostly Major": "🟠",
+                      "🟡 Mostly Normal": "🟡", "🟢 Mostly Minor": "🟢"}.get(sband, "⚪")
 
-        card_title = f"{sev_icon} Theme #{rank_n} · **{count} bugs** · _{label}_"
+        card_title = (
+            f"{sev_icon} Theme #{rank_n} · **{count} bugs** "
+            f"· {trend_icon} {trend_val} ({vel_val:.1f}×) · _{label}_"
+        )
 
         with st.expander(card_title, expanded=(rank_n == 1)):
             cc1, cc2, cc3 = st.columns(3)
@@ -1791,6 +1884,18 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
                        help="1=Critical  2=Major  3=Normal  4=Minor")
             pct = f"{count / n_clustered * 100:.1f}%" if n_clustered else "—"
             cc3.metric("Share of clustered bugs", pct)
+
+            # Velocity / trend / recurrence row
+            vc1, vc2, vc3 = st.columns(3)
+            vel_delta_color = "inverse" if trend_val == "declining" else ("off" if trend_val == "stable" else "normal")
+            vc1.metric("Velocity (recent vs prior 3 builds)", f"{vel_val:.2f}×",
+                       delta=f"{trend_icon} {trend_val.capitalize()}",
+                       delta_color=vel_delta_color,
+                       help="Ratio of bugs in the last 3 builds vs the 3 builds before that. Above 1.5 = growing.")
+            vc2.metric("Recurrence rate", f"{recur_val * 100:.0f}%",
+                       help="Fraction of recent bugs from modules that also contributed to this theme in the prior window. High = fix not holding.")
+            recur_label = "⚠️ Fix not holding" if recur_val > 0.5 else ("🔶 Moderate" if recur_val > 0.25 else "✅ Low")
+            vc3.metric("Recurrence risk", recur_label)
 
             if mods:
                 st.markdown(f"**Modules affected:** {mods}")
@@ -1813,24 +1918,264 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
                         st.markdown("**Sample bugs in this theme:**")
                         st.dataframe(samples, hide_index=True, width='stretch')
 
-            # Plain-English interpretation for non-QA readers
+            # Plain-English action — severity-based baseline
             if avg_sv <= 1.5:
-                action = "🚨 **Immediate attention** — this theme contains crash-level or data-loss bugs. Escalate to RD."
+                action = "🚨 **Immediate attention** — crash-level or data-loss bugs. Escalate to RD."
             elif avg_sv <= 2.5:
-                action = "⚠️ **High priority** — major functionality issues. Add these modules to the next sprint's regression list."
+                action = "⚠️ **High priority** — major functionality issues. Add to next sprint regression."
             elif avg_sv <= 3.5:
                 action = "📋 **Standard priority** — normal-severity issues. Cover in release-candidate testing."
             else:
-                action = "✅ **Low priority** — mostly cosmetic or minor issues. Include in full release cycle testing."
+                action = "✅ **Low priority** — mostly cosmetic or minor issues. Full release cycle."
+            # Amplify when velocity or recurrence signals override the severity baseline
+            if trend_val == "growing" and vel_val >= 1.5:
+                action += f"  🔺 **Growing fast ({vel_val:.1f}×)** — prioritise this theme in the next build regardless of total count."
+            if recur_val >= 0.5:
+                action += "  🔁 **High recurrence** — same modules keep appearing; underlying root cause may not be resolved."
             st.info(action)
 
     # ── Raw summary table ────────────────────────────────────────────────
     with st.expander("📋 Full theme table (raw data)"):
-        display_sum = summary[["cluster_label", "count", "avg_sev", "modules",
-                                "severity_band"]].copy()
-        display_sum.columns = ["Theme keywords", "Bug count", "Avg severity (1–4)",
-                                "Modules affected", "Severity band"]
+        display_cols_sum = [c for c in ["cluster_label", "count", "avg_sev", "modules",
+                                         "severity_band", "cluster_velocity_ratio",
+                                         "cluster_trend", "recurrence_rate"]
+                            if c in summary.columns]
+        disp_names = {
+            "cluster_label": "Theme keywords", "count": "Bug count",
+            "avg_sev": "Avg severity (1–4)", "modules": "Modules affected",
+            "severity_band": "Severity band",
+            "cluster_velocity_ratio": "Velocity ratio",
+            "cluster_trend": "Trend",
+            "recurrence_rate": "Recurrence rate",
+        }
+        display_sum = summary[display_cols_sum].rename(columns=disp_names)
         st.dataframe(display_sum, hide_index=True, width='stretch')
+
+    # ── NEW v3.0 — Cluster velocity chart ───────────────────────────────
+    if "cluster_velocity_ratio" in summary.columns and "cluster_trend" in summary.columns:
+        st.markdown("---")
+        st.subheader("📈 Cluster Velocity — Which Themes Are Growing?")
+        st.caption(
+            "Velocity ratio compares bug count in the most recent 3 builds vs the prior 3 builds. "
+            "**Above 1.5** = theme is growing (🔺 alert). **Below 0.67** = theme is declining (✅ improving). "
+            "Focus testing effort on growing themes."
+        )
+
+        vel_df = summary.copy()
+        vel_df["cluster_velocity_ratio"] = pd.to_numeric(
+            vel_df["cluster_velocity_ratio"], errors="coerce").fillna(1.0)
+        # Show all clusters sorted by velocity descending — most urgent at top
+        vel_df = vel_df.sort_values("cluster_velocity_ratio", ascending=False).head(20)
+
+        vel_df["trend_color"] = vel_df["cluster_trend"].map({
+            "growing":   "🔺 Growing",
+            "stable":    "➡️ Stable",
+            "declining": "✅ Declining",
+        }).fillna("➡️ Stable")
+
+        TREND_COLORS = {
+            "🔺 Growing":   "#ef4444",
+            "➡️ Stable":    "#94a3b8",
+            "✅ Declining": "#22c55e",
+        }
+        fig_vel = px.bar(
+            vel_df,
+            x="cluster_velocity_ratio",
+            y="label_short",
+            orientation="h",
+            color="trend_color",
+            color_discrete_map=TREND_COLORS,
+            hover_data={"cluster_velocity_ratio": ":.2f",
+                        "count": True, "modules": True,
+                        "label_short": False, "trend_color": False},
+            labels={"cluster_velocity_ratio": "Velocity ratio (recent / prior 3 builds)",
+                    "label_short": "Theme",
+                    "count": "Total bugs",
+                    "modules": "Modules"},
+            text="cluster_velocity_ratio",
+        )
+        fig_vel.update_traces(texttemplate="%{text:.2f}×", textposition="outside")
+        fig_vel.add_vline(x=1.0, line_color="gray", line_width=1, line_dash="dash")
+        fig_vel.add_vline(x=1.5, line_color="#ef4444", line_width=1, line_dash="dot",
+                          annotation_text="Growing threshold", annotation_position="top right")
+        fig_vel.update_layout(
+            height=max(320, len(vel_df) * 28),
+            yaxis={"categoryorder": "total ascending"},
+            showlegend=True, legend_title_text="Trend",
+            margin=dict(l=10, r=120, t=20, b=10),
+        )
+        st.plotly_chart(fig_vel, width='stretch')
+
+    # ── NEW v3.0 — Module cluster entropy table ──────────────────────────
+    # Use loaded entropy CSV if available; otherwise compute directly from cluster_df
+    _ent_source_df = cluster_ent_df
+    if _ent_source_df is None and cluster_df is not None and "cluster_id" in cluster_df.columns:
+        _clustered_only = cluster_df[(cluster_df["cluster_id"] != -1)].dropna(
+            subset=["parsed_module", "cluster_id"])
+        _ent_rows = []
+        for _mod, _grp in _clustered_only.groupby("parsed_module"):
+            _counts = _grp["cluster_id"].value_counts().values.astype(float)
+            _total  = _counts.sum()
+            if _total > 0:
+                _p   = _counts / _total
+                _ent = float(-np.sum(_p * np.log2(_p + 1e-12)))
+                _ent_rows.append({"module": _mod, "cluster_entropy": round(_ent, 3)})
+        if _ent_rows:
+            _ent_source_df = pd.DataFrame(_ent_rows)
+
+    if _ent_source_df is not None and not _ent_source_df.empty:
+        st.markdown("---")
+        st.subheader("🔀 Module Cluster Entropy — Breadth of Bug Themes")
+        with st.expander("ℹ️ What is cluster entropy?", expanded=False):
+            st.markdown("""
+**Entropy** measures how spread out a module's bugs are across different themes.
+
+| Entropy | Meaning | Action |
+|---------|---------|--------|
+| **Low (< 1)** | Bugs concentrated in one theme — focused failure mode | Easy to fix: one root cause to address |
+| **Medium (1–2)** | Bugs spread across a few themes | Review whether themes share a common component |
+| **High (> 2)** | Bugs spread across many themes — broad instability | Module needs comprehensive regression testing |
+""")
+        ent_display = _ent_source_df.copy()
+        ent_display["cluster_entropy"] = pd.to_numeric(
+            ent_display["cluster_entropy"], errors="coerce").fillna(0.0)
+        ent_display = ent_display.sort_values("cluster_entropy", ascending=False)
+        ent_display["stability"] = ent_display["cluster_entropy"].apply(
+            lambda v: "⚠️ Broad instability" if v > 2 else
+                      "🔶 Spreading" if v > 1 else
+                      "✅ Focused"
+        )
+        fig_ent = px.bar(
+            ent_display.head(20),
+            x="cluster_entropy", y="module", orientation="h",
+            color="stability",
+            color_discrete_map={
+                "⚠️ Broad instability": "#ef4444",
+                "🔶 Spreading":         "#f97316",
+                "✅ Focused":           "#22c55e",
+            },
+            labels={"cluster_entropy": "Entropy (higher = more spread)",
+                    "module": "Module", "stability": "Theme breadth"},
+            text="cluster_entropy",
+        )
+        fig_ent.update_traces(texttemplate="%{text:.2f}", textposition="outside")
+        fig_ent.add_vline(x=1.0, line_color="#f97316", line_width=1, line_dash="dash")
+        fig_ent.add_vline(x=2.0, line_color="#ef4444", line_width=1, line_dash="dash")
+        fig_ent.update_layout(
+            height=max(300, min(20, len(ent_display)) * 30),
+            yaxis={"categoryorder": "total ascending"},
+            showlegend=True, legend_title_text="Theme breadth",
+            margin=dict(l=10, r=80, t=10, b=10),
+        )
+        st.plotly_chart(fig_ent, width='stretch')
+
+    # ── NEW v3.0 — Severity-stratified cluster views ─────────────────────
+    if cluster_s12_df is not None or cluster_s34_df is not None:
+        st.markdown("---")
+        st.subheader("🔬 Severity-Stratified Themes")
+        st.caption(
+            "Clusters run separately for S1/S2 (crash/major) and S3/S4 (normal/minor) bugs. "
+            "The global view above mixes all severities; these tabs show each tier in isolation."
+        )
+        tier_tabs = st.tabs(["🔴 Critical/Major themes (S1–S2)", "🟡 Normal/Minor themes (S3–S4)"])
+
+        for tab_widget, tier_df, tier_name in [
+            (tier_tabs[0], cluster_s12_df, "S1/S2"),
+            (tier_tabs[1], cluster_s34_df, "S3/S4"),
+        ]:
+            with tab_widget:
+                if tier_df is None or tier_df.empty:
+                    st.info(f"No stratified cluster data for {tier_name}. "
+                            f"Re-run with `--stratify-severity` flag.")
+                    continue
+
+                for col, default in [("count", 0), ("avg_sev", 3.0), ("modules", ""),
+                                     ("cluster_velocity_ratio", 1.0), ("cluster_trend", "stable"),
+                                     ("recurrence_rate", 0.0)]:
+                    if col not in tier_df.columns:
+                        tier_df[col] = default
+
+                tier_df = tier_df.copy()
+                tier_df["label_short"] = tier_df["cluster_label"].apply(
+                    lambda s: s[:45] + "…" if isinstance(s, str) and len(s) > 45 else s)
+                tier_df["avg_sev"]   = pd.to_numeric(tier_df["avg_sev"], errors="coerce").fillna(3.0)
+                tier_df["count"]     = pd.to_numeric(tier_df["count"],   errors="coerce").fillna(0).astype(int)
+                tier_df["cluster_velocity_ratio"] = pd.to_numeric(
+                    tier_df["cluster_velocity_ratio"], errors="coerce").fillna(1.0)
+                tier_df = tier_df.sort_values("count", ascending=False)
+
+                # Overview bar
+                fig_tier = px.bar(
+                    tier_df.head(15),
+                    x="count", y="label_short", orientation="h",
+                    color="cluster_trend",
+                    color_discrete_map={"growing": "#ef4444", "stable": "#94a3b8",
+                                        "declining": "#22c55e"},
+                    hover_data={"count": True, "avg_sev": ":.2f", "modules": True,
+                                "cluster_velocity_ratio": ":.2f", "recurrence_rate": ":.0%"},
+                    labels={"count": "Bugs", "label_short": "Theme",
+                            "cluster_trend": "Trend",
+                            "cluster_velocity_ratio": "Velocity",
+                            "recurrence_rate": "Recurrence"},
+                    text="count",
+                )
+                fig_tier.update_traces(textposition="outside")
+                fig_tier.update_layout(
+                    height=max(300, min(15, len(tier_df)) * 30),
+                    yaxis={"categoryorder": "total ascending"},
+                    showlegend=True, legend_title_text="Trend",
+                    margin=dict(l=10, r=40, t=10, b=10),
+                )
+                st.plotly_chart(fig_tier, width='stretch')
+
+                # Detail cards for top 10
+                st.markdown(f"**Theme detail cards — {tier_name} tier**")
+                tier_n_clustered = tier_df["count"].sum()
+                for _ti, _tr in tier_df.head(10).iterrows():
+                    _cid   = _tr.get("cluster_id", -1)
+                    _label = str(_tr.get("cluster_label", "Unknown"))
+                    _count = int(_tr.get("count", 0))
+                    _avsev = float(_tr.get("avg_sev", 3.0))
+                    _mods  = str(_tr.get("modules", ""))
+                    _vel   = float(_tr.get("cluster_velocity_ratio", 1.0))
+                    _trend = str(_tr.get("cluster_trend", "stable"))
+                    _recur = float(_tr.get("recurrence_rate", 0.0))
+                    _sev_icon = "🔴" if _avsev <= 1.5 else "🟠" if _avsev <= 2.5 else "🟡" if _avsev <= 3.5 else "🟢"
+                    _trend_icon = {"growing": "🔺", "declining": "✅", "stable": "➡️"}.get(_trend, "➡️")
+                    _title = f"{_sev_icon} **{_count} bugs** · {_trend_icon} {_trend} · _{_label}_"
+                    with st.expander(_title, expanded=False):
+                        _c1, _c2, _c3 = st.columns(3)
+                        _c1.metric("Bugs", _count)
+                        _c2.metric("Avg severity", f"{_avsev:.1f}")
+                        _c3.metric("Share of tier", f"{_count / max(tier_n_clustered, 1) * 100:.1f}%")
+                        _v1, _v2 = st.columns(2)
+                        _v1.metric("Velocity", f"{_vel:.2f}×",
+                                   delta=f"{_trend_icon} {_trend.capitalize()}",
+                                   delta_color="inverse" if _trend == "declining" else
+                                              ("off" if _trend == "stable" else "normal"))
+                        _v2.metric("Recurrence", f"{_recur * 100:.0f}%",
+                                   help="Fraction of recent bugs from modules that contributed in prior window")
+                        if _mods:
+                            st.markdown(f"**Modules:** {_mods}")
+                        # Sample bugs for this tier cluster
+                        _id_col = "cluster_id_s12" if tier_name == "S1/S2" else "cluster_id_s34"
+                        if cluster_df is not None and _id_col in cluster_df.columns:
+                            _cl_bugs = cluster_df[cluster_df[_id_col] == _cid]
+                        elif cluster_df is not None and "cluster_id" in cluster_df.columns:
+                            _cl_bugs = cluster_df[cluster_df["cluster_id"] == _cid]
+                        else:
+                            _cl_bugs = pd.DataFrame()
+                        if not _cl_bugs.empty and "parsed_description" in _cl_bugs.columns:
+                            _samples = (
+                                _cl_bugs[_cl_bugs["parsed_description"].notna()]
+                                [["parsed_module", "parsed_description", "severity_label"]]
+                                .head(5)
+                                .rename(columns={"parsed_module": "Module",
+                                                 "parsed_description": "Bug description",
+                                                 "severity_label": "Severity"})
+                            )
+                            if not _samples.empty:
+                                st.dataframe(_samples, hide_index=True, width='stretch')
 
 
 # =====================================================================
@@ -1943,11 +2288,18 @@ The signals are labelled in plain English, not variable names.
 ### 🛠️ Where Does This Data Come From?
 
 ```bash
-python scripts/predict_defects.py data/ecl_parsed.csv data/ecl_parsed_predictions.csv
+# Basic (no cluster features):
+python scripts/predict_defects.py data/ecl_parsed.csv
+
+# v3.0 recommended (with cluster features + bug-type predictions):
+python scripts/predict_defects.py data/ecl_parsed.csv \\
+  --cluster-csv data/clusters/ecl_parsed_clustered.csv
 ```
 
-Then in the sidebar: **Step 4** → set paths to `ecl_parsed_predictions.csv`, `_focus_summary.txt`,
-and `_leading_indicators.csv`. All four output files are stored under `data/predictions/` by default.
+v3.0 produces an additional output automatically when `--cluster-csv` is provided:
+- `predictions/ecl_parsed_predictions_by_cluster.csv` — per-module, per-theme predicted counts
+
+Then in the sidebar: **Step 4** → set paths to the prediction CSV, focus summary, leading indicators CSV, and the new bug-type predictions CSV (`_by_cluster.csv`). All four files live under `data/predictions/` by default.
 
 Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 stay in sync.
 """)
@@ -1963,6 +2315,21 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
     if not required_pred_cols.issubset(pred_df.columns):
         st.error(f"Predictions file missing columns: {required_pred_cols - set(pred_df.columns)}")
         st.stop()
+
+    # Build _ent_source_df for module entropy lookup (same fallback logic as Tab 8)
+    _ent_source_df = cluster_ent_df
+    if _ent_source_df is None and cluster_df is not None and "cluster_id" in cluster_df.columns:
+        _ec_only = cluster_df[(cluster_df["cluster_id"] != -1)].dropna(
+            subset=["parsed_module", "cluster_id"])
+        _ent_rows_t9 = []
+        for _mod, _grp in _ec_only.groupby("parsed_module"):
+            _c = _grp["cluster_id"].value_counts().values.astype(float)
+            if _c.sum() > 0:
+                _p = _c / _c.sum()
+                _ent_rows_t9.append({"module": _mod,
+                                     "cluster_entropy": round(float(-np.sum(_p * np.log2(_p + 1e-12))), 3)})
+        if _ent_rows_t9:
+            _ent_source_df = pd.DataFrame(_ent_rows_t9)
 
     pred_df["predicted"] = pd.to_numeric(pred_df["predicted"], errors="coerce").fillna(0)
     pred_df = pred_df.sort_values("predicted", ascending=False).reset_index(drop=True)
@@ -1982,7 +2349,103 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
     else:
         pm4.metric("Model accuracy (MAE)", "N/A")
 
+    # ── AI Focus Summary (from predict_defects.py focus summary file) ─────
+    if pred_summary_txt and pred_summary_txt.strip():
+        st.markdown("---")
+        st.subheader("📋 AI Risk Briefing — Next Build Focus Summary")
+        st.caption(
+            "Plain-English summary generated by predict_defects.py. "
+            "Lists the highest-risk modules with why they are at risk and what to test."
+        )
+        st.code(pred_summary_txt, language=None)
+
     st.markdown("---")
+
+    # ── NEW v3.0 — Severity escalation alerts ─────────────────────────────
+    if "severity_escalation" in pred_df.columns:
+        _esc = pred_df[["module", "predicted", "risk_level", "severity_escalation"]].copy()
+        _esc["severity_escalation"] = pd.to_numeric(_esc["severity_escalation"], errors="coerce")
+        _worsening = _esc[_esc["severity_escalation"] < -0.3].sort_values(
+            "severity_escalation").head(8)
+        if not _worsening.empty:
+            st.subheader("⚠️ Severity Escalation Alerts")
+            st.caption(
+                "These modules have bugs getting **more severe** in recent builds — "
+                "the average severity is trending toward Critical (S1). "
+                "Flag for immediate investigation even if raw bug counts look low."
+            )
+            for _, _er in _worsening.iterrows():
+                _esc_val = float(_er["severity_escalation"])
+                _esc_icon = "🚨" if _esc_val < -0.8 else "⚠️"
+                st.warning(
+                    f"{_esc_icon} **{_er['module']}** — severity worsening by "
+                    f"{abs(_esc_val):.2f} points toward S1 "
+                    f"(predicted {_er['predicted']:.0f} bugs, {_er['risk_level']} risk)"
+                )
+            st.markdown("---")
+
+    # ── NEW v3.0 — builds_since_last_crit summary ─────────────────────────
+    if "builds_since_last_crit" in pred_df.columns:
+        _bslc = pred_df[["module", "predicted", "risk_level", "builds_since_last_crit"]].copy()
+        _bslc["builds_since_last_crit"] = pd.to_numeric(
+            _bslc["builds_since_last_crit"], errors="coerce")
+        _overdue = _bslc[
+            (_bslc["builds_since_last_crit"] >= 5) &
+            (_bslc["builds_since_last_crit"] <= 20) &
+            (~_bslc["risk_level"].isin(["Low"]))
+        ].sort_values("builds_since_last_crit").head(6)
+        if not _overdue.empty:
+            # Expanded by default so users see it without scrolling
+            with st.expander(
+                f"🕒 {len(_overdue)} module(s) overdue for a critical bug — had S1s historically, none recently",
+                expanded=True,
+            ):
+                st.caption(
+                    "Modules that have produced critical bugs in the past but have been quiet for 5–20 builds. "
+                    "They are not 'fixed' — they may be accumulating risk. Monitor closely."
+                )
+                for _, _od in _overdue.iterrows():
+                    st.info(
+                        f"**{_od['module']}** — {int(_od['builds_since_last_crit'])} builds "
+                        f"since last critical · predicted {_od['predicted']:.0f} bugs · {_od['risk_level']} risk"
+                    )
+            st.markdown("---")
+
+    # ── NEW v3.0 — Module signals summary table ───────────────────────────
+    # Shows severity_escalation, builds_since_last_crit, and entropy for all
+    # modules in one scannable table — not buried inside individual cards.
+    _sig_cols = [c for c in ["module", "predicted", "risk_level",
+                              "severity_escalation", "builds_since_last_crit",
+                              "dominant_bug_type", "leading_signal"]
+                 if c in pred_df.columns]
+    _have_new_signals = any(c in pred_df.columns
+                            for c in ["severity_escalation", "builds_since_last_crit"])
+    if _have_new_signals:
+        with st.expander("📊 Module signals table — v3.0 features across all modules",
+                         expanded=False):
+            st.caption(
+                "Full breakdown of every forecast signal. "
+                "**Severity escalation**: negative = bugs getting more severe toward S1. "
+                "**Builds since last critical**: small number = recently had a crash; large = possibly overdue."
+            )
+            _sig_df = pred_df[_sig_cols].copy()
+            # Join entropy if available
+            if _ent_source_df is not None and not _ent_source_df.empty:
+                _sig_df = _sig_df.merge(
+                    _ent_source_df[["module", "cluster_entropy"]], on="module", how="left")
+            _col_labels = {
+                "module": "Module",
+                "predicted": "Forecast",
+                "risk_level": "Risk",
+                "severity_escalation": "Sev. escalation",
+                "builds_since_last_crit": "Builds since S1",
+                "dominant_bug_type": "Typical bug type",
+                "leading_signal": "Leading signal",
+                "cluster_entropy": "Theme breadth",
+            }
+            _sig_df = _sig_df.rename(columns=_col_labels)
+            st.dataframe(_sig_df, hide_index=True, width='stretch')
+        st.markdown("---")
 
     # ── Forecast bar chart ────────────────────────────────────────────────
     st.subheader("📊 Predicted Bug Count — Next Build")
@@ -2110,15 +2573,92 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
 
         card_header = f"{icon} **{mod}** — forecast {pred_val:.0f} bugs · {rl} risk"
         with st.expander(card_header, expanded=(rl == "Critical")):
+            # Row 1 — count metrics
             fc1, fc2, fc3 = st.columns(3)
             fc1.metric("Predicted bugs", f"{pred_val:.0f}")
             if target_v is not None:
-                fc2.metric("Actual last build", f"{float(target_v):.0f}")
+                fc2.metric("Actual last build", f"{float(target_v):.0f}",
+                           delta=f"{float(pred_val) - float(target_v):+.0f} vs actual",
+                           delta_color="inverse")
             fc3.metric("Risk level", rl)
 
+            # Row 2 — new v3.0 signals
+            sev_esc   = row.get("severity_escalation", None)
+            bslc      = row.get("builds_since_last_crit", None)
+            # Look up module entropy from _ent_source_df if available
+            mod_ent   = None
+            if _ent_source_df is not None and not _ent_source_df.empty:
+                _ent_row = _ent_source_df[_ent_source_df["module"] == mod]
+                if not _ent_row.empty:
+                    mod_ent = float(_ent_row.iloc[0]["cluster_entropy"])
+
+            if sev_esc is not None or bslc is not None or mod_ent is not None:
+                sc1, sc2, sc3 = st.columns(3)
+                if sev_esc is not None:
+                    _sev_esc_f = float(sev_esc)
+                    _esc_label = (
+                        "🚨 Worsening toward S1" if _sev_esc_f < -0.5 else
+                        "⚠️ Slight worsening"    if _sev_esc_f < -0.1 else
+                        "✅ Stable / improving"
+                    )
+                    sc1.metric("Severity trend", _esc_label,
+                               help="Negative = severity worsening toward S1 in recent builds")
+                if bslc is not None:
+                    sc2.metric("Builds since last critical", f"{int(float(bslc))}",
+                               help="How many builds have passed since the last S1 bug in this module")
+                if mod_ent is not None:
+                    _ent_label = (
+                        "⚠️ Broad instability" if mod_ent > 2.0 else
+                        "🔶 Spreading themes"  if mod_ent > 1.0 else
+                        "✅ Focused theme"
+                    )
+                    sc3.metric("Theme breadth (entropy)", f"{mod_ent:.2f} — {_ent_label}",
+                               help="High entropy = bugs spread across many themes; low = concentrated failure mode")
+
             st.markdown(f"**Typical bug type:** {dom_type}")
-            st.markdown(f"**Why high risk:** driven by _{lead_sig}_")
+            st.markdown(f"**Leading signal:** _{lead_sig}_")
+
+            # v3.0 — per-cluster bug-type breakdown
+            if pred_cluster_df is not None and not pred_cluster_df.empty:
+                mod_clusters = pred_cluster_df[pred_cluster_df["module"] == mod].head(6)
+                if not mod_clusters.empty:
+                    st.markdown("**What to expect (by bug theme):**")
+                    for _, cr in mod_clusters.iterrows():
+                        pct_str = f"{cr['historical_pct'] * 100:.0f}%"
+                        cnt_str = f"~{cr['predicted_count']:.0f}"
+                        label   = str(cr.get("cluster_label", f"Cluster {cr['cluster_id']}"))
+                        if label not in ("No cluster data", "Unclustered"):
+                            st.markdown(
+                                f"&nbsp;&nbsp;• **{cnt_str} bugs** ({pct_str}) — _{label}_",
+                                unsafe_allow_html=True,
+                            )
+
+            # AI narrative — show if available and non-empty
+            _narrative = str(row.get("ai_narrative", "")).strip()
+            if _narrative and _narrative not in ("", "nan"):
+                st.markdown("**AI risk briefing:**")
+                st.info(_narrative)
+
             st.info(f"**What to test:** {RISK_ADVICE.get(rl, '')}")
+
+    # ── Cross-tab cluster callout ─────────────────────────────────────────
+    # When cluster data is loaded, surface which of the high-risk modules also
+    # have growing themes in Tab 8 — connecting the two tabs visually.
+    if cluster_sum_df is not None and not cluster_sum_df.empty and "cluster_trend" in cluster_sum_df.columns:
+        _growing_mods = set()
+        for _, _cr in cluster_sum_df[cluster_sum_df["cluster_trend"] == "growing"].iterrows():
+            _mod_str = str(_cr.get("modules", ""))
+            for _m in _mod_str.split(","):
+                _growing_mods.add(_m.strip())
+        _high_risk_mods = set(cards_df["module"].tolist())
+        _overlap = _high_risk_mods & _growing_mods
+        if _overlap:
+            st.info(
+                f"📡 **Tab 8 cross-reference:** {len(_overlap)} high-risk module(s) also have "
+                f"**growing bug themes** in the cluster analysis — "
+                f"{', '.join(sorted(_overlap))}. "
+                f"Open **Tab 8 → Bug Clusters** to see which specific themes are accelerating."
+            )
 
     # ── Leading indicators ────────────────────────────────────────────────
     if pred_leading_df is not None and not pred_leading_df.empty:
@@ -2177,14 +2717,35 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
 
     # ── Raw predictions table ──────────────────────────────────────────────
     with st.expander("📋 Full predictions table"):
-        show_cols = [c for c in ["module", "predicted", "target", "risk_level",
-                                 "dominant_bug_type", "leading_signal"] if c in pred_df.columns]
-        disp_pred = pred_df[show_cols].copy()
-        disp_pred.columns = [
-            {"module": "Module", "predicted": "Forecast (next build)",
-             "target": "Actual (last build)", "risk_level": "Risk level",
-             "dominant_bug_type": "Typical bug type",
-             "leading_signal": "Leading signal"}.get(c, c)
-            for c in show_cols
-        ]
+        _all_pred_cols = [c for c in [
+            "module", "predicted", "target", "risk_level",
+            "dominant_bug_type", "leading_signal",
+            "severity_escalation", "builds_since_last_crit",
+        ] if c in pred_df.columns]
+        disp_pred = pred_df[_all_pred_cols].copy()
+        _pred_col_labels = {
+            "module": "Module",
+            "predicted": "Forecast (next build)",
+            "target": "Actual (last build)",
+            "risk_level": "Risk level",
+            "dominant_bug_type": "Typical bug type",
+            "leading_signal": "Leading signal",
+            "severity_escalation": "Sev. escalation",
+            "builds_since_last_crit": "Builds since S1",
+        }
+        disp_pred = disp_pred.rename(columns=_pred_col_labels)
         st.dataframe(disp_pred, hide_index=True, width='stretch')
+
+        # Also show the per-cluster breakdown table if loaded
+        if pred_cluster_df is not None and not pred_cluster_df.empty:
+            st.markdown("**Bug-type predictions by cluster:**")
+            st.dataframe(
+                pred_cluster_df[["module", "cluster_label", "historical_pct", "predicted_count"]]
+                .rename(columns={
+                    "module": "Module",
+                    "cluster_label": "Bug theme",
+                    "historical_pct": "Historical %",
+                    "predicted_count": "Predicted bugs",
+                }),
+                hide_index=True, width='stretch',
+            )

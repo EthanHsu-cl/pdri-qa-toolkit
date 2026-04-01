@@ -1,9 +1,52 @@
-# PDR-I QA Toolkit v2.6 — Complete Step-by-Step Implementation Guide
+# PDR-I QA Toolkit v3.0 — Complete Step-by-Step Implementation Guide
 
 > Mac Mini M1 · Python 3.14 · Appium · Jenkins · Streamlit  
-> Updated from v2.5 to reflect all session changes through v2.16.
+> Updated from v2.6 to reflect all session changes through v3.0.
 
 ***
+
+## What Changed in v3.0
+
+### `cluster_bugs.py` → v3.0
+
+| Area | Change |
+|------|--------|
+| **Severity stratification** | `--stratify-severity` flag splits clustering into two independent passes: S1/S2 (Critical/Major) and S3/S4 (Normal/Minor). Produces separate summary files `_cluster_summary_s12.csv` and `_cluster_summary_s34.csv` so you can investigate crash-class bugs independently of cosmetic ones. |
+| **`cluster_velocity_ratio`** | Added to cluster summary. Ratio of bug count in the most recent 3 builds vs the prior 3 builds per cluster. Values above 1.5 = theme accelerating (prioritise in testing); below 0.67 = theme declining (fixes may be holding). |
+| **`cluster_trend`** | `"growing"` / `"stable"` / `"declining"` label derived from velocity ratio. Quick filter: sort summary by `cluster_trend == "growing"` before the weekly team meeting. |
+| **`recurrence_rate`** | Fraction of recent bugs in a cluster whose source module also contributed the same cluster in the prior build window. Above 0.5 = root cause not being fixed — escalate to RD. |
+| **`cluster_entropy` (per module)** | New `*_module_entropy.csv` output. Shannon entropy of a module's cluster distribution. Below 1.0 = all bugs in one theme (easy to target). Above 2.0 = bugs everywhere (needs comprehensive coverage). |
+| **New output files** | `*_cluster_summary_s12.csv`, `*_cluster_summary_s34.csv` (with `--stratify-severity`); `*_module_entropy.csv` (always). |
+
+### `predict_defects.py` → v3.0
+
+| Area | Change |
+|------|--------|
+| **`--cluster-csv` flag** | Auto-detected from default path if present. Feeds `cluster_entropy_3`, `cluster_entropy_5`, and `top_cluster_velocity` features into the model. |
+| **New features** | `severity_escalation` (mean severity delta — catches modules about to hit a critical before counts spike); `builds_since_last_crit` (flags modules historically prone to S1s that have been quiet — potentially overdue); `cluster_entropy_3/_5` (rising diversity of bug themes = new *kinds* of failures); `top_cluster_velocity` (growth rate of dominant theme — early-warning for theme-specific regressions). |
+| **`_predictions_by_cluster.csv`** | New output. Per-module, per-theme predicted counts: `module, cluster_id, cluster_label, historical_pct, predicted_count`. Tells you not just how many bugs to expect, but what *type*. |
+| **`--provider claude`** | New provider option for cluster-aware narratives via the Claude API (in addition to existing `ollama`). |
+
+### `auto_tag_tests.py` → v3.0
+
+| Area | Change |
+|------|--------|
+| **`--cluster-predictions` flag** | Accepts `*_predictions_by_cluster.csv`. When provided, each generated `test_<module>.py` now contains one `test_<theme_name>()` method per predicted bug theme, with expected count in the TODO comment and Allure severity inferred from cluster label keywords. |
+| **`--cluster-plan` flag** | Writes `data/cluster_test_plan.md` — a scenario-level test plan for P1/P2 modules. One table per module listing each predicted theme, its expected bug count, and a one-sentence test scenario description auto-generated from cluster label keywords. |
+| **`quadrant_summary.md`** | P1/P2 rows now include a "Predicted bug themes" column showing the top 2 expected cluster labels when `--cluster-predictions` is supplied. |
+
+### Dashboard (`bug_heatmap_dashboard.py` → v3.0)
+
+| Area | Change |
+|------|--------|
+| **Sidebar Step 3 — Module entropy field** | Optional "Module entropy CSV" path field added. Stratified summaries (`_s12.csv`, `_s34.csv`) load automatically from their default locations when the base cluster files are loaded. |
+| **Sidebar Step 4 — Bug-type predictions field** | Optional "Bug-type predictions CSV" path field added (`_by_cluster.csv`). |
+| **Tab 8 — Bug Clusters (new features)** | Velocity chart (cluster trend over time), module entropy chart, stratified S1/S2 vs S3/S4 tabs — all shown when the corresponding files are loaded. |
+| **Tab 9 — Defect Forecast (new feature)** | Module forecast cards now show a per-theme breakdown under "What to expect" (e.g. "~3 bugs — login crash / timeout") when `_by_cluster.csv` is loaded. |
+
+All v3.0 changes are strictly additive — every existing command from v2.6 works without modification. See [Backward compatibility](#backward-compatibility) for a full compatibility table.
+
+---
 
 ## What Changed in v2.6
 
@@ -105,10 +148,10 @@
 | 1 | `scripts/parse_ecl_export.py` | v2.6+ | Parse ECL Excel / CSV / n8n JSON → enriched CSV + version catalogue |
 | 2 | `scripts/compute_risk_scores.py` | v2.4 | Module metric aggregation → risk register (recency-ordered, sparse-skipping) |
 | 3 | `scripts/ai_risk_scorer.py` | v2.4 | Impact/Detectability scoring (heuristic / Ollama / OpenAI) with resume/checkpoint |
-| 4 | `scripts/auto_tag_tests.py` | v2.1 | pytest skeleton generator + Allure decorator output |
-| 5 | `scripts/bug_heatmap_dashboard.py` | v2.16 | Streamlit dashboard — 9 tabs, 4-step sidebar |
-| 6 | `scripts/cluster_bugs.py` | v2.3 | TF-IDF / Ollama semantic embeddings + K-Means/DBSCAN clustering + LLM cluster labels |
-| 7 | `scripts/predict_defects.py` | v2.2 | Gradient Boosting defect prediction with leading indicators + plain-English focus summary |
+| 4 | `scripts/auto_tag_tests.py` | **v3.0** | pytest skeleton generator + Allure decorators + per-theme test methods + cluster test plan |
+| 5 | `scripts/bug_heatmap_dashboard.py` | **v3.0** | Streamlit dashboard — 9 tabs, 4-step sidebar; velocity/entropy charts; per-theme forecast cards |
+| 6 | `scripts/cluster_bugs.py` | **v3.0** | TF-IDF / Ollama clustering + velocity/trend/recurrence metrics + severity stratification + module entropy |
+| 7 | `scripts/predict_defects.py` | **v3.0** | Gradient Boosting prediction + cluster-aware features + per-theme bug-type forecasts |
 | 8 | `scripts/visual_regression.py` | v2.1 | Screenshot diff engine |
 | 9 | `scripts/fetch_from_n8n.py` | v1.2 | Fetch bugs from n8n webhook → `data/ecl_raw.json` (status comparison, scope scheduling, version catalogue integration) |
 | 10 | `Jenkinsfile` | — | P1→P2→P3→P4 CI/CD pipeline |
@@ -144,13 +187,20 @@ pdri-qa-toolkit/
 │   ├── module_mappings/                         ← fuzzy match store (auto-created)
 │   │   ├── permanent/mappings_global.json
 │   │   └── versions/
-│   ├── ecl_parsed_clustered.csv                 ← Step 6.1 output  ← Dashboard Step 3
-│   ├── ecl_parsed_cluster_summary.csv           ← Step 6.1 output  ← Dashboard Step 3
-│   ├── ecl_parsed_predictions.csv               ← Step 6.2 output  ← Dashboard Step 4
-│   ├── ecl_parsed_predictions_focus_summary.txt ← Step 6.2 output  ← Dashboard Step 4
-│   ├── ecl_parsed_predictions_leading_indicators.csv  ← Step 6.2 output  ← Dashboard Step 4
-│   ├── ecl_parsed_predictions_importance.csv    ← Step 6.2 output (model feature importances)
-│   └── quadrant_summary.md                      ← Step 3.3 output
+│   ├── clusters/                                ← Step 6.1 output  ← Dashboard Step 3
+│   │   ├── ecl_parsed_clustered.csv             ← bug-level with cluster_id, cluster_label
+│   │   ├── ecl_parsed_cluster_summary.csv       ← per-cluster: velocity, trend, recurrence_rate
+│   │   ├── ecl_parsed_module_entropy.csv        ← per-module cluster_entropy score (v3.0)
+│   │   ├── ecl_parsed_cluster_summary_s12.csv   ← S1/S2 tier (--stratify-severity, v3.0)
+│   │   └── ecl_parsed_cluster_summary_s34.csv   ← S3/S4 tier (--stratify-severity, v3.0)
+│   ├── predictions/                             ← Step 6.2 output  ← Dashboard Step 4
+│   │   ├── ecl_parsed_predictions.csv
+│   │   ├── ecl_parsed_predictions_by_cluster.csv  ← per-theme forecast (v3.0)
+│   │   ├── ecl_parsed_predictions_focus_summary.txt
+│   │   ├── ecl_parsed_predictions_leading_indicators.csv
+│   │   └── ecl_parsed_predictions_importance.csv
+│   ├── quadrant_summary.md                      ← Step 3.3 output (P1/P2 now include themes, v3.0)
+│   └── cluster_test_plan.md                     ← Step 3.3 output (new in v3.0)
 ├── scripts/
 │   ├── fetch_from_n8n.py
 │   ├── parse_ecl_export.py
@@ -446,11 +496,20 @@ Produces:
 ### Step 3.3 — Generate Test Skeletons & Management Summary
 
 ```bash
+# Minimum — same as v2.1:
 python scripts/auto_tag_tests.py data/risk_register_scored_all.csv \
   --generate-skeletons tests/generated/ --summary
+
+# Recommended (v3.0) — include per-theme test methods and cluster test plan:
+python scripts/auto_tag_tests.py data/risk_register_scored_all.csv \
+  --generate-skeletons tests/generated/ \
+  --cluster-predictions data/predictions/ecl_parsed_predictions_by_cluster.csv \
+  --summary --cluster-plan
 ```
 
-Creates one `test_<module>.py` per module with `@pytest.mark.p1` (or p2/p3/p4) markers, Allure decorators, and `data/quadrant_summary.md`.
+When `--cluster-predictions` is supplied, each generated `test_<module>.py` contains one `test_<theme_name>()` method per predicted bug theme, with the expected count in the TODO comment and Allure severity inferred from cluster label keywords. `quadrant_summary.md` P1/P2 rows gain a "Predicted bug themes" column.
+
+`--cluster-plan` writes `data/cluster_test_plan.md` — a scenario-level test plan for P1/P2 modules listing each theme, its predicted bug count, and a one-sentence test scenario auto-generated from cluster keywords.
 
 ### Step 3.4 — Optional: Team Refinement Workshop
 
@@ -493,8 +552,8 @@ The dashboard uses a **four-step sidebar**:
 |------|------|----------|---------|
 | **Step 1** — Bug data | `data/ecl_parsed.csv` | ✅ Required | Tabs 1–6 |
 | **Step 2** — Risk scores | `data/risk_register_scored_all.csv` | Optional | Tab 7 (Risk Heatmap), risk badges on all other tabs |
-| **Step 3** — Bug clusters | `data/ecl_parsed_clustered.csv` + `ecl_parsed_cluster_summary.csv` | Optional | Tab 8 (Bug Clusters) |
-| **Step 4** — Defect forecast | `data/ecl_parsed_predictions.csv` + `_focus_summary.txt` + `_leading_indicators.csv` | Optional | Tab 9 (Defect Forecast) |
+| **Step 3** — Bug clusters | `data/clusters/ecl_parsed_clustered.csv` + `ecl_parsed_cluster_summary.csv` | Optional | Tab 8 (Bug Clusters). Optional: `ecl_parsed_module_entropy.csv`; stratified `_s12.csv`/`_s34.csv` load automatically |
+| **Step 4** — Defect forecast | `data/predictions/ecl_parsed_predictions.csv` + `_focus_summary.txt` + `_leading_indicators.csv` | Optional | Tab 9 (Defect Forecast). Optional: `_by_cluster.csv` adds per-theme breakdown to forecast cards |
 
 The dashboard reads `data/version_catalogue.csv` (produced by the parser) to order the version picker by recency and exclude sparse/typo versions from the default selection. When the catalogue is absent it falls back to deriving the same ordering live from the bug data.
 
@@ -509,8 +568,8 @@ The dashboard reads `data/version_catalogue.csv` (produced by the parser) to ord
 | 5 | 👥 Team Coverage | Step 1 | Tester × Category matrix — knowledge silo detection |
 | 6 | 📊 KPI Dashboard | Steps 1–2 | Total bugs, critical count, weekly trend, severity pie. P1/P2 counts + avg risk score when risk data loaded. |
 | 7 | 🔥 Risk Heatmap | Steps 1–2 | Interactive treemap with version-aware scores. Click any module to see its bugs. P1 bar chart. Risk vs Probability scatter (jittered for readability). |
-| 8 | 🔬 Bug Clusters | Steps 1+3 | Theme overview bar chart, expandable per-theme cards with sample bugs and plain-English action lines. |
-| 9 | 🔮 Defect Forecast | Steps 1+4 | Forecast bar chart, actual-vs-predicted comparison, per-module "what to test" cards, leading indicators chart. |
+| 8 | 🔬 Bug Clusters | Steps 1+3 | Theme overview bar chart, expandable per-theme cards with sample bugs and plain-English action lines. **New in v3.0:** velocity chart (theme acceleration over recent builds), module entropy chart, stratified S1/S2 vs S3/S4 tabs when stratified files are loaded. |
+| 9 | 🔮 Defect Forecast | Steps 1+4 | Forecast bar chart, actual-vs-predicted comparison, per-module "what to test" cards, leading indicators chart. **New in v3.0:** per-theme breakdown under "What to expect" (e.g. "~3 bugs — login crash / timeout") when `_by_cluster.csv` is loaded. |
 
 Each tab has a **📖 How to read this chart** expander written for both QA engineers and non-technical team members.
 
@@ -550,10 +609,19 @@ Each expandable card shows: bug count, average severity score (1 = Critical, 4 =
 **Files loaded in Sidebar Step 3:**
 | File | Contents |
 |------|---------|
-| `ecl_parsed_clustered.csv` | Full bug-level file with `cluster_id` and `cluster_label` columns added |
-| `ecl_parsed_cluster_summary.csv` | One row per cluster: keyword label, bug count, affected modules, average severity |
+| `clusters/ecl_parsed_clustered.csv` | Full bug-level file with `cluster_id`, `cluster_label`, and `embed_source` columns |
+| `clusters/ecl_parsed_cluster_summary.csv` | One row per cluster: keyword label, bug count, affected modules, average severity, `cluster_velocity_ratio`, `cluster_trend`, `recurrence_rate` |
+| `clusters/ecl_parsed_module_entropy.csv` | *(optional)* Per-module `cluster_entropy` score. Auto-loaded when present. |
+| `clusters/ecl_parsed_cluster_summary_s12.csv` | *(optional)* Summary for Critical/Major bugs only. Auto-loaded when present. |
+| `clusters/ecl_parsed_cluster_summary_s34.csv` | *(optional)* Summary for Normal/Minor bugs only. Auto-loaded when present. |
 
-Both files are stored under `data/clusters/` when `cluster_bugs.py` is run with default paths.
+**New v3.0 cluster metrics:**
+| Metric | What it means |
+|--------|--------------|
+| `cluster_velocity_ratio` | Bug count in last 3 builds ÷ prior 3 builds. Above 1.5 = theme accelerating. Below 0.67 = declining. |
+| `cluster_trend` | `"growing"` / `"stable"` / `"declining"` — quick sort key for the weekly meeting. |
+| `recurrence_rate` | Fraction of recent bugs whose module recurred in the same cluster from the prior window. Above 0.5 = root cause not fixed — escalate to RD. |
+| `cluster_entropy` | Shannon entropy of a module's cluster distribution. Below 1.0 = single-theme (easy to target). Above 2.0 = multi-theme (needs comprehensive coverage). |
 
 **Ollama vs TF-IDF mode:**
 Running with `--provider ollama --model <model>` produces richer, meaning-aware cluster names (e.g. "subtitle rendering delay" rather than "subtitle | render | slow") and is recommended when the Mac Mini has enough free RAM. TF-IDF mode (the default, no Ollama required) is faster and perfectly adequate for most uses. The dashboard tab displays correctly regardless of which mode was used to generate the files.
@@ -608,12 +676,11 @@ Shows which current bug signals are most strongly correlated (Pearson r) with fu
 **Files produced by `predict_defects.py` (load in Sidebar Step 4):**
 | File | Contents |
 |------|---------|
-| `ecl_parsed_predictions.csv` | Per-module: `predicted` (next build count), `target` (last-build actual), `risk_level`, `dominant_bug_type`, `leading_signal` |
-| `ecl_parsed_predictions_focus_summary.txt` | Plain-English paragraph per top-risk module: what to test, which signal is driving risk, what bug type to expect |
-| `ecl_parsed_predictions_leading_indicators.csv` | Pearson correlation of each lag feature vs future bug count — identifies which current signals best predict next build |
-| `ecl_parsed_predictions_importance.csv` | Gradient Boosting internal feature importance ranking |
-
-All four files are stored under `data/predictions/` by default.
+| `predictions/ecl_parsed_predictions.csv` | Per-module: `predicted` (next build count), `target` (last-build actual), `risk_level`, `dominant_bug_type`, `leading_signal` |
+| `predictions/ecl_parsed_predictions_by_cluster.csv` | *(optional, v3.0)* Per-module, per-theme: `cluster_id`, `cluster_label`, `historical_pct`, `predicted_count`. Enables per-theme breakdown in forecast cards. |
+| `predictions/ecl_parsed_predictions_focus_summary.txt` | Plain-English paragraph per top-risk module: what to test, which signal is driving risk, what bug type to expect. Per-theme breakdowns included when cluster data is present. |
+| `predictions/ecl_parsed_predictions_leading_indicators.csv` | Pearson correlation of each lag feature vs future bug count — identifies which current signals best predict next build |
+| `predictions/ecl_parsed_predictions_importance.csv` | Gradient Boosting internal feature importance ranking |
 
 **Example focus summary output:**
 ```
@@ -665,8 +732,10 @@ python scripts/ai_risk_scorer.py data/risk_register_all.csv data/risk_register_s
   --provider heuristic
 
 # 4. Refresh clustering and predictions (run Friday or when patterns feel stale)
-python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv
-python scripts/predict_defects.py data/ecl_parsed.csv data/ecl_parsed_predictions.csv
+python scripts/cluster_bugs.py data/ecl_parsed.csv data/clusters/ecl_parsed_clustered.csv \
+  --provider ollama --model qwen3:7b --stratify-severity
+python scripts/predict_defects.py data/ecl_parsed.csv \
+  --cluster-csv data/clusters/ecl_parsed_clustered.csv
 
 # 5. Refresh dashboard — reload the browser tab (Streamlit auto-picks up new CSVs)
 ```
@@ -676,8 +745,10 @@ On the first Saturday after setup, run with `--scope all` to measure total fetch
 
 ```bash
 python scripts/fetch_from_n8n.py --scope all --then-parse
-time python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv
-time python scripts/predict_defects.py data/ecl_parsed.csv data/ecl_parsed_predictions.csv
+time python scripts/cluster_bugs.py data/ecl_parsed.csv \
+  data/clusters/ecl_parsed_clustered.csv --stratify-severity
+time python scripts/predict_defects.py data/ecl_parsed.csv \
+  --cluster-csv data/clusters/ecl_parsed_clustered.csv
 ```
 
 ***
@@ -687,36 +758,57 @@ time python scripts/predict_defects.py data/ecl_parsed.csv data/ecl_parsed_predi
 ### Step 6.1 — Cluster Similar Bugs
 
 ```bash
-python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv
+# Minimum (TF-IDF, no Ollama) — same as v2.3:
+python scripts/cluster_bugs.py data/ecl_parsed.csv \
+    data/clusters/ecl_parsed_clustered.csv
+
+# Recommended (v3.0) — Ollama + severity stratification:
+python scripts/cluster_bugs.py data/ecl_parsed.csv \
+    data/clusters/ecl_parsed_clustered.csv \
+    --provider ollama --model qwen3:7b \
+    --stratify-severity
 ```
 
-Uses TF-IDF + K-Means globally (25 clusters) and DBSCAN per-module on the 5 busiest modules. Falls back from bigrams to unigrams if vocabulary is too sparse. With `--provider ollama` it uses Ollama semantic embeddings for meaning-aware grouping and LLM-generated plain-English cluster labels.
-
-**Ollama mode (richer labels, recommended when RAM allows):**
-```bash
-python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv \
-  --provider ollama --model qwen3:7b
-```
-
-**How the algorithm works:**
-1. Extracts `parsed_description` text from each bug.
-2. Converts descriptions to TF-IDF vectors (or Ollama embeddings in `--provider ollama` mode).
-3. Runs K-Means (k=25) globally to find broad themes.
-4. For each of the top 5 modules by bug count, runs DBSCAN (ε=0.6, min_samples=2) for tighter within-module grouping.
-5. Each cluster is named by its top 3 TF-IDF keywords (TF-IDF mode) or an LLM-generated 3–6 word label (Ollama mode).
-6. Produces a per-cluster summary CSV and a full bug-level CSV with `cluster_id` and `cluster_label` columns added.
+Uses TF-IDF + K-Means globally (25 clusters) and DBSCAN per-module on the 5 busiest modules. With `--provider ollama` it uses Ollama semantic embeddings for meaning-aware grouping and LLM-generated plain-English cluster labels. `--stratify-severity` adds a second pass split into S1/S2 (Critical/Major) and S3/S4 (Normal/Minor) independently.
 
 **Output files (load in Dashboard Sidebar Step 3):**
-- `data/clusters/ecl_parsed_clustered.csv` — full bug-level file with `cluster_id`, `cluster_label`, and `embed_source` columns
-- `data/clusters/ecl_parsed_cluster_summary.csv` — one row per cluster: keyword label, bug count, affected modules, average severity
+
+| File | Description |
+|------|-------------|
+| `clusters/ecl_parsed_clustered.csv` | Bug-level file with `cluster_id`, `cluster_label`, `embed_source`, and (with `--stratify-severity`) `cluster_id_s12`, `cluster_label_s12`, `cluster_id_s34`, `cluster_label_s34` |
+| `clusters/ecl_parsed_cluster_summary.csv` | Per-cluster summary including `cluster_velocity_ratio`, `cluster_trend`, `recurrence_rate` |
+| `clusters/ecl_parsed_module_entropy.csv` | Per-module `cluster_entropy` score |
+| `clusters/ecl_parsed_cluster_summary_s12.csv` | S1/S2 tier summary (`--stratify-severity`) |
+| `clusters/ecl_parsed_cluster_summary_s34.csv` | S3/S4 tier summary (`--stratify-severity`) |
+
+**New v3.0 output columns explained:**
+
+`cluster_velocity_ratio` — ratio of bug count in the most recent 3 builds vs the prior 3 builds per cluster. Above 1.5 = theme accelerating, prioritise in testing. Below 0.67 = theme declining, fixes may be holding.
+
+`cluster_trend` — `"growing"` / `"stable"` / `"declining"`. Sort the summary by `cluster_trend == "growing"` before the weekly team meeting.
+
+`recurrence_rate` — fraction of recent bugs in the cluster whose source module also appeared in the same cluster during the prior build window. Above 0.5 = root cause not fixed — escalate to RD.
+
+`cluster_entropy` (per module) — Shannon entropy of a module's cluster distribution. Below 1.0 = all bugs in one theme (easy to target). Above 2.0 = bugs everywhere (needs comprehensive coverage).
 
 ### Step 6.2 — Predict Next Build's Defects
 
 ```bash
-python scripts/predict_defects.py data/ecl_parsed.csv data/ecl_parsed_predictions.csv
+# Without cluster features (same as v2.2):
+python scripts/predict_defects.py data/ecl_parsed.csv
+
+# Recommended (v3.0) — with cluster features + per-theme forecasts:
+python scripts/predict_defects.py data/ecl_parsed.csv \
+    --cluster-csv data/clusters/ecl_parsed_clustered.csv \
+    --provider claude
+
+# With Ollama narratives:
+python scripts/predict_defects.py data/ecl_parsed.csv \
+    --cluster-csv data/clusters/ecl_parsed_clustered.csv \
+    --provider ollama --model qwen3:7b
 ```
 
-Trains a Gradient Boosting model on historical build-module bug counts and forecasts how many bugs each module will produce in the **next build**. At startup the script prints a `PREDICTION_GUIDE` explaining exactly what the target variable is, what each feature means, and how to interpret the output — no data-science background required.
+Trains a Gradient Boosting model on historical build-module bug counts and forecasts how many bugs each module will produce in the **next build**. `--cluster-csv` is auto-detected from the default path if present — no flag needed after an initial run.
 
 **Requirements:**
 - `Build#` must be numeric integers. Version strings (e.g. "16.3.5") are dropped automatically; the count dropped is printed at startup.
@@ -731,17 +823,20 @@ Trains a Gradient Boosting model on historical build-module bug counts and forec
 | `crit_lag3` | Critical bug count over the last 3 builds |
 | `trend_3` | Rate of change (slope) over the last 3 builds |
 | `sev_weighted_lag3` | Severity-weighted bug total over the last 3 builds |
+| `severity_escalation` | *(v3.0)* Mean severity in last build minus mean in prior 3 builds. Negative = worsening toward S1. |
+| `builds_since_last_crit` | *(v3.0)* Builds elapsed since the last S1 bug. Historically crash-prone modules that have been quiet are flagged as potentially overdue. |
+| `cluster_entropy_3/_5` | *(v3.0)* Bug-theme diversity over 3/5 builds. Rising entropy = new *kinds* of failures, not just more of the same. |
+| `top_cluster_velocity` | *(v3.0)* Growth rate of the dominant bug theme. Early-warning for theme-specific regressions. |
 
 **Output files (load in Dashboard Sidebar Step 4):**
 
 | File | Contains |
 |------|----------|
-| `ecl_parsed_predictions.csv` | Per-module: `predicted` (next build), `target` (last build actual), `risk_level`, `dominant_bug_type`, `leading_signal` |
-| `ecl_parsed_predictions_focus_summary.txt` | Plain-English paragraph per top-risk module: what to test, why risk is high, what bug type to expect |
-| `ecl_parsed_predictions_leading_indicators.csv` | Pearson correlation of each feature vs future bug count — shows which current signals best predict next build |
-| `ecl_parsed_predictions_importance.csv` | Model feature importances (Gradient Boosting internal ranking) |
-
-All four files are stored under `data/predictions/` by default.
+| `predictions/ecl_parsed_predictions.csv` | Per-module: `predicted`, `target`, `risk_level`, `dominant_bug_type`, `leading_signal` |
+| `predictions/ecl_parsed_predictions_by_cluster.csv` | *(v3.0)* Per-module, per-theme: `cluster_id`, `cluster_label`, `historical_pct`, `predicted_count` |
+| `predictions/ecl_parsed_predictions_focus_summary.txt` | Plain-English paragraph per top-risk module; includes per-theme breakdowns when cluster data present |
+| `predictions/ecl_parsed_predictions_leading_indicators.csv` | Pearson correlation of each feature vs future bug count |
+| `predictions/ecl_parsed_predictions_importance.csv` | Model feature importances (Gradient Boosting internal ranking) |
 
 **Example focus summary output:**
 ```
@@ -854,13 +949,18 @@ python scripts/fetch_from_n8n.py \
   --scope all --then-parse && \
 python scripts/compute_risk_scores.py data/ecl_parsed.csv data/risk_register_all.csv && \
 ollama serve &>/dev/null & sleep 5 && \
-python scripts/ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv --provider ollama --model llama3.1 && \
+python scripts/ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv \
+  --provider ollama --model qwen3:7b && \
+python scripts/cluster_bugs.py data/ecl_parsed.csv \
+  data/clusters/ecl_parsed_clustered.csv \
+  --provider ollama --model qwen3:7b --stratify-severity && \
+python scripts/predict_defects.py data/ecl_parsed.csv \
+  --cluster-csv data/clusters/ecl_parsed_clustered.csv \
+  --provider ollama --model qwen3:7b && \
 python scripts/auto_tag_tests.py data/risk_register_scored_all.csv \
-  --generate-skeletons tests/generated/ --summary && \
-python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv \
-  --provider ollama --model llama3.1 && \
-python scripts/predict_defects.py data/ecl_parsed.csv data/ecl_parsed_predictions.csv \
-  --provider ollama --model llama3.1 && \
+  --generate-skeletons tests/generated/ \
+  --cluster-predictions data/predictions/ecl_parsed_predictions_by_cluster.csv \
+  --summary --cluster-plan && \
 pkill -f streamlit && \
 streamlit run scripts/bug_heatmap_dashboard.py --server.address 0.0.0.0 --server.port 8501
 ```
@@ -871,11 +971,16 @@ source .venv/bin/activate && \
 python scripts/parse_ecl_export.py data/ecl_export.xlsx data/ecl_parsed.csv && \
 python scripts/compute_risk_scores.py data/ecl_parsed.csv data/risk_register_all.csv && \
 ollama serve &>/dev/null & sleep 5 && \
-python scripts/ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv --provider ollama --model llama3.1 && \
+python scripts/ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv \
+  --provider ollama --model qwen3:7b && \
+python scripts/cluster_bugs.py data/ecl_parsed.csv \
+  data/clusters/ecl_parsed_clustered.csv --stratify-severity && \
+python scripts/predict_defects.py data/ecl_parsed.csv \
+  --cluster-csv data/clusters/ecl_parsed_clustered.csv && \
 python scripts/auto_tag_tests.py data/risk_register_scored_all.csv \
-  --generate-skeletons tests/generated/ --summary && \
-python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv && \
-python scripts/predict_defects.py data/ecl_parsed.csv data/ecl_parsed_predictions.csv && \
+  --generate-skeletons tests/generated/ \
+  --cluster-predictions data/predictions/ecl_parsed_predictions_by_cluster.csv \
+  --summary --cluster-plan && \
 pkill -f streamlit && \
 streamlit run scripts/bug_heatmap_dashboard.py --server.address 0.0.0.0 --server.port 8501
 ```
@@ -883,8 +988,26 @@ streamlit run scripts/bug_heatmap_dashboard.py --server.address 0.0.0.0 --server
 **Dashboard sidebar setup after launch:**
 - **Step 1** → `data/ecl_parsed.csv`
 - **Step 2** → `data/risk_register_scored_all.csv`
-- **Step 3** → `data/ecl_parsed_clustered.csv` + `ecl_parsed_cluster_summary.csv`
-- **Step 4** → `data/ecl_parsed_predictions.csv` + `_focus_summary.txt` + `_leading_indicators.csv`
+- **Step 3** → `data/clusters/ecl_parsed_clustered.csv` + `ecl_parsed_cluster_summary.csv` (+ entropy and stratified files load automatically)
+- **Step 4** → `data/predictions/ecl_parsed_predictions.csv` + `_focus_summary.txt` + `_leading_indicators.csv` (+ `_by_cluster.csv` for per-theme cards)
+
+***
+
+## Backward Compatibility
+
+All v3.0 changes are strictly additive. Every command from v2.6 continues to work without modification.
+
+| Script | Old command still works? | Notes |
+|--------|--------------------------|-------|
+| `cluster_bugs.py` | ✅ Yes | `--stratify-severity` is optional; new output files are only written when the flag is passed |
+| `predict_defects.py` | ✅ Yes | `--cluster-csv` is optional and auto-detected; new features fall back to zero when the cluster CSV is absent |
+| `auto_tag_tests.py` | ✅ Yes | `--cluster-predictions` and `--cluster-plan` are optional; without them output is identical to v2.1 |
+| `bug_heatmap_dashboard.py` | ✅ Yes | New sidebar fields accept the v3.0 files but are non-blocking; all new tab sections are conditional on their data being loaded |
+| `compute_risk_scores.py` | ✅ Unchanged | |
+| `ai_risk_scorer.py` | ✅ Unchanged | |
+| `visual_regression.py` | ✅ Unchanged | |
+| `fetch_from_n8n.py` | ✅ Unchanged | |
+| `parse_ecl_export.py` | ✅ Unchanged | |
 
 ***
 
@@ -916,6 +1039,11 @@ streamlit run scripts/bug_heatmap_dashboard.py --server.address 0.0.0.0 --server
 | `fetch_from_n8n.py`: missing required fields | n8n `Get Columns_v3` Set node misconfigured | Re-import `Dashboard_Query_eBug_List_v3.json`; script lists which fields are absent |
 | `fetch_from_n8n.py`: empty response | n8n date range filter returns no bugs | Widen the `CreateTime` range in the eCL eBug query node |
 | `fetch_from_n8n.py`: `_status_changed` all False | First-ever run (no existing cache to compare against) | Expected — flags will populate on second+ runs |
+| `cluster_bugs.py` cluster/prediction files in wrong path | Old path was `data/ecl_parsed_clustered.csv`; v3.0 default is `data/clusters/` | Update sidebar paths or pass explicit output path to the script |
+| `predict_defects.py`: `_by_cluster.csv` not produced | `--cluster-csv` not provided and no default file found | Run `cluster_bugs.py` first, then re-run `predict_defects.py` with `--cluster-csv` |
+| `auto_tag_tests.py`: test methods are generic (no theme names) | `--cluster-predictions` flag not passed | Re-run with `--cluster-predictions data/predictions/ecl_parsed_predictions_by_cluster.csv` |
+| Dashboard Tab 8: no velocity chart or entropy chart | Cluster files were generated by pre-v3.0 `cluster_bugs.py` | Re-run `cluster_bugs.py` v3.0 to produce `cluster_velocity_ratio`, `cluster_trend`, and `ecl_parsed_module_entropy.csv` |
+| Dashboard Tab 9: no per-theme breakdown in cards | `_by_cluster.csv` not loaded in Sidebar Step 4 | Run `predict_defects.py` with `--cluster-csv`, then add the `_by_cluster.csv` path to Sidebar Step 4 |
 | `repro_rate` all 0.5 after JSON parse | `Reproduce Probability` not in the eCL API | Expected — 0.5 is the correct default; Detectability scoring is unaffected |
 | `version_catalogue.csv` not found | Parser not yet re-run after v2.6 update | Re-run `parse_ecl_export.py` — catalogue is generated automatically |
 | `parsed_version` shows wrong version | Parser is pre-v2.6 (reads from Short Description) | Update to v2.6+ parser; new version reads from the `Version` column directly |

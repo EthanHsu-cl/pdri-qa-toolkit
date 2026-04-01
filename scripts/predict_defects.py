@@ -1,40 +1,51 @@
 #!/usr/bin/env python3
-"""PDR-I Defect Prediction v2.6
+"""PDR-I Defect Prediction v3.0
 
-Changes from v2.5
+Changes from v2.6
 ─────────────────
-Change 9 — Per-module leading_signal (fixes all modules showing the same signal)
-• train_predict() now computes leading_signal independently for each module by
-  correlating each lag feature against that module's own build history.
-  Only core lag features (bugs_N, sev_N, crit_N, trend) are candidates —
-  risk-score and TF-IDF columns are excluded because they are module-constant
-  and would produce misleading correlations.
-  Falls back to the global top-Pearson-r signal when a module has fewer than
-  4 build rows (not enough history for a per-module correlation).
-• generate_focus_summary() reads leading_signal from the preds dataframe
-  (already computed above) rather than re-deriving it independently.
+Change 11 — Two new lag features in build_features()
+• severity_escalation: mean severity_num in the last build minus the mean in the
+  3 builds prior to that. Negative = worsening toward S1. This captures directional
+  shift in severity that the existing sev_N features (which sum weights) miss.
+• builds_since_last_crit: how many builds have elapsed since the most recent build
+  with at least one critical bug. Modules overdue for a critical are flagged earlier.
 
-Change 10 — Recency-weighted dominant_bug_type (fixes all modules showing "Major")
-• dominant_bug_type is now weighted so recent builds count more:
-  last build ×5, last third of builds ×3, earlier builds ×1.
-  A module that accumulated many Normal bugs historically but is now producing
-  Critical bugs will correctly show "crash/Critical (S1)" rather than its
-  all-time mode.
-• generate_focus_summary() reads dominant_bug_type from the preds dataframe
-  rather than recomputing it with all-history mode, ensuring the focus summary
-  and the CSV always agree.
+Change 12 — Cluster features (optional, --cluster-csv)
+• load_cluster_features() reads the clustered output from cluster_bugs.py and builds
+  per-module per-build features:
+      cluster_entropy_3      Shannon entropy of bug-theme distribution, last 3 builds
+      cluster_entropy_5      Shannon entropy of bug-theme distribution, last 5 builds
+      top_cluster_velocity   Growth ratio of the dominant theme over the last 3 builds
+• These are merged into the feature matrix via build_features() when --cluster-csv
+  is provided. They are excluded from per-module leading_signal computation (module-
+  constant issue does not apply here, but they would dominate on small datasets).
 
-All other behaviour is unchanged from v2.5.
+Change 13 — Bug-type prediction layer
+• predict_bug_type() uses the recent cluster-distribution for each module scaled by
+  the total-count forecast to answer "what kind of bug will happen next build."
+  Output: data/predictions/<stem>_predictions_by_cluster.csv with columns:
+      module, cluster_id, cluster_label, historical_pct, predicted_count
+• generate_ai_narrative() / generate_ai_narrative_ollama() now accept an optional
+  cluster_forecast dict and include it in the prompt so the narrative names specific
+  expected bug types rather than paraphrasing the severity category.
 
-Output paths (unchanged):
-  data/predictions/ecl_parsed_predictions.csv
-  data/predictions/ecl_parsed_predictions_importance.csv
-  data/predictions/ecl_parsed_predictions_leading_indicators.csv
-  data/predictions/ecl_parsed_predictions_focus_summary.txt
+Change 14 — Updated feature labels and focus summary
+• _FEATURE_LABELS extended with labels for all new features.
+• generate_focus_summary() passes cluster_forecast to the AI narrative when the
+  per-cluster prediction DataFrame is available.
+
+All other behaviour is unchanged from v2.6.
+
+Output paths:
+  data/predictions/<stem>_predictions.csv
+  data/predictions/<stem>_predictions_by_cluster.csv  ← NEW
+  data/predictions/<stem>_predictions_importance.csv
+  data/predictions/<stem>_predictions_leading_indicators.csv
+  data/predictions/<stem>_predictions_focus_summary.txt
 
 Usage:
   python predict_defects.py <input_csv>
-  python predict_defects.py <input_csv> --provider ollama
+  python predict_defects.py <input_csv> --cluster-csv data/clusters/ecl_parsed_clustered.csv
   python predict_defects.py <input_csv> --provider ollama --model llama3.1
   python predict_defects.py <input_csv> --provider claude --api-key <key>
   python predict_defects.py <input_csv> --no-ai
@@ -67,32 +78,40 @@ PREDICTION_GUIDE = """
 ║  bug_count = number of new bugs filed against that module in one build.    ║
 ║  It is NOT severity-weighted; it is a raw head-count of new defects.       ║
 ║                                                                             ║
-║  FEATURES USED                                                              ║
+║  CORE FEATURES                                                              ║
 ║  ─────────────                                                              ║
 ║  bugs_1 / bugs_3 / bugs_5        Bugs filed in last 1 / 3 / 5 builds      ║
 ║  sev_1  / sev_3  / sev_5         Severity-weighted sum over same windows   ║
 ║  crit_1 / crit_3 / crit_5        Critical (S1) count over same windows     ║
 ║  trend                            bugs in last build minus bugs 3 ago      ║
-║  repro_rate       (if present)    mean reproduce probability                ║
-║  tfidf_*          (if present)    top TF-IDF terms from descriptions        ║
-║  impact_score     (if scored)     domain impact 1-5                        ║
-║  detectability_score              test difficulty 1-5                      ║
-║  probability_score_auto           historical defect probability            ║
-║  risk_score_final                 I × P × D composite score                ║
+║  severity_escalation  (NEW)       negative = worsening toward S1           ║
+║  builds_since_last_crit (NEW)     builds elapsed since last critical       ║
+║                                                                             ║
+║  CLUSTER FEATURES (when --cluster-csv provided)                            ║
+║  ─────────────────────────────────────────────                             ║
+║  cluster_entropy_3/5  Bug-theme diversity index (higher = more spread)     ║
+║  top_cluster_velocity Growth rate of the dominant bug theme                ║
 ║                                                                             ║
 ║  OUTPUT COLUMNS                                                             ║
 ║  ──────────────                                                             ║
 ║  target           Actual bug count in most recent build (ground truth)     ║
 ║  predicted        Model's forecast for the NEXT build                      ║
 ║  risk_level       Low(<3) / Medium(3-5) / High(6-10) / Critical(>10)      ║
-║  dominant_bug_type  Most common severity in recent history                 ║
+║  dominant_bug_type  Most common severity in recent history (recency-wtd)   ║
 ║  leading_signal   Feature most predictive of this module's future bugs     ║
 ║  ai_narrative     Plain-English AI explanation of risk and what to test    ║
+║                                                                             ║
+║  BUG-TYPE PREDICTION OUTPUT (_predictions_by_cluster.csv)                  ║
+║  ──────────────────────────────────────────────────────                    ║
+║  module, cluster_id, cluster_label  Which theme is expected                ║
+║  historical_pct   Fraction of recent bugs that belonged to this theme      ║
+║  predicted_count  Expected bugs in this theme next build                   ║
 ║                                                                             ║
 ║  HOW TO ACT ON IT                                                           ║
 ║  ────────────────                                                           ║
 ║  Critical/High modules → add to mandatory test suite for the next build.  ║
 ║  Read 'ai_narrative' for a plain-English explanation of why.               ║
+║  Read '_by_cluster.csv' to know WHAT KIND of bugs to test for.             ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -111,12 +130,24 @@ _FEATURE_LABELS = {
     "sev_3":   "severity-weighted momentum (last 3 builds)",
     "sev_5":   "severity-weighted momentum (last 5 builds)",
     "trend":   "upward bug-count trend",
+    # Change 11 — new features
+    "severity_escalation":     "severity escalation (negative = worsening toward S1)",
+    "builds_since_last_crit":  "builds elapsed since last critical bug",
+    # Change 12 — cluster features
+    "cluster_entropy_3":       "bug-theme diversity index (last 3 builds)",
+    "cluster_entropy_5":       "bug-theme diversity index (last 5 builds)",
+    "top_cluster_velocity":    "fastest-growing bug theme velocity",
+    # existing optional features
     "repro_rate":             "high reproduce rate (consistently reproducible bugs)",
     "impact_score":           "domain impact score (I×P×D scorer)",
     "detectability_score":    "test detectability score (I×P×D scorer)",
     "probability_score_auto": "historical defect probability (I×P×D scorer)",
     "risk_score_final":       "composite risk score I×P×D",
 }
+
+# Cluster feature columns — excluded from per-module leading_signal search
+# because they are more structural signals than per-build time-series signals.
+_CLUSTER_FEATURE_COLS = {"cluster_entropy_3", "cluster_entropy_5", "top_cluster_velocity"}
 
 _RISK_ADVICE = {
     "Critical": "Mandatory — add to test suite for every build. Focus on crash and data-loss scenarios.",
@@ -125,8 +156,9 @@ _RISK_ADVICE = {
     "Low":      "Monitor — include in release-candidate pass.",
 }
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Risk feature loader
+# Risk feature loader  (unchanged from v2.6)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_risk_features(scored_csv: str) -> "pd.DataFrame | None":
@@ -159,7 +191,7 @@ def load_risk_features(scored_csv: str) -> "pd.DataFrame | None":
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TF-IDF text features
+# TF-IDF text features  (unchanged from v2.6)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_tfidf_features(orig_df: pd.DataFrame,
@@ -205,11 +237,112 @@ def build_tfidf_features(orig_df: pd.DataFrame,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Feature matrix builder
+# NEW v3.0 — Cluster feature builder
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_cluster_features(cluster_csv: str,
+                           orig_df: pd.DataFrame,
+                           build_col: str = "Build#",
+                           mod_col: str = "parsed_module") -> "pd.DataFrame | None":
+    """
+    Read the clustered bug CSV produced by cluster_bugs.py and build per-module
+    per-build cluster-derived features:
+
+      cluster_entropy_3   Shannon entropy of bug-theme distribution, last 3 builds
+      cluster_entropy_5   Shannon entropy of bug-theme distribution, last 5 builds
+      top_cluster_velocity  Growth ratio of the dominant theme over last 3 builds
+
+    Returns a DataFrame keyed on (module, build) for merging into fdf,
+    or None if the cluster CSV cannot be used.
+    """
+    try:
+        cdf = pd.read_csv(cluster_csv)
+    except Exception as e:
+        print(f"  WARNING: could not load cluster CSV ({e}) — skipping cluster features.")
+        return None
+
+    if "cluster_id" not in cdf.columns:
+        print("  NOTE: cluster CSV has no cluster_id column — skipping cluster features.")
+        return None
+
+    # Join cluster assignments back onto the raw bug data
+    if "BugCode" in cdf.columns and "BugCode" in orig_df.columns:
+        bug_cols = [c for c in [build_col, mod_col, "BugCode"] if c in orig_df.columns]
+        merged = orig_df[bug_cols].merge(
+            cdf[["BugCode", "cluster_id"]], on="BugCode", how="left"
+        )
+    elif mod_col in cdf.columns and build_col in cdf.columns:
+        merged = orig_df[[build_col, mod_col]].merge(
+            cdf[[build_col, mod_col, "cluster_id"]], on=[build_col, mod_col], how="left"
+        )
+    else:
+        print("  NOTE: No shared key between cluster CSV and bug data — skipping cluster features.")
+        return None
+
+    merged[build_col] = pd.to_numeric(merged[build_col], errors="coerce")
+    merged = merged.dropna(subset=[build_col, mod_col])
+    merged[build_col] = merged[build_col].astype(int)
+    merged["cluster_id"] = merged["cluster_id"].fillna(-1).astype(int)
+
+    rows = []
+    for mod, mod_bugs in merged.groupby(mod_col):
+        builds_sorted = sorted(mod_bugs[build_col].unique())
+        if len(builds_sorted) < 5:
+            continue
+
+        for idx in range(5, len(builds_sorted)):
+            build_num = builds_sorted[idx]
+            r = {"module": mod, "build": build_num}
+
+            for lag in [3, 5]:
+                prev_builds = builds_sorted[max(0, idx - lag):idx]
+                window_bugs = mod_bugs[
+                    mod_bugs[build_col].isin(prev_builds) & (mod_bugs["cluster_id"] != -1)
+                ]
+                if len(window_bugs) == 0:
+                    r[f"cluster_entropy_{lag}"] = 0.0
+                else:
+                    counts = window_bugs["cluster_id"].value_counts().values.astype(float)
+                    probs  = counts / counts.sum()
+                    r[f"cluster_entropy_{lag}"] = round(
+                        float(-np.sum(probs * np.log2(probs + 1e-12))), 3
+                    )
+
+            # Velocity of the dominant cluster: recent 3 builds vs prior 3
+            if idx >= 6:
+                recent_b = builds_sorted[idx - 3:idx]
+                prior_b  = builds_sorted[idx - 6:idx - 3]
+                r_bugs = mod_bugs[mod_bugs[build_col].isin(recent_b) & (mod_bugs["cluster_id"] != -1)]
+                p_bugs = mod_bugs[mod_bugs[build_col].isin(prior_b)  & (mod_bugs["cluster_id"] != -1)]
+                if len(r_bugs) > 0:
+                    top_cid = r_bugs["cluster_id"].value_counts().index[0]
+                    rc_n    = int((r_bugs["cluster_id"] == top_cid).sum())
+                    pc_n    = int((p_bugs["cluster_id"] == top_cid).sum()) if len(p_bugs) > 0 else 0
+                    r["top_cluster_velocity"] = round(rc_n / max(pc_n, 1), 2)
+                else:
+                    r["top_cluster_velocity"] = 1.0
+            else:
+                r["top_cluster_velocity"] = 1.0
+
+            rows.append(r)
+
+    if not rows:
+        print("  NOTE: No cluster features could be built (insufficient history per module).")
+        return None
+
+    cf = pd.DataFrame(rows)
+    print(f"  Cluster features: {len(cf)} rows  "
+          f"(cluster_entropy_3/5, top_cluster_velocity)")
+    return cf
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature matrix builder  (updated for v3.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_features(df, build_col="Build#", mod_col="parsed_module",
-                   risk_features=None, tfidf_features=None):
+                   risk_features=None, tfidf_features=None,
+                   cluster_features=None):
     df = df.copy()
     total_before = len(df)
     df[build_col] = pd.to_numeric(df[build_col], errors="coerce")
@@ -220,11 +353,13 @@ def build_features(df, build_col="Build#", mod_col="parsed_module",
         print(f"  WARNING: {non_numeric}/{total_before} rows dropped — "
               f"'{build_col}' could not be parsed as numbers.")
 
+    # Aggregate per (module, build) — added avg_sev for severity_escalation
     agg = df.groupby([mod_col, build_col]).agg(
         bug_count=("severity_weight", "size"),
         sev_w=("severity_weight", "sum"),
         crit=("severity_num", lambda x: (x == 1).sum()),
         major=("severity_num", lambda x: (x == 2).sum()),
+        avg_sev=("severity_num", "mean"),    # NEW v3.0
     ).reset_index()
 
     if "repro_rate" in df.columns:
@@ -236,7 +371,11 @@ def build_features(df, build_col="Build#", mod_col="parsed_module",
     for mod in agg[mod_col].unique():
         md = agg[agg[mod_col] == mod].sort_values(build_col).reset_index(drop=True)
         for i in range(5, len(md)):
-            r = {"module": mod, "build": md.loc[i, build_col], "target": md.loc[i, "bug_count"]}
+            r = {"module": mod,
+                 "build": md.loc[i, build_col],
+                 "target": md.loc[i, "bug_count"]}
+
+            # Existing lag windows
             for lag in [1, 3, 5]:
                 w = md.loc[max(0, i - lag):i - 1]
                 r[f"bugs_{lag}"] = w["bug_count"].sum()
@@ -244,16 +383,32 @@ def build_features(df, build_col="Build#", mod_col="parsed_module",
                 r[f"crit_{lag}"] = w["crit"].sum()
             l3 = md.loc[max(0, i - 3):i - 1, "bug_count"].values
             r["trend"] = l3[-1] - l3[0] if len(l3) >= 2 else 0
+
+            # Change 11 — severity_escalation
+            # Mean severity in the last build vs the mean in the 3 builds before that.
+            # Negative = severity is worsening (moving toward S1).
+            sv_last  = md.loc[i - 1, "avg_sev"] if i >= 1 else 3.0
+            sv_prior_slice = md.loc[max(0, i - 4):i - 2, "avg_sev"]
+            sv_prior = float(sv_prior_slice.mean()) if len(sv_prior_slice) > 0 else float(sv_last)
+            r["severity_escalation"] = round(float(sv_last - sv_prior), 3)
+
+            # Change 11 — builds_since_last_crit
+            crit_hist = md.loc[:i - 1, "crit"]
+            crit_rows = crit_hist.index[crit_hist > 0].tolist()
+            r["builds_since_last_crit"] = int(i - crit_rows[-1] - 1) if crit_rows else i
+
             rows.append(r)
 
     fdf = pd.DataFrame(rows)
 
+    # Merge TF-IDF text features
     if tfidf_features is not None and not fdf.empty:
         fdf = fdf.merge(tfidf_features, on="module", how="left")
         tfidf_cols = [c for c in fdf.columns if c.startswith(TFIDF_PREFIX)]
         fdf[tfidf_cols] = fdf[tfidf_cols].fillna(0.0)
         print(f"  Text features merged: {len(tfidf_cols)} TF-IDF columns added.")
 
+    # Merge risk features
     if risk_features is not None and not fdf.empty:
         fdf = fdf.merge(risk_features, on="module", how="left")
         for col, default in [
@@ -265,11 +420,20 @@ def build_features(df, build_col="Build#", mod_col="parsed_module",
         n_matched = fdf["impact_score"].notna().sum() if "impact_score" in fdf.columns else 0
         print(f"  Risk features merged: {n_matched}/{len(fdf)} rows have scores.")
 
+    # Change 12 — merge cluster features
+    if cluster_features is not None and not fdf.empty:
+        fdf = fdf.merge(cluster_features, on=["module", "build"], how="left")
+        for col in ["cluster_entropy_3", "cluster_entropy_5", "top_cluster_velocity"]:
+            if col in fdf.columns:
+                fdf[col] = fdf[col].fillna(0.0)
+        added = [c for c in _CLUSTER_FEATURE_COLS if c in fdf.columns]
+        print(f"  Cluster features merged: {len(added)} columns added.")
+
     return fdf
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Leading-indicator correlation
+# Leading-indicator correlation  (unchanged from v2.6)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_leading_indicators(fdf: pd.DataFrame) -> pd.Series:
@@ -285,17 +449,18 @@ def compute_leading_indicators(fdf: pd.DataFrame) -> pd.Series:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Model training
+# Model training  (updated for v3.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train_predict(fdf: pd.DataFrame, orig_df: pd.DataFrame):
     fcols = [c for c in fdf.columns if c not in ["module", "build", "target"]]
     n_text    = sum(1 for c in fcols if c.startswith(TFIDF_PREFIX))
-    n_numeric = len(fcols) - n_text
+    n_cluster = sum(1 for c in fcols if c in _CLUSTER_FEATURE_COLS)
+    n_numeric = len(fcols) - n_text - n_cluster
     X = fdf[fcols].fillna(0)
     y = fdf["target"]
     print(f"Training: {len(X)} samples, {len(fcols)} features "
-          f"({n_text} text TF-IDF, {n_numeric} numeric)")
+          f"({n_text} text TF-IDF, {n_cluster} cluster, {n_numeric} numeric)")
 
     model = GradientBoostingRegressor(
         n_estimators=200, max_depth=4, learning_rate=0.1, random_state=42
@@ -312,25 +477,19 @@ def train_predict(fdf: pd.DataFrame, orig_df: pd.DataFrame):
     leading = compute_leading_indicators(fdf)
     print(f"\nLeading indicators (Pearson r):")
     for feat, r in leading.head(8).items():
-        print(f"  {feat:<20s} r = {r:+.3f}  ({_FEATURE_LABELS.get(feat, feat)})")
+        print(f"  {feat:<25s} r = {r:+.3f}  ({_FEATURE_LABELS.get(feat, feat)})")
 
     latest = fdf.groupby("module").tail(1).copy()
     latest["predicted"] = model.predict(latest[fcols].fillna(0)).round(1)
 
-    # ── dominant_bug_type: recency-weighted, per module ───────────────────────
-    # Weight recent bugs more heavily (last 3 builds × 3, last build × 5) so a
-    # module that used to have many Normal bugs but is now producing Critical
-    # bugs correctly shows "crash/Critical" rather than its all-time mode.
+    # Recency-weighted dominant_bug_type (unchanged from v2.6)
     sev_label_map = {1: "crash/Critical (S1)", 2: "Major functional (S2)",
                      3: "Normal (S3)", 4: "Minor/cosmetic (S4)"}
     dom_type = {}
     if "severity_num" in orig_df.columns and "parsed_module" in orig_df.columns:
         if "Build#" in orig_df.columns:
-            # Use numeric Build# for recency ordering when available
             orig_sorted = orig_df.copy()
-            orig_sorted["_build_num"] = pd.to_numeric(
-                orig_sorted["Build#"], errors="coerce"
-            )
+            orig_sorted["_build_num"] = pd.to_numeric(orig_sorted["Build#"], errors="coerce")
         else:
             orig_sorted = orig_df.copy()
             orig_sorted["_build_num"] = np.nan
@@ -340,21 +499,16 @@ def train_predict(fdf: pd.DataFrame, orig_df: pd.DataFrame):
             if grp.empty:
                 dom_type[mod] = "mixed"
                 continue
-            # If we have build numbers, weight recent builds more heavily
             if grp["_build_num"].notna().sum() >= 3:
                 grp = grp.sort_values("_build_num")
                 n = len(grp)
-                # Last build: weight 5, second-last third: weight 3, rest: weight 1
                 weights = np.ones(n)
                 cutoff_1 = grp["_build_num"].nlargest(1).min()
-                cutoff_3 = grp["_build_num"].nlargest(
-                    max(1, int(n * 0.33))
-                ).min()
-                weights[grp["_build_num"] >= cutoff_3]  = 3
-                weights[grp["_build_num"] >= cutoff_1]  = 5
+                cutoff_3 = grp["_build_num"].nlargest(max(1, int(n * 0.33))).min()
+                weights[grp["_build_num"].values >= cutoff_3] = 3
+                weights[grp["_build_num"].values >= cutoff_1] = 5
                 sev_vals = grp["severity_num"].astype(int).values
-                # Weighted mode: sum weights per severity level
-                sev_weights = {}
+                sev_weights: dict = {}
                 for sv, w in zip(sev_vals, weights):
                     sev_weights[sv] = sev_weights.get(sv, 0.0) + w
                 best_sev = min(sev_weights, key=lambda s: (-sev_weights[s], s))
@@ -365,21 +519,17 @@ def train_predict(fdf: pd.DataFrame, orig_df: pd.DataFrame):
 
     latest["dominant_bug_type"] = latest["module"].map(dom_type).fillna("mixed")
 
-    # ── leading_signal: per-module, not global ────────────────────────────────
-    # For each module, find the feature that has the highest absolute Pearson
-    # correlation with that module's own target values across its build history.
-    # Falls back to the global top signal when a module has too few rows for
-    # a meaningful per-module correlation (< 4 build rows).
+    # Per-module leading_signal (unchanged from v2.6)
     global_top_signal = leading.index[0] if len(leading) else ""
     global_top_label  = _FEATURE_LABELS.get(global_top_signal, global_top_signal)
 
-    # Only consider the core numeric lag features for per-module signal —
-    # tfidf and risk score columns are module-constant and would mislead.
+    # Exclude TF-IDF, risk-score, and cluster-structural features from per-module signal
     signal_candidates = [
         c for c in fcols
         if not c.startswith(TFIDF_PREFIX)
         and c not in ("impact_score", "detectability_score",
                       "probability_score_auto", "risk_score_final")
+        and c not in _CLUSTER_FEATURE_COLS
     ]
 
     def _per_module_signal(mod: str) -> str:
@@ -388,7 +538,6 @@ def train_predict(fdf: pd.DataFrame, orig_df: pd.DataFrame):
             return global_top_label
         y_mod = mod_rows["target"].fillna(0)
         if y_mod.std() == 0:
-            # All target values identical — no signal is meaningful
             return global_top_label
         best_r, best_col = 0.0, global_top_signal
         for fc in signal_candidates:
@@ -405,7 +554,115 @@ def train_predict(fdf: pd.DataFrame, orig_df: pd.DataFrame):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Description sampler
+# NEW v3.0 — Bug-type (per-cluster) prediction
+# ─────────────────────────────────────────────────────────────────────────────
+
+def predict_bug_type(latest_preds: pd.DataFrame,
+                     orig_df: pd.DataFrame,
+                     cluster_csv: str,
+                     build_col: str = "Build#",
+                     mod_col: str = "parsed_module",
+                     history_builds: int = 5) -> "pd.DataFrame | None":
+    """
+    For each module, predict the expected count per bug theme (cluster) for
+    the next build. Strategy: scale the recent historical cluster distribution
+    by the total predicted count from train_predict().
+
+    Parameters
+    ----------
+    latest_preds   : DataFrame with [module, predicted] from train_predict()
+    orig_df        : raw bug-level DataFrame
+    cluster_csv    : path to the clustered output CSV from cluster_bugs.py
+    history_builds : number of most recent builds to use for the distribution
+
+    Returns
+    -------
+    DataFrame: module, cluster_id, cluster_label, historical_pct, predicted_count
+    Sorted by module, then predicted_count descending.
+    Returns None if the cluster CSV cannot be read or there is insufficient data.
+    """
+    try:
+        cdf = pd.read_csv(cluster_csv)
+    except Exception as e:
+        print(f"  WARNING: cannot load cluster CSV for type prediction ({e}).")
+        return None
+
+    if "cluster_id" not in cdf.columns or "predicted" not in latest_preds.columns:
+        return None
+
+    # Join cluster assignments onto the raw bug data
+    if "BugCode" in cdf.columns and "BugCode" in orig_df.columns:
+        bug_cols = [c for c in [build_col, mod_col, "BugCode"] if c in orig_df.columns]
+        merged = orig_df[bug_cols].merge(
+            cdf[["BugCode", "cluster_id", "cluster_label"]], on="BugCode", how="left"
+        )
+    elif mod_col in cdf.columns and build_col in cdf.columns:
+        merged = orig_df[[build_col, mod_col]].merge(
+            cdf[[build_col, mod_col, "cluster_id", "cluster_label"]],
+            on=[build_col, mod_col], how="left"
+        )
+    else:
+        print("  NOTE: Cannot join cluster CSV for type prediction — no shared key.")
+        return None
+
+    merged[build_col] = pd.to_numeric(merged[build_col], errors="coerce")
+    merged = merged.dropna(subset=[build_col, mod_col])
+    merged[build_col] = merged[build_col].astype(int)
+    merged["cluster_id"] = merged["cluster_id"].fillna(-1).astype(int)
+
+    # Build cluster label lookup
+    label_map = (
+        cdf[cdf["cluster_id"] != -1][["cluster_id", "cluster_label"]]
+        .drop_duplicates("cluster_id")
+        .set_index("cluster_id")["cluster_label"]
+        .to_dict()
+        if "cluster_label" in cdf.columns else {}
+    )
+
+    results = []
+    for _, pred_row in latest_preds.iterrows():
+        mod        = pred_row["module"]
+        pred_total = float(pred_row.get("predicted", 0))
+
+        mod_data = merged[merged[mod_col] == mod]
+        if len(mod_data) < 5:
+            continue
+
+        recent_builds = sorted(mod_data[build_col].unique())[-history_builds:]
+        recent = mod_data[
+            mod_data[build_col].isin(recent_builds) & (mod_data["cluster_id"] != -1)
+        ]
+
+        if len(recent) == 0:
+            results.append({
+                "module": mod, "cluster_id": -1,
+                "cluster_label": "No cluster data",
+                "historical_pct": 1.0,
+                "predicted_count": round(pred_total, 1),
+            })
+            continue
+
+        total_recent = len(recent)
+        for cid, cnt in recent["cluster_id"].value_counts().items():
+            pct = cnt / total_recent
+            results.append({
+                "module": mod,
+                "cluster_id": int(cid),
+                "cluster_label": label_map.get(int(cid), f"Cluster {cid}"),
+                "historical_pct": round(float(pct), 3),
+                "predicted_count": round(pred_total * pct, 1),
+            })
+
+    if not results:
+        return None
+
+    out = pd.DataFrame(results)
+    out = out.sort_values(["module", "predicted_count"], ascending=[True, False])
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Description sampler  (unchanged from v2.6)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _sample_descriptions(orig_df, module, mod_col="parsed_module",
@@ -424,30 +681,44 @@ def _sample_descriptions(orig_df, module, mod_col="parsed_module",
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Claude narrative (unchanged from v2.4)
+# AI narrative — Claude  (updated for v3.0 cluster_forecast param)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_ai_narrative(module, predicted, risk_level, dominant_bug_type,
-                           leading_signal, descriptions, api_key) -> str:
+                           leading_signal, descriptions, api_key,
+                           cluster_forecast: "dict | None" = None) -> str:
     desc_block = "\n".join(f" - {d}" for d in descriptions[:12]) if descriptions \
         else " (no description samples available)"
+
+    # Build a plain-English cluster forecast block if available
+    cluster_block = ""
+    if cluster_forecast:
+        lines = []
+        for label, count in list(cluster_forecast.items())[:5]:
+            lines.append(f"  • ~{count:.0f} bugs expected in theme: '{label}'")
+        cluster_block = (
+            "\n\nExpected bug-type breakdown for next build:\n" + "\n".join(lines)
+        )
+
     prompt = (
         f"You are a QA lead writing a pre-build risk briefing for your team.\n\n"
         f"Module: {module}\n"
         f"Predicted bugs next build: {predicted:.0f}\n"
         f"Risk level: {risk_level}\n"
         f"Dominant bug type historically: {dominant_bug_type}\n"
-        f"Strongest predictive signal: {leading_signal}\n\n"
+        f"Strongest predictive signal: {leading_signal}"
+        f"{cluster_block}\n\n"
         f"Sample of recent bug descriptions for this module:\n{desc_block}\n\n"
         f"Write a concise 3-5 sentence paragraph that:\n"
         f"1. States clearly why this module is high risk next build.\n"
-        f"2. Describes the specific kinds of issues to expect based on the descriptions above.\n"
+        f"2. Describes the specific kinds of issues to expect — use the "
+        f"expected bug-type breakdown above if present.\n"
         f"3. Gives concrete, actionable testing advice (what flows/scenarios to prioritise).\n\n"
         f"Be specific and direct. Plain prose only. No bullet points. No headers."
     )
     payload = json.dumps({
         "model": "claude-sonnet-4-20250514",
-        "max_tokens": 300,
+        "max_tokens": 350,
         "messages": [{"role": "user", "content": prompt}],
     }).encode()
     req = urllib.request.Request(
@@ -468,25 +739,37 @@ def generate_ai_narrative(module, predicted, risk_level, dominant_bug_type,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ollama narrative (NEW — Change 8)
+# AI narrative — Ollama  (updated for v3.0 cluster_forecast param)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_ai_narrative_ollama(module, predicted, risk_level, dominant_bug_type,
-                                  leading_signal, descriptions,
-                                  model="llama3.1") -> str:
+                                  leading_signal, descriptions, model="llama3.1",
+                                  cluster_forecast: "dict | None" = None) -> str:
     desc_block = "\n".join(f" - {d}" for d in descriptions[:12]) if descriptions \
         else " (no description samples available)"
+
+    cluster_block = ""
+    if cluster_forecast:
+        lines = []
+        for label, count in list(cluster_forecast.items())[:5]:
+            lines.append(f"  • ~{count:.0f} bugs expected in theme: '{label}'")
+        cluster_block = (
+            "\n\nExpected bug-type breakdown for next build:\n" + "\n".join(lines)
+        )
+
     prompt = (
         f"You are a QA lead writing a pre-build risk briefing for your team.\n\n"
         f"Module: {module}\n"
         f"Predicted bugs next build: {predicted:.0f}\n"
         f"Risk level: {risk_level}\n"
         f"Dominant bug type historically: {dominant_bug_type}\n"
-        f"Strongest predictive signal: {leading_signal}\n\n"
+        f"Strongest predictive signal: {leading_signal}"
+        f"{cluster_block}\n\n"
         f"Sample of recent bug descriptions for this module:\n{desc_block}\n\n"
         f"Write a concise 3-5 sentence paragraph that:\n"
         f"1. States clearly why this module is high risk next build.\n"
-        f"2. Describes the specific kinds of issues to expect based on the descriptions above.\n"
+        f"2. Describes the specific kinds of issues to expect — use the "
+        f"expected bug-type breakdown above if present.\n"
         f"3. Gives concrete, actionable testing advice (what flows/scenarios to prioritise).\n\n"
         f"Be specific and direct. Plain prose only. No bullet points. No headers."
     )
@@ -494,7 +777,7 @@ def generate_ai_narrative_ollama(module, predicted, risk_level, dominant_bug_typ
         "model": model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.3, "num_predict": 300},
+        "options": {"temperature": 0.3, "num_predict": 350},
     }).encode()
     req = urllib.request.Request(
         f"{OLLAMA_BASE}/api/generate",
@@ -510,13 +793,13 @@ def generate_ai_narrative_ollama(module, predicted, risk_level, dominant_bug_typ
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Focus summary — routes to ollama, claude, or template
+# Focus summary  (updated to pass cluster_forecast to narratives)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_focus_summary(preds, leading, orig_df,
                             mod_col="parsed_module", top_n=8,
-                            api_key="", provider="none",
-                            model="llama3.1") -> str:
+                            api_key="", provider="none", model="llama3.1",
+                            cluster_preds_df: "pd.DataFrame | None" = None) -> str:
     lines = [
         "=" * 78,
         " PDR-I DEFECT PREDICTION — FOCUS SUMMARY FOR NEXT BUILD",
@@ -524,15 +807,10 @@ def generate_focus_summary(preds, leading, orig_df,
         " Modules ranked by predicted bug count.", "",
     ]
 
-    sev_label_map = {1: "crash/Critical (S1)", 2: "Major functional (S2)",
-                     3: "Normal (S3)", 4: "Minor/cosmetic (S4)"}
+    dom_type_series = preds.set_index("module").get(
+        "dominant_bug_type", pd.Series(dtype=str))
 
-    # dominant_bug_type is already computed per-module with recency weighting
-    # in train_predict() and stored in the preds dataframe — read it from there
-    # rather than recomputing from all-history mode here.
-    dom_type_series = preds.set_index("module").get("dominant_bug_type", pd.Series(dtype=str))
-
-    top_feat = leading.index[0] if len(leading) else "bug_count"
+    top_feat       = leading.index[0] if len(leading) else "bug_count"
     top_feat_label = _FEATURE_LABELS.get(top_feat, top_feat)
 
     high_risk = preds[preds["risk_level"].isin(["Critical", "High"])].head(top_n)
@@ -543,11 +821,9 @@ def generate_focus_summary(preds, leading, orig_df,
         mod   = row["module"]
         pred  = row["predicted"]
         rl    = str(row["risk_level"])
-        dtype = str(row.get("dominant_bug_type", dom_type_series.get(mod, "mixed")))
+        dtype = str(row.get("dominant_bug_type",
+                             dom_type_series.get(mod, "mixed")))
 
-        # leading_signal is already computed per-module in train_predict();
-        # read it from the preds row. Only fall back to per-summary correlation
-        # if the column is absent (e.g. older predictions file).
         if "leading_signal" in row and str(row["leading_signal"]) not in ("", "nan"):
             mod_feat_label = str(row["leading_signal"])
         else:
@@ -568,8 +844,22 @@ def generate_focus_summary(preds, leading, orig_df,
                             best_corr, best_col = r, fc
                 mod_feat_label = _FEATURE_LABELS.get(best_col, best_col)
 
+        # Build cluster_forecast dict for this module if available
+        cluster_forecast = None
+        if cluster_preds_df is not None and not cluster_preds_df.empty:
+            mod_clusters = cluster_preds_df[cluster_preds_df["module"] == mod].head(5)
+            if not mod_clusters.empty:
+                cluster_forecast = dict(
+                    zip(mod_clusters["cluster_label"],
+                        mod_clusters["predicted_count"])
+                )
+
         lines.append(f"  {'─' * 74}")
         lines.append(f"  📍 {mod} → predicted {pred:.0f} bugs [{rl}]")
+        if cluster_forecast:
+            lines.append(f"     Bug type breakdown:")
+            for lbl, cnt in list(cluster_forecast.items())[:4]:
+                lines.append(f"       • ~{cnt:.0f}  {lbl}")
 
         if provider == "ollama":
             descriptions = _sample_descriptions(orig_df, mod, mod_col=mod_col)
@@ -577,6 +867,7 @@ def generate_focus_summary(preds, leading, orig_df,
                 module=mod, predicted=pred, risk_level=rl,
                 dominant_bug_type=dtype, leading_signal=mod_feat_label,
                 descriptions=descriptions, model=model,
+                cluster_forecast=cluster_forecast,
             )
             for narrative_line in narrative.splitlines():
                 lines.append(f"  {narrative_line}")
@@ -587,6 +878,7 @@ def generate_focus_summary(preds, leading, orig_df,
                 module=mod, predicted=pred, risk_level=rl,
                 dominant_bug_type=dtype, leading_signal=mod_feat_label,
                 descriptions=descriptions, api_key=api_key,
+                cluster_forecast=cluster_forecast,
             )
             for narrative_line in narrative.splitlines():
                 lines.append(f"  {narrative_line}")
@@ -609,12 +901,14 @@ def main():
 
     if len(sys.argv) < 2:
         print("Usage: python predict_defects.py <input_csv> "
-              "[--provider claude|ollama|none] [--model <name>] "
-              "[--no-ai] [--scored-csv <path>] [--api-key <key>]")
+              "[--provider claude|ollama|none] [--model <n>] "
+              "[--no-ai] [--scored-csv <path>] [--api-key <key>] "
+              "[--cluster-csv <path>]")
         sys.exit(1)
 
     args = sys.argv[1:]
-    scored_csv_path = None
+    scored_csv_path  = None
+    cluster_csv_path = None
     provider = "claude"
     model    = "llama3.1"
     api_key  = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -643,9 +937,15 @@ def main():
         api_key = args[idx + 1]
         args = args[:idx] + args[idx + 2:]
 
+    # Change 12 — new --cluster-csv argument
+    if "--cluster-csv" in args:
+        idx = args.index("--cluster-csv")
+        cluster_csv_path = args[idx + 1]
+        args = args[:idx] + args[idx + 2:]
+
     inp = args[0]
-    inp_dir = Path(inp).parent
-    out_dir = inp_dir / "predictions"
+    inp_dir  = Path(inp).parent
+    out_dir  = inp_dir / "predictions"
     out_dir.mkdir(parents=True, exist_ok=True)
     out      = str(out_dir / (Path(inp).stem + "_predictions.csv"))
     out_stem = out_dir / Path(inp).stem
@@ -663,6 +963,7 @@ def main():
     orig_df = pd.read_csv(inp)
     print(f"Loaded {len(orig_df)} bugs")
 
+    # ── Load optional risk scores ─────────────────────────────────────────────
     risk_features = None
     if scored_csv_path:
         print(f"\nLoading risk scores from: {scored_csv_path}")
@@ -673,10 +974,27 @@ def main():
             print(f"\nAuto-detected risk scores: {auto_path}")
             risk_features = load_risk_features(str(auto_path))
 
+    # ── TF-IDF text features ──────────────────────────────────────────────────
     print("\nBuilding TF-IDF text features from parsed_description...")
     tfidf_features = build_tfidf_features(orig_df)
 
-    fdf = build_features(orig_df, risk_features=risk_features, tfidf_features=tfidf_features)
+    # ── Cluster features (Change 12) ──────────────────────────────────────────
+    cluster_features = None
+    if cluster_csv_path:
+        print(f"\nBuilding cluster features from: {cluster_csv_path}")
+        cluster_features = load_cluster_features(cluster_csv_path, orig_df)
+    else:
+        # Auto-detect: look in data/clusters/ next to the input CSV
+        auto_cluster = inp_dir / "clusters" / (Path(inp).stem + "_clustered.csv")
+        if auto_cluster.exists():
+            print(f"\nAuto-detected cluster CSV: {auto_cluster}")
+            cluster_features = load_cluster_features(str(auto_cluster), orig_df)
+
+    # ── Feature matrix ────────────────────────────────────────────────────────
+    fdf = build_features(orig_df,
+                         risk_features=risk_features,
+                         tfidf_features=tfidf_features,
+                         cluster_features=cluster_features)
     print(f"Feature matrix: {fdf.shape}")
 
     if len(fdf) < 20:
@@ -702,15 +1020,35 @@ def main():
     display_cols = [c for c in display_cols if c in preds.columns]
     print(preds[display_cols].head(20).to_string(index=False))
 
+    # ── Bug-type prediction (Change 13) ───────────────────────────────────────
+    cluster_preds_df = None
+    cluster_csv_for_type = cluster_csv_path
+    if cluster_csv_for_type is None:
+        auto_cluster = inp_dir / "clusters" / (Path(inp).stem + "_clustered.csv")
+        if auto_cluster.exists():
+            cluster_csv_for_type = str(auto_cluster)
+
+    if cluster_csv_for_type:
+        print("\nBuilding per-cluster bug-type predictions …")
+        cluster_preds_df = predict_bug_type(preds, orig_df, cluster_csv_for_type)
+        if cluster_preds_df is not None:
+            by_cluster_path = str(out_stem) + "_predictions_by_cluster.csv"
+            cluster_preds_df.to_csv(by_cluster_path, index=False, encoding="utf-8-sig")
+            print(f"  Bug-type predictions saved → {by_cluster_path}")
+            print(f"  ({len(cluster_preds_df)} module×cluster rows)")
+
+    # ── Focus summary ─────────────────────────────────────────────────────────
     use_ai = provider in ("claude", "ollama")
     print(f"\nGenerating focus summary (provider={provider})...")
     summary_text = generate_focus_summary(
         preds, leading, orig_df,
         top_n=8, api_key=api_key,
         provider=provider, model=model,
+        cluster_preds_df=cluster_preds_df,
     )
     print("\n" + summary_text)
 
+    # ── Per-module AI narratives ───────────────────────────────────────────────
     preds["ai_narrative"] = ""
     if use_ai:
         high_risk_mods = (
@@ -720,6 +1058,15 @@ def main():
         for mod in high_risk_mods:
             row = preds[preds["module"] == mod].iloc[0]
             descriptions = _sample_descriptions(orig_df, mod)
+
+            # Build cluster_forecast for this module
+            cluster_forecast = None
+            if cluster_preds_df is not None and not cluster_preds_df.empty:
+                mod_c = cluster_preds_df[cluster_preds_df["module"] == mod].head(5)
+                if not mod_c.empty:
+                    cluster_forecast = dict(
+                        zip(mod_c["cluster_label"], mod_c["predicted_count"]))
+
             kwargs = dict(
                 module=mod,
                 predicted=float(row["predicted"]),
@@ -727,6 +1074,7 @@ def main():
                 dominant_bug_type=str(row.get("dominant_bug_type", "mixed")),
                 leading_signal=str(row.get("leading_signal", "")),
                 descriptions=descriptions,
+                cluster_forecast=cluster_forecast,
             )
             if provider == "ollama":
                 narrative = generate_ai_narrative_ollama(**kwargs, model=model)
@@ -734,26 +1082,30 @@ def main():
                 narrative = generate_ai_narrative(**kwargs, api_key=api_key)
             preds.loc[preds["module"] == mod, "ai_narrative"] = narrative
 
-    summary_path = str(out_stem) + "_focus_summary.txt"
+    # ── Save outputs ──────────────────────────────────────────────────────────
+    summary_path = str(out_stem) + "_predictions_focus_summary.txt"
     Path(summary_path).write_text(summary_text, encoding="utf-8")
 
     save_cols = [c for c in preds.columns if not c.startswith(TFIDF_PREFIX)]
     preds[save_cols].to_csv(out, index=False, encoding="utf-8-sig")
 
-    imp_path     = str(out_stem) + "_importance.csv"
-    leading_path = str(out_stem) + "_leading_indicators.csv"
+    imp_path     = str(out_stem) + "_predictions_importance.csv"
+    leading_path = str(out_stem) + "_predictions_leading_indicators.csv"
     imp.to_csv(imp_path, encoding="utf-8-sig")
 
     leading_df = leading.reset_index()
     leading_df.columns = ["feature", "pearson_r"]
-    leading_df["label"] = leading_df["feature"].map(_FEATURE_LABELS).fillna(leading_df["feature"])
+    leading_df["label"] = leading_df["feature"].map(_FEATURE_LABELS).fillna(
+        leading_df["feature"])
     leading_df.to_csv(leading_path, index=False, encoding="utf-8-sig")
 
     print(f"\nOutputs:")
-    print(f"  {out}           ← main predictions (includes ai_narrative column)")
-    print(f"  {imp_path}      ← model feature importances")
-    print(f"  {leading_path}  ← leading indicator correlations")
-    print(f"  {summary_path}  ← plain-English focus summary")
+    print(f"  {out}              ← main predictions (includes ai_narrative)")
+    if cluster_preds_df is not None:
+        print(f"  {out_stem}_predictions_by_cluster.csv  ← bug-type forecast per cluster")
+    print(f"  {imp_path}         ← model feature importances")
+    print(f"  {leading_path}     ← leading indicator correlations")
+    print(f"  {summary_path}     ← plain-English focus summary")
 
 
 if __name__ == "__main__":

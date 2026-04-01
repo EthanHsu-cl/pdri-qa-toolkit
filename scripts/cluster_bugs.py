@@ -1,35 +1,44 @@
 #!/usr/bin/env python3
-"""PDR-I NLP Defect Clustering v2.4 - Resume support + embedding cache
+"""PDR-I NLP Defect Clustering v3.0 — Severity stratification + cluster intelligence
 
-Changes from v2.3:
-  - Input fingerprint check: hashes row count + newest Create Date from the
-    input CSV. If both match the last run's fingerprint (stored in the cluster
-    cache file), the script exits immediately with "Nothing changed" and
-    returns without touching any output files. This makes daily cron runs
-    essentially free when the bug data hasn't been refreshed.
-  - Embedding cache: Ollama embedding vectors are persisted to
-    <cluster_dir>/embedding_cache.json, keyed by BugCode. On subsequent runs
-    only NEW bugs (BugCode not in the cache) are sent to Ollama for embedding;
-    all existing bugs reuse their cached vectors. This is the main time-saver:
-    a corpus of 10,000 bugs where 200 are new takes the same time as embedding
-    200 bugs from scratch rather than all 10,000.
-  - Cache is written every EMBED_CHECKPOINT_EVERY embeddings (default 50) so
-    a crash mid-run preserves all work done so far.
-  - --force flag overrides the fingerprint check and runs a full re-cluster
-    even when the input is unchanged. Use this after updating the Ollama model
-    or when you want fresh cluster assignments regardless.
-  - --no-cache flag skips loading AND saving the embedding cache (runs exactly
-    like v2.3, useful for debugging or one-off runs on a different machine).
-  - Dropped bugs warning: if BugCodes present in the embedding cache are
-    absent from the current input, a count is printed (same pattern as the
-    scorer's module-dropped warning). The stale entries are retained in the
-    cache file so they don't need to be re-embedded if the bug reappears.
+New in v3.0:
+  - Severity-stratified clustering (--stratify-severity):
+      S1/S2 bugs are clustered separately from S3/S4. The global pass still
+      runs on all bugs. Two extra columns are added to the output:
+          cluster_id_s12 / cluster_label_s12  ← critical/major tier
+          cluster_id_s34 / cluster_label_s34  ← normal/minor tier
+      Stratified summaries are saved to:
+          clusters/<stem>_cluster_summary_s12.csv
+          clusters/<stem>_cluster_summary_s34.csv
+
+  - Cluster velocity: for each cluster, compares bug count in the most recent
+    VELOCITY_WINDOW builds against the prior VELOCITY_WINDOW builds.
+    Exported as cluster_velocity_ratio and cluster_trend (growing/stable/declining)
+    in the cluster summary CSV.
+
+  - Module cluster entropy: Shannon entropy (base-2) of the cluster-assignment
+    distribution per module. High entropy = broad instability (bugs spread across
+    many themes). Low entropy = focused failure mode (bugs concentrated in one theme).
+    Exported to clusters/<stem>_module_entropy.csv.
+
+  - Cluster recurrence rate: fraction of bugs in each cluster whose source module
+    also contributed to that cluster in the prior build window. High recurrence =
+    the fix isn't holding — a strong predictor of future bugs of the same type.
+    Exported as recurrence_rate in the cluster summary CSV.
+
+  - Summary CSV columns (v3.0):
+      cluster_id, cluster_label, count, modules, avg_sev,
+      cluster_velocity_ratio, cluster_trend, recent_count, prior_count,
+      recurrence_rate
+
+All v2.4 features retained: embedding cache, fingerprint check, --force,
+--no-cache, per-module DBSCAN, Ollama / TF-IDF provider choice.
 
 Usage:
-  python cluster_bugs.py <input_csv> <output_csv>                          # TF-IDF (default)
-  python cluster_bugs.py <input_csv> <output_csv> --provider ollama        # Ollama embeddings
-  python cluster_bugs.py <input_csv> <output_csv> --provider ollama --model llama3.1
-  python cluster_bugs.py <input_csv> <output_csv> --provider ollama --force  # ignore cache
+  python cluster_bugs.py <input_csv> <output_csv>
+  python cluster_bugs.py <input_csv> <output_csv> --provider ollama
+  python cluster_bugs.py <input_csv> <output_csv> --stratify-severity
+  python cluster_bugs.py <input_csv> <output_csv> --provider ollama --force
   python cluster_bugs.py <input_csv> <output_csv> --provider ollama --no-cache
 """
 import sys, json, hashlib, argparse, urllib.request, time
@@ -45,19 +54,16 @@ from pathlib import Path
 # ─────────────────────────────────────────────────────────────────────────────
 
 OLLAMA_BASE            = "http://localhost:11434"
-EMBED_CHECKPOINT_EVERY = 50   # save cache to disk this often during embedding
+EMBED_CHECKPOINT_EVERY = 50
+VELOCITY_WINDOW        = 3    # builds per velocity comparison window
+MIN_BUGS_STRATIFIED    = 20   # min bugs per severity tier to run a stratified cluster pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Input fingerprint helpers
+# Input fingerprint helpers  (unchanged from v2.4)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _compute_fingerprint(df: pd.DataFrame) -> str:
-    """Return a short hash that changes when bug data is added or removed.
-
-    Uses row count + max(Create Date) rather than hashing all cell values —
-    fast enough on 10k+ rows, stable across column reordering.
-    """
     n = len(df)
     latest = ""
     if "Create Date" in df.columns:
@@ -67,17 +73,10 @@ def _compute_fingerprint(df: pd.DataFrame) -> str:
 
 
 def _fp_file(cluster_dir: Path) -> Path:
-    """Path to the lightweight fingerprint file (used by both tfidf and ollama)."""
     return cluster_dir / "cluster_fingerprint.json"
 
 
 def _load_fingerprint(cache_path: Path) -> str:
-    """Read the fingerprint stored in the embedding cache file OR the standalone
-    fingerprint file.  The embedding cache only exists in Ollama mode, so TF-IDF
-    mode uses cluster_fingerprint.json instead.  Both locations are checked so
-    that a previous Ollama run's fingerprint is still honoured when switching to
-    TF-IDF mode on the next run.
-    """
     for path in [cache_path, cache_path.parent / "cluster_fingerprint.json"]:
         if not path.exists():
             continue
@@ -93,9 +92,6 @@ def _load_fingerprint(cache_path: Path) -> str:
 
 
 def _save_fingerprint(cluster_dir: Path, fingerprint: str) -> None:
-    """Persist only the fingerprint to a tiny standalone JSON file.
-    Used by TF-IDF mode (which has no embedding cache to piggyback on).
-    """
     fp_path = _fp_file(cluster_dir)
     tmp = fp_path.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -104,7 +100,6 @@ def _save_fingerprint(cluster_dir: Path, fingerprint: str) -> None:
 
 
 def _save_cache(cache_path: Path, embeddings: dict, fingerprint: str) -> None:
-    """Persist embedding cache + fingerprint atomically (write-then-rename)."""
     tmp = cache_path.with_suffix(".tmp")
     payload = {"_fingerprint": fingerprint, "embeddings": embeddings}
     with open(tmp, "w", encoding="utf-8") as f:
@@ -113,9 +108,6 @@ def _save_cache(cache_path: Path, embeddings: dict, fingerprint: str) -> None:
 
 
 def _load_cache(cache_path: Path) -> dict:
-    """Load embedding cache dict (keyed by BugCode → list[float]).
-    Returns empty dict on any error.
-    """
     if not cache_path.exists():
         return {}
     try:
@@ -128,11 +120,10 @@ def _load_cache(cache_path: Path) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ollama helpers
+# Ollama helpers  (unchanged from v2.4)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ollama_embed(text: str, model: str = "llama3.1") -> "list[float] | None":
-    """Return embedding vector for a single text string via Ollama /api/embeddings."""
     payload = json.dumps({"model": model, "prompt": text}).encode()
     req = urllib.request.Request(
         f"{OLLAMA_BASE}/api/embeddings",
@@ -156,28 +147,11 @@ def get_ollama_embeddings(
     fingerprint: str = "",
     batch_delay: float = 0.1,
 ) -> "np.ndarray | None":
-    """Embed a list of texts, reusing cached vectors by BugCode.
-
-    Args:
-        texts:       One description per bug (parallel to bug_codes).
-        bug_codes:   Unique identifier per bug — used as cache key.
-        model:       Ollama model name.
-        cache:       Mutable dict of previously computed vectors (modified in-place).
-        cache_path:  Path to persist the cache; checkpointed every
-                     EMBED_CHECKPOINT_EVERY new embeddings.
-        fingerprint: Written back to the cache file so the next run can
-                     detect unchanged input.
-        batch_delay: Seconds to sleep every 20 requests (avoids hammering Ollama).
-
-    Returns:
-        (N, D) float32 array of embedding vectors, or None on failure.
-    """
     if cache is None:
         cache = {}
 
-    # Identify which bugs are new (not in cache)
-    new_indices = [i for i, code in enumerate(bug_codes) if str(code) not in cache]
-    cached_count = len(texts) - len(new_indices)
+    new_indices   = [i for i, code in enumerate(bug_codes) if str(code) not in cache]
+    cached_count  = len(texts) - len(new_indices)
 
     if cached_count:
         print(f"  Embedding cache: {cached_count:,} reused, {len(new_indices):,} new bugs to embed.")
@@ -196,8 +170,6 @@ def get_ollama_embeddings(
             return None
         cache[code] = vec
         new_done += 1
-
-        # Progress + checkpoint
         if batch_delay and new_done % 20 == 0:
             print(f"    {new_done}/{len(new_indices)} new embeddings done...")
             time.sleep(batch_delay)
@@ -205,7 +177,6 @@ def get_ollama_embeddings(
             _save_cache(cache_path, cache, fingerprint)
             print(f"    Cache checkpointed at {new_done} new embeddings.")
 
-    # Assemble full array in original order
     vecs = []
     for i, code in enumerate(bug_codes):
         v = cache.get(str(code))
@@ -220,7 +191,6 @@ def get_ollama_embeddings(
 
 
 def _ollama_label_cluster(samples: "list[str]", model: str = "llama3.1") -> str:
-    """Ask Ollama to produce a short (3-6 word) label summarising sample bug descriptions."""
     joined = "\n".join(f"- {s}" for s in samples[:8])
     prompt = (
         "You are a QA analyst. Given these bug descriptions from the same cluster, "
@@ -250,11 +220,10 @@ def _ollama_label_cluster(samples: "list[str]", model: str = "llama3.1") -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Core clustering
+# Core clustering  (unchanged from v2.4)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _tfidf_matrix(texts: "list[str]"):
-    """Return (TF-IDF sparse matrix, vectorizer). Falls back to unigrams on sparse data."""
     for kwargs in [
         dict(max_features=3000, stop_words="english", ngram_range=(1, 2), min_df=2, max_df=0.8),
         dict(max_features=3000, stop_words="english", ngram_range=(1, 1), min_df=1, max_df=0.95),
@@ -281,70 +250,58 @@ def cluster_bugs(
     cache_path: "Path | None" = None,
     fingerprint: str = "",
 ):
-    """Cluster bugs by description similarity.
-
-    embed_cache, cache_path, fingerprint are passed through to
-    get_ollama_embeddings() and are only used in Ollama mode.
-    """
     df = df.copy()
     mask = df[text_col].notna() & (df[text_col].str.len() > 5)
     valid_idx = df[mask].index.tolist()
 
     if len(valid_idx) < 10:
-        df["cluster_id"] = -1
+        df["cluster_id"]    = -1
         df["cluster_label"] = "Unclustered"
+        df["embed_source"]  = provider
         return df
 
-    texts = df.loc[valid_idx, text_col].tolist()
-    X_dense = None
+    texts      = df.loc[valid_idx, text_col].tolist()
+    X_dense    = None
     embed_source = "tfidf"
 
-    # ── Ollama semantic embeddings ──────────────────────────────────────────
     if provider == "ollama":
-        # Build a stable per-row key: prefer BugCode, fall back to row index
         if "BugCode" in df.columns:
             bug_codes = df.loc[valid_idx, "BugCode"].fillna("").astype(str).tolist()
         else:
             bug_codes = [str(i) for i in valid_idx]
 
         arr = get_ollama_embeddings(
-            texts,
-            bug_codes=bug_codes,
-            model=model,
-            cache=embed_cache,
-            cache_path=cache_path,
-            fingerprint=fingerprint,
+            texts, bug_codes=bug_codes, model=model,
+            cache=embed_cache, cache_path=cache_path, fingerprint=fingerprint,
         )
         if arr is not None:
-            X_dense = normalize(arr)
+            X_dense      = normalize(arr)
             embed_source = "ollama"
         else:
             print("  Ollama embedding failed — falling back to TF-IDF.")
 
-    # ── TF-IDF fallback ──────────────────────────────────────────────────────
     if X_dense is None:
         X_sparse, vec = _tfidf_matrix(texts)
         if X_sparse is None:
-            df["cluster_id"] = -1
+            df["cluster_id"]    = -1
             df["cluster_label"] = "Unclustered"
+            df["embed_source"]  = "tfidf"
             return df
         X_dense = X_sparse.toarray()
         vec_ref = vec
     else:
         vec_ref = None
 
-    # ── Fit clusters ─────────────────────────────────────────────────────────
     if method == "dbscan":
-        dist = cosine_distances(X_dense)
+        dist   = cosine_distances(X_dense)
         labels = DBSCAN(eps=eps, min_samples=min_samples,
                         metric="precomputed").fit_predict(dist)
     else:
         labels = KMeans(
             n_clusters=min(n_clusters, len(valid_idx)),
-            random_state=42, n_init=10
+            random_state=42, n_init=10,
         ).fit_predict(X_dense)
 
-    # ── Cluster labels ───────────────────────────────────────────────────────
     unique_ids = sorted(set(labels))
     clabels = {}
     for cid in unique_ids:
@@ -367,21 +324,211 @@ def cluster_bugs(
             top = tfidf_mean.argsort()[-3:][::-1]
             clabels[cid] = " | ".join(fnames[i] for i in top)
 
-    df["cluster_id"] = -1
+    df["cluster_id"]    = -1
     df["cluster_label"] = "Unclustered"
-    df["embed_source"] = embed_source
+    df["embed_source"]  = embed_source
     for i, idx in enumerate(valid_idx):
-        df.at[idx, "cluster_id"] = int(labels[i])
+        df.at[idx, "cluster_id"]    = int(labels[i])
         df.at[idx, "cluster_label"] = clabels.get(int(labels[i]), "Unknown")
 
     return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Summary
+# NEW v3.0 — Cluster intelligence functions
 # ─────────────────────────────────────────────────────────────────────────────
 
-def summarize(df):
+def compute_cluster_velocity(df: pd.DataFrame,
+                              build_col: str = "Build#",
+                              cluster_col: str = "cluster_id",
+                              window: int = VELOCITY_WINDOW) -> dict:
+    """
+    For each cluster, compare bug count in the most recent `window` builds
+    against the prior `window` builds.
+
+    Returns
+    -------
+    dict: {cluster_id: {"recent_count", "prior_count", "velocity_ratio", "trend"}}
+    trend is "growing" (ratio ≥ 1.5), "declining" (ratio ≤ 0.67), or "stable".
+    """
+    if build_col not in df.columns or cluster_col not in df.columns:
+        return {}
+
+    work = df.copy()
+    work[build_col] = pd.to_numeric(work[build_col], errors="coerce")
+    work = work.dropna(subset=[build_col, cluster_col])
+    work = work[work[cluster_col] != -1]
+    if work.empty:
+        return {}
+
+    max_build  = work[build_col].max()
+    recent_min = max_build - window + 1
+    prior_min  = max_build - window * 2 + 1
+
+    result = {}
+    for cid in work[cluster_col].unique():
+        cdf    = work[work[cluster_col] == cid]
+        recent = int((cdf[build_col] >= recent_min).sum())
+        prior  = int(((cdf[build_col] >= prior_min) & (cdf[build_col] < recent_min)).sum())
+        if prior == 0:
+            ratio = float(recent) if recent > 0 else 1.0
+        else:
+            ratio = recent / prior
+        trend = ("growing"   if ratio >= 1.5 else
+                 "declining" if ratio <= 0.67 else
+                 "stable")
+        result[int(cid)] = {
+            "recent_count":   recent,
+            "prior_count":    prior,
+            "velocity_ratio": round(ratio, 2),
+            "trend":          trend,
+        }
+    return result
+
+
+def compute_module_cluster_entropy(df: pd.DataFrame,
+                                    cluster_col: str = "cluster_id",
+                                    mod_col: str = "parsed_module") -> dict:
+    """
+    Shannon entropy (base-2) of the cluster-assignment distribution per module.
+
+    High entropy → bugs spread across many themes (broad instability).
+    Low entropy  → bugs concentrated in one theme (focused failure mode).
+
+    Returns
+    -------
+    dict: {module_name: entropy_value}
+    """
+    if cluster_col not in df.columns or mod_col not in df.columns:
+        return {}
+
+    clustered = df[(df[cluster_col] != -1)].dropna(subset=[mod_col, cluster_col])
+    result = {}
+    for mod, grp in clustered.groupby(mod_col):
+        counts = grp[cluster_col].value_counts().values.astype(float)
+        total  = counts.sum()
+        if total == 0:
+            continue
+        probs = counts / total
+        ent   = float(-np.sum(probs * np.log2(probs + 1e-12)))
+        result[str(mod)] = round(ent, 3)
+    return result
+
+
+def compute_cluster_recurrence_rate(df: pd.DataFrame,
+                                     build_col: str = "Build#",
+                                     cluster_col: str = "cluster_id",
+                                     mod_col: str = "parsed_module",
+                                     window: int = VELOCITY_WINDOW) -> dict:
+    """
+    For each cluster, compute the fraction of bugs in the most recent build
+    window whose source module also contributed to that cluster in the prior
+    build window. High recurrence = the fix isn't sticking.
+
+    Returns
+    -------
+    dict: {cluster_id: recurrence_rate_0_to_1}
+    """
+    if build_col not in df.columns or cluster_col not in df.columns or mod_col not in df.columns:
+        return {}
+
+    work = df.copy()
+    work[build_col] = pd.to_numeric(work[build_col], errors="coerce")
+    work = work.dropna(subset=[build_col, cluster_col, mod_col])
+    work = work[work[cluster_col] != -1]
+    if work.empty:
+        return {}
+
+    max_build  = work[build_col].max()
+    recent_min = max_build - window + 1
+    prior_min  = max_build - window * 2 + 1
+
+    recent_df = work[work[build_col] >= recent_min]
+    prior_df  = work[(work[build_col] >= prior_min) & (work[build_col] < recent_min)]
+
+    result = {}
+    for cid in work[cluster_col].unique():
+        r_mods = set(recent_df[recent_df[cluster_col] == cid][mod_col].unique())
+        p_mods = set(prior_df[prior_df[cluster_col]  == cid][mod_col].unique())
+        if not r_mods:
+            result[int(cid)] = 0.0
+        else:
+            overlap = len(r_mods & p_mods)
+            result[int(cid)] = round(overlap / len(r_mods), 3)
+    return result
+
+
+def cluster_bugs_stratified(df: pd.DataFrame,
+                              method: str = "kmeans",
+                              n_clusters: int = 15,
+                              provider: str = "tfidf",
+                              model: str = "llama3.1",
+                              embed_cache: "dict | None" = None,
+                              fingerprint: str = "") -> pd.DataFrame:
+    """
+    Run separate cluster passes for S1/S2 bugs and S3/S4 bugs.
+
+    Adds four columns to the output DataFrame:
+      cluster_id_s12     — cluster index within the critical/major tier (-1 if N/A)
+      cluster_label_s12  — label for that cluster
+      cluster_id_s34     — cluster index within the normal/minor tier (-1 if N/A)
+      cluster_label_s34  — label for that cluster
+
+    The global cluster_id / cluster_label columns from the main pass are unchanged.
+    """
+    df = df.copy()
+    df["cluster_id_s12"]    = -1
+    df["cluster_id_s34"]    = -1
+    df["cluster_label_s12"] = "Unclustered"
+    df["cluster_label_s34"] = "Unclustered"
+
+    if "severity_num" not in df.columns:
+        print("  NOTE: severity_num not found — skipping stratified clustering.")
+        return df
+
+    sev = pd.to_numeric(df["severity_num"], errors="coerce")
+
+    # S1 / S2 tier
+    s12_mask = sev.notna() & (sev <= 2)
+    s12_df   = df[s12_mask].copy()
+    if len(s12_df) >= MIN_BUGS_STRATIFIED:
+        k = min(n_clusters, max(2, len(s12_df) // 5))
+        print(f"  Stratified S1/S2: clustering {len(s12_df)} bugs into {k} clusters …")
+        s12c = cluster_bugs(s12_df, method=method, n_clusters=k,
+                            provider=provider, model=model,
+                            embed_cache=embed_cache, cache_path=None,
+                            fingerprint=fingerprint)
+        df.loc[s12_mask, "cluster_id_s12"]    = s12c["cluster_id"].values
+        df.loc[s12_mask, "cluster_label_s12"] = s12c["cluster_label"].values
+    else:
+        print(f"  Stratified S1/S2: only {len(s12_df)} bugs — skipping (need ≥ {MIN_BUGS_STRATIFIED}).")
+
+    # S3 / S4 tier
+    s34_mask = sev.notna() & (sev > 2)
+    s34_df   = df[s34_mask].copy()
+    if len(s34_df) >= MIN_BUGS_STRATIFIED:
+        k = min(n_clusters, max(2, len(s34_df) // 5))
+        print(f"  Stratified S3/S4: clustering {len(s34_df)} bugs into {k} clusters …")
+        s34c = cluster_bugs(s34_df, method=method, n_clusters=k,
+                            provider=provider, model=model,
+                            embed_cache=embed_cache, cache_path=None,
+                            fingerprint=fingerprint)
+        df.loc[s34_mask, "cluster_id_s34"]    = s34c["cluster_id"].values
+        df.loc[s34_mask, "cluster_label_s34"] = s34c["cluster_label"].values
+    else:
+        print(f"  Stratified S3/S4: only {len(s34_df)} bugs — skipping (need ≥ {MIN_BUGS_STRATIFIED}).")
+
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Summary  (updated for v3.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def summarize(df: pd.DataFrame,
+              velocity_map: "dict | None" = None,
+              recurrence_map: "dict | None" = None) -> pd.DataFrame:
+    """Build a per-cluster summary DataFrame including velocity/trend/recurrence."""
     if "cluster_id" not in df.columns:
         print("No cluster_id column.")
         return pd.DataFrame()
@@ -389,18 +536,50 @@ def summarize(df):
     if len(clustered) == 0:
         print("No clusters found.")
         return pd.DataFrame()
+
     agg_dict = dict(
         count=("cluster_id", "size"),
         modules=("parsed_module", lambda x: ", ".join(x.dropna().unique()[:5])),
         avg_sev=("severity_num", "mean"),
     )
-    cl = clustered.groupby(["cluster_id", "cluster_label"]).agg(**agg_dict)\
-                  .sort_values("count", ascending=False)
-    n_c = df["cluster_id"].nunique() - (1 if -1 in df["cluster_id"].values else 0)
+    cl = (clustered
+          .groupby(["cluster_id", "cluster_label"])
+          .agg(**agg_dict)
+          .sort_values("count", ascending=False)
+          .reset_index())
+
+    # Merge velocity columns
+    if velocity_map:
+        cl["cluster_velocity_ratio"] = cl["cluster_id"].map(
+            lambda cid: velocity_map.get(int(cid), {}).get("velocity_ratio", 1.0))
+        cl["cluster_trend"] = cl["cluster_id"].map(
+            lambda cid: velocity_map.get(int(cid), {}).get("trend", "stable"))
+        cl["recent_count"] = cl["cluster_id"].map(
+            lambda cid: velocity_map.get(int(cid), {}).get("recent_count", 0))
+        cl["prior_count"] = cl["cluster_id"].map(
+            lambda cid: velocity_map.get(int(cid), {}).get("prior_count", 0))
+    else:
+        cl["cluster_velocity_ratio"] = 1.0
+        cl["cluster_trend"]          = "stable"
+        cl["recent_count"]           = 0
+        cl["prior_count"]            = 0
+
+    # Merge recurrence
+    if recurrence_map:
+        cl["recurrence_rate"] = cl["cluster_id"].map(
+            lambda cid: recurrence_map.get(int(cid), 0.0))
+    else:
+        cl["recurrence_rate"] = 0.0
+
+    n_c  = df["cluster_id"].nunique() - (1 if -1 in df["cluster_id"].values else 0)
     n_in = (df["cluster_id"] != -1).sum()
-    src = df["embed_source"].iloc[0] if "embed_source" in df.columns else "tfidf"
+    src  = df["embed_source"].iloc[0] if "embed_source" in df.columns else "tfidf"
     print(f"Clusters: {n_c}, In clusters: {n_in}/{len(df)}, Embed source: {src}")
-    print(cl.head(15).to_string())
+
+    display_cols = ["cluster_label", "count", "avg_sev",
+                    "cluster_velocity_ratio", "cluster_trend", "recurrence_rate"]
+    display_cols = [c for c in display_cols if c in cl.columns]
+    print(cl.head(15)[display_cols].to_string(index=False))
     return cl
 
 
@@ -409,17 +588,17 @@ def summarize(df):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="PDR-I Defect Clustering v2.4")
+    parser = argparse.ArgumentParser(description="PDR-I Defect Clustering v3.0")
     parser.add_argument("input_csv")
     parser.add_argument("output_csv")
-    parser.add_argument("--provider", choices=["tfidf", "ollama"], default="tfidf",
-                        help="Embedding source: tfidf (default) or ollama")
-    parser.add_argument("--model", default="llama3.1",
-                        help="Ollama model for embeddings and labels (default: llama3.1)")
-    parser.add_argument("--force", action="store_true",
-                        help="Ignore fingerprint check and re-cluster even if input is unchanged")
-    parser.add_argument("--no-cache", action="store_true",
-                        help="Skip loading and saving the embedding cache (always embeds from scratch)")
+    parser.add_argument("--provider", choices=["tfidf", "ollama"], default="tfidf")
+    parser.add_argument("--model", default="llama3.1")
+    parser.add_argument("--force",    action="store_true")
+    parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument(
+        "--stratify-severity", action="store_true",
+        help="Also run separate cluster passes for S1/S2 and S3/S4 bugs"
+    )
     args = parser.parse_args()
 
     inp = Path(args.input_csv)
@@ -433,7 +612,8 @@ def main():
 
     # ── Load input ────────────────────────────────────────────────────────────
     df = pd.read_csv(str(inp))
-    print(f"Loaded {len(df):,} bugs | provider={args.provider} model={args.model}")
+    print(f"Loaded {len(df):,} bugs | provider={args.provider} model={args.model}"
+          + (" | stratify-severity=ON" if args.stratify_severity else ""))
 
     # ── Fingerprint check ─────────────────────────────────────────────────────
     fingerprint = _compute_fingerprint(df)
@@ -449,61 +629,97 @@ def main():
             )
             return
         elif cached_fp:
-            print(f"  Fingerprint changed: cached={cached_fp!r} → current={fingerprint!r} — re-clustering.")
+            print(f"  Fingerprint changed: {cached_fp!r} → {fingerprint!r} — re-clustering.")
         else:
-            print(f"  No cached fingerprint found — running full cluster (provider={args.provider}).")
+            print(f"  No cached fingerprint — running full cluster (provider={args.provider}).")
 
     if args.force:
-        print(f"  --force: skipping fingerprint check, running full re-cluster.")
+        print("  --force: skipping fingerprint check, running full re-cluster.")
 
     # ── Load embedding cache (Ollama mode only) ───────────────────────────────
     embed_cache: dict = {}
     if args.provider == "ollama" and not args.no_cache:
         embed_cache = _load_cache(cache_path)
         if embed_cache:
-            # Warn about BugCodes in cache that are no longer in the input
             if "BugCode" in df.columns:
-                current_codes  = set(df["BugCode"].dropna().astype(str))
-                cached_codes   = set(embed_cache.keys()) - {"_fingerprint"}
-                stale_codes    = cached_codes - current_codes
-                if stale_codes:
-                    print(
-                        f"  Note: {len(stale_codes):,} BugCodes in embedding cache are absent from "
-                        f"current input (bugs closed/removed). They are retained in the cache in case "
-                        f"they reappear, but will not affect this run's output."
-                    )
+                current_codes = set(df["BugCode"].dropna().astype(str))
+                cached_codes  = set(embed_cache.keys()) - {"_fingerprint"}
+                stale = cached_codes - current_codes
+                if stale:
+                    print(f"  Note: {len(stale):,} BugCodes in cache absent from input — "
+                          f"retained but won't affect output.")
             print(f"  Embedding cache loaded: {len(embed_cache):,} existing vectors.")
         else:
-            print(f"  No embedding cache found — all bugs will be embedded from scratch.")
+            print("  No embedding cache found — all bugs will be embedded from scratch.")
 
     # ── Global clustering ─────────────────────────────────────────────────────
     df = cluster_bugs(
-        df,
-        method="kmeans",
-        n_clusters=25,
-        provider=args.provider,
-        model=args.model,
+        df, method="kmeans", n_clusters=25,
+        provider=args.provider, model=args.model,
         embed_cache=embed_cache,
         cache_path=cache_path if not args.no_cache else None,
         fingerprint=fingerprint,
     )
 
-    # ── Save final embedding cache + fingerprint ──────────────────────────────
+    # ── Severity-stratified clustering (optional) ─────────────────────────────
+    if args.stratify_severity:
+        print("\nRunning severity-stratified clustering …")
+        df = cluster_bugs_stratified(
+            df, method="kmeans", n_clusters=15,
+            provider=args.provider, model=args.model,
+            embed_cache=embed_cache, fingerprint=fingerprint,
+        )
+
+    # ── Save final embedding cache ────────────────────────────────────────────
     if args.provider == "ollama" and not args.no_cache:
         _save_cache(cache_path, embed_cache, fingerprint)
         print(f"  Embedding cache saved: {len(embed_cache):,} vectors → {cache_path}")
     elif args.provider == "tfidf" and not args.no_cache:
-        # TF-IDF has no embedding vectors to persist, but we still save the
-        # fingerprint so the next run can skip re-clustering unchanged input.
         _save_fingerprint(cluster_dir, fingerprint)
         print(f"  Fingerprint saved → {_fp_file(cluster_dir)}")
 
-    # ── Summary + summary CSV ─────────────────────────────────────────────────
-    summary = summarize(df)
-    if len(summary) > 0:
+    # ── Compute cluster intelligence ──────────────────────────────────────────
+    print("\nComputing cluster velocity, recurrence, and module entropy …")
+    velocity_map   = compute_cluster_velocity(df)
+    recurrence_map = compute_cluster_recurrence_rate(df)
+    entropy_map    = compute_module_cluster_entropy(df)
+
+    # ── Global summary ────────────────────────────────────────────────────────
+    summary = summarize(df, velocity_map=velocity_map, recurrence_map=recurrence_map)
+    if not summary.empty:
         summary_path = cluster_dir / (inp.stem + "_cluster_summary.csv")
-        summary.to_csv(str(summary_path), encoding="utf-8-sig")
+        summary.to_csv(str(summary_path), encoding="utf-8-sig", index=False)
         print(f"  Cluster summary → {summary_path}")
+
+    # ── Module entropy CSV ────────────────────────────────────────────────────
+    if entropy_map:
+        ent_df = pd.DataFrame([
+            {"module": mod, "cluster_entropy": ent}
+            for mod, ent in sorted(entropy_map.items(), key=lambda x: -x[1])
+        ])
+        ent_path = cluster_dir / (inp.stem + "_module_entropy.csv")
+        ent_df.to_csv(str(ent_path), encoding="utf-8-sig", index=False)
+        print(f"  Module entropy   → {ent_path}  ({len(ent_df)} modules)")
+
+    # ── Stratified summaries ──────────────────────────────────────────────────
+    if args.stratify_severity:
+        for tier, id_col, label_col in [
+            ("s12", "cluster_id_s12", "cluster_label_s12"),
+            ("s34", "cluster_id_s34", "cluster_label_s34"),
+        ]:
+            tier_df = df[df[id_col] != -1].copy()
+            if tier_df.empty:
+                continue
+            # Build a temporary cluster_id/cluster_label view for summarize()
+            tier_df["cluster_id"]    = tier_df[id_col]
+            tier_df["cluster_label"] = tier_df[label_col]
+            tier_vel  = compute_cluster_velocity(tier_df)
+            tier_rec  = compute_cluster_recurrence_rate(tier_df)
+            tier_sum  = summarize(tier_df, velocity_map=tier_vel, recurrence_map=tier_rec)
+            if not tier_sum.empty:
+                tier_path = cluster_dir / f"{inp.stem}_cluster_summary_{tier}.csv"
+                tier_sum.to_csv(str(tier_path), encoding="utf-8-sig", index=False)
+                print(f"  Stratified {tier} summary → {tier_path}")
 
     # ── Per-module DBSCAN clustering (top 5 modules) ──────────────────────────
     if "parsed_module" in df.columns:
@@ -511,17 +727,10 @@ def main():
             mdf = df[df["parsed_module"] == mod].copy()
             if len(mdf) >= 20:
                 print(f"\nClustering within module: {mod} ({len(mdf):,} bugs)")
-                # Per-module clustering reuses the same embed_cache that was
-                # populated during the global pass, so no new Ollama calls needed.
                 mdf = cluster_bugs(
-                    mdf,
-                    method="dbscan",
-                    eps=0.6,
-                    min_samples=2,
-                    provider=args.provider,
-                    model=args.model,
-                    embed_cache=embed_cache,
-                    cache_path=None,  # don't re-checkpoint for per-module passes
+                    mdf, method="dbscan", eps=0.6, min_samples=2,
+                    provider=args.provider, model=args.model,
+                    embed_cache=embed_cache, cache_path=None,
                     fingerprint=fingerprint,
                 )
                 summarize(mdf)
