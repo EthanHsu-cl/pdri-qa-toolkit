@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""PDR-I Bug Heatmap Dashboard v2.19
+"""PDR-I Bug Heatmap Dashboard v2.20
+
+Changes from v2.19:
+  - Tab 9 (Defect Forecast): v4.0 category-based predictions.
+    New stacked bar chart "Predicted Bug Categories — What Will Break?"
+    shows per-module breakdown of expected QA bug categories (Crash/Stability,
+    Feature not working, UI/Display, UX/Usability, Translation, Data/File).
+  - Module forecast cards now show "What types of bugs to expect" section
+    with per-category percentages from recent history.  Card headers show
+    the top 2 expected categories. "Bug categories expected" metric replaces
+    raw bug count when category data is available.
+  - Loads new _predictions_by_category.csv (v4.0) from predict_defects.py.
+  - AI Risk Briefing and Predicted Bug Count chart now use consistent
+    numbers — the AI narrative no longer states or re-derives bug counts,
+    eliminating the previous mismatch between the briefing text and chart.
 
 Changes from v2.18:
   - Sidebar Steps 1–4 consolidated into a single "📁 Data Sources" expander.
@@ -81,7 +95,7 @@ from pathlib import Path
 
 
 st.set_page_config(page_title="PDR-I QA Dashboard", layout="wide", page_icon="🔥")
-st.sidebar.title("🔥 PDR-I QA Dashboard v2.19")
+st.sidebar.title("🔥 PDR-I QA Dashboard v2.20")
 
 
 # ---------------------------------------------------------------------
@@ -253,6 +267,7 @@ _pred_default         = "data/predictions/ecl_parsed_predictions.csv"
 _pred_sum_def         = "data/predictions/ecl_parsed_predictions_focus_summary.txt"
 _pred_li_def          = "data/predictions/ecl_parsed_predictions_leading_indicators.csv"
 _pred_cluster_def     = "data/predictions/ecl_parsed_predictions_by_cluster.csv" # v3.0 NEW
+_pred_category_def    = "data/predictions/ecl_parsed_predictions_by_category.csv" # v4.0 NEW
 
 _bugs_probe    = Path(_bugs_default).exists()
 _risk_probe    = Path(_risk_default).exists()
@@ -364,6 +379,7 @@ with st.sidebar.expander(_datasources_label, expanded=not _bugs_probe):
     pred_summary_txt    = ""
     pred_leading_df     = None
     pred_cluster_df     = None   # v3.0: per-cluster bug-type predictions
+    pred_category_df    = None   # v4.0: per-category bug-type predictions
 
     pds = st.radio(
         "Prediction data source", ["File Path", "None"], key="ds_pred", index=0
@@ -381,6 +397,9 @@ with st.sidebar.expander(_datasources_label, expanded=not _bugs_probe):
         pcfp = st.text_input(
             "Bug-type predictions CSV (v3.0)", value=_pred_cluster_def, key="fp_pred_cluster",
         )
+        pcatfp = st.text_input(
+            "Bug category predictions CSV (v4.0)", value=_pred_category_def, key="fp_pred_category",
+        )
         if Path(pfp).exists():
             pred_df = load_csv(pfp)
             st.caption(f"✅ {len(pred_df):,} modules loaded")
@@ -392,6 +411,8 @@ with st.sidebar.expander(_datasources_label, expanded=not _bugs_probe):
             pred_leading_df = load_csv(plfp)
         if Path(pcfp).exists():
             pred_cluster_df = load_csv(pcfp)
+        if Path(pcatfp).exists():
+            pred_category_df = load_csv(pcatfp)
 
 # ── End of expander ────────────────────────────────────────────────────────
 # Derived-field computation runs here, outside the expander, so it always
@@ -2515,6 +2536,52 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
     )
     st.plotly_chart(fig_pred, width='stretch')
 
+    # ── v4.0 — Bug Category Breakdown chart ──────────────────────────────
+    if pred_category_df is not None and not pred_category_df.empty:
+        st.markdown("---")
+        st.subheader("📋 Predicted Bug Categories — What Will Break?")
+        st.caption(
+            "Each bar shows which types of bugs are expected per module, based on "
+            "recent bug descriptions. This tells you WHAT to test for, not just how many."
+        )
+        # Filter to top modules and build stacked bar data
+        _top_mods = pred_df.head(top_n_pred)["module"].tolist()
+        _cat_chart = pred_category_df[pred_category_df["module"].isin(_top_mods)].copy()
+        if not _cat_chart.empty:
+            _CAT_COLORS = {
+                "Crash / Stability":              "#ef4444",
+                "Feature not working as intended": "#f97316",
+                "UI / Display problem":            "#eab308",
+                "UX / Usability problem":          "#a855f7",
+                "Translation / Localization":      "#3b82f6",
+                "Data / File / Sync issue":        "#06b6d4",
+            }
+            # Sort modules by predicted desc (same order as the risk chart)
+            _mod_order = [m for m in _top_mods if m in _cat_chart["module"].values]
+            _cat_chart["module"] = pd.Categorical(
+                _cat_chart["module"], categories=_mod_order, ordered=True)
+            _cat_chart = _cat_chart.sort_values(["module", "expected_next_build"],
+                                                ascending=[True, False])
+            fig_cat = px.bar(
+                _cat_chart,
+                x="module", y="historical_pct", color="category",
+                color_discrete_map=_CAT_COLORS,
+                labels={"module": "Module", "historical_pct": "Proportion of recent bugs",
+                        "category": "Bug Category"},
+                hover_data={"historical_count": True, "expected_next_build": ":.1f"},
+                barmode="stack",
+            )
+            fig_cat.update_traces(texttemplate="", textposition="inside")
+            fig_cat.update_layout(
+                height=460,
+                xaxis_tickangle=-35,
+                yaxis_tickformat=".0%",
+                showlegend=True,
+                legend_title_text="Bug Category",
+                margin=dict(t=20, b=10),
+            )
+            st.plotly_chart(fig_cat, width='stretch')
+
     # ── Actual vs Predicted comparison ───────────────────────────────────
     if "target" in pred_df.columns:
         with st.expander("📈 Actual vs Predicted (last known build)"):
@@ -2571,16 +2638,30 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
         target_v  = row.get("target", None)
         icon      = RISK_ICONS.get(rl, "⚪")
 
-        card_header = f"{icon} **{mod}** — forecast {pred_val:.0f} bugs · {rl} risk"
+        # v4.0 — build a short category summary for the card header
+        _card_cat_hint = ""
+        if pred_category_df is not None and not pred_category_df.empty:
+            _mc = pred_category_df[pred_category_df["module"] == mod].head(2)
+            if not _mc.empty:
+                _card_cat_hint = " · ".join(_mc["category"].tolist())
+
+        if _card_cat_hint:
+            card_header = f"{icon} **{mod}** — {rl} risk · likely: {_card_cat_hint}"
+        else:
+            card_header = f"{icon} **{mod}** — {rl} risk"
         with st.expander(card_header, expanded=(rl == "Critical")):
-            # Row 1 — count metrics
+            # Row 1 — risk + context metrics
             fc1, fc2, fc3 = st.columns(3)
-            fc1.metric("Predicted bugs", f"{pred_val:.0f}")
+            fc1.metric("Risk level", rl)
+            # v4.0 — show how many bug categories expected instead of raw count
+            if pred_category_df is not None and not pred_category_df.empty:
+                _mod_cats = pred_category_df[pred_category_df["module"] == mod]
+                fc2.metric("Bug categories expected", f"{len(_mod_cats)}",
+                           help="Number of distinct QA bug categories predicted for next build")
+            else:
+                fc2.metric("Predicted bugs", f"{pred_val:.0f}")
             if target_v is not None:
-                fc2.metric("Actual last build", f"{float(target_v):.0f}",
-                           delta=f"{float(pred_val) - float(target_v):+.0f} vs actual",
-                           delta_color="inverse")
-            fc3.metric("Risk level", rl)
+                fc3.metric("Actual last build", f"{float(target_v):.0f}")
 
             # Row 2 — new v3.0 signals
             sev_esc   = row.get("severity_escalation", None)
@@ -2615,21 +2696,36 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
                     sc3.metric("Theme breadth (entropy)", f"{mod_ent:.2f} — {_ent_label}",
                                help="High entropy = bugs spread across many themes; low = concentrated failure mode")
 
-            st.markdown(f"**Typical bug type:** {dom_type}")
             st.markdown(f"**Leading signal:** _{lead_sig}_")
 
-            # v3.0 — per-cluster bug-type breakdown
-            if pred_cluster_df is not None and not pred_cluster_df.empty:
+            # v4.0 — per-category bug-type breakdown (preferred over clusters)
+            _showed_categories = False
+            if pred_category_df is not None and not pred_category_df.empty:
+                mod_cats = pred_category_df[pred_category_df["module"] == mod].head(6)
+                if not mod_cats.empty:
+                    _showed_categories = True
+                    st.markdown("**What types of bugs to expect:**")
+                    for _, cr in mod_cats.iterrows():
+                        pct_str = f"{cr['historical_pct'] * 100:.0f}%"
+                        cat_name = str(cr.get("category", "Unknown"))
+                        exp_cnt  = cr.get("expected_next_build", 0)
+                        st.markdown(
+                            f"&nbsp;&nbsp;• **{cat_name}** — {pct_str} of recent bugs"
+                            + (f" (~{exp_cnt:.0f} expected)" if exp_cnt >= 1 else ""),
+                            unsafe_allow_html=True,
+                        )
+
+            # Fall back to cluster breakdown if no categories
+            if not _showed_categories and pred_cluster_df is not None and not pred_cluster_df.empty:
                 mod_clusters = pred_cluster_df[pred_cluster_df["module"] == mod].head(6)
                 if not mod_clusters.empty:
                     st.markdown("**What to expect (by bug theme):**")
                     for _, cr in mod_clusters.iterrows():
                         pct_str = f"{cr['historical_pct'] * 100:.0f}%"
-                        cnt_str = f"~{cr['predicted_count']:.0f}"
                         label   = str(cr.get("cluster_label", f"Cluster {cr['cluster_id']}"))
                         if label not in ("No cluster data", "Unclustered"):
                             st.markdown(
-                                f"&nbsp;&nbsp;• **{cnt_str} bugs** ({pct_str}) — _{label}_",
+                                f"&nbsp;&nbsp;• _{label}_ ({pct_str})",
                                 unsafe_allow_html=True,
                             )
 

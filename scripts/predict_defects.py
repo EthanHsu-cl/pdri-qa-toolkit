@@ -1,44 +1,37 @@
 #!/usr/bin/env python3
-"""PDR-I Defect Prediction v3.0
+"""PDR-I Defect Prediction v4.0
 
-Changes from v2.6
+Changes from v3.0
 ─────────────────
-Change 11 — Two new lag features in build_features()
-• severity_escalation: mean severity_num in the last build minus the mean in the
-  3 builds prior to that. Negative = worsening toward S1. This captures directional
-  shift in severity that the existing sev_N features (which sum weights) miss.
-• builds_since_last_crit: how many builds have elapsed since the most recent build
-  with at least one critical bug. Modules overdue for a critical are flagged earlier.
+Change 15 — QA category classification (always on, no extra CSV needed)
+• BUG_CATEGORIES dict maps six QA-meaningful category names to keyword lists.
+• classify_bug_category(text) assigns each bug description to a category.
+• predict_category_breakdown() computes per-module category distributions from
+  the last N builds and scales them by the ML-model total to produce expected
+  counts per category for the next build.
+  Output: data/predictions/<stem>_predictions_by_category.csv with columns:
+      module, category, historical_count, historical_pct, expected_next_build
 
-Change 12 — Cluster features (optional, --cluster-csv)
-• load_cluster_features() reads the clustered output from cluster_bugs.py and builds
-  per-module per-build features:
-      cluster_entropy_3      Shannon entropy of bug-theme distribution, last 3 builds
-      cluster_entropy_5      Shannon entropy of bug-theme distribution, last 5 builds
-      top_cluster_velocity   Growth ratio of the dominant theme over the last 3 builds
-• These are merged into the feature matrix via build_features() when --cluster-csv
-  is provided. They are excluded from per-module leading_signal computation (module-
-  constant issue does not apply here, but they would dominate on small datasets).
+Change 16 — AI narrative re-focused on "what" not "how many"
+• generate_ai_narrative() and generate_ai_narrative_ollama() now receive the
+  category_forecast dict (from predict_category_breakdown) instead of the raw
+  predicted count as the headline.
+• The prompt explicitly asks the AI to describe WHAT types of bugs to expect and
+  which flows to prioritise — NOT to state or re-derive a total count.
+• This eliminates the mismatch between the AI Risk Briefing text and the
+  Predicted Bug Count chart (which always shows the ML model's prediction).
 
-Change 13 — Bug-type prediction layer
-• predict_bug_type() uses the recent cluster-distribution for each module scaled by
-  the total-count forecast to answer "what kind of bug will happen next build."
-  Output: data/predictions/<stem>_predictions_by_cluster.csv with columns:
-      module, cluster_id, cluster_label, historical_pct, predicted_count
-• generate_ai_narrative() / generate_ai_narrative_ollama() now accept an optional
-  cluster_forecast dict and include it in the prompt so the narrative names specific
-  expected bug types rather than paraphrasing the severity category.
+Change 17 — Focus summary shows category breakdown
+• generate_focus_summary() uses category_preds_df for per-module breakdowns.
+• Each module entry now lists its top expected bug categories instead of a
+  raw count.
 
-Change 14 — Updated feature labels and focus summary
-• _FEATURE_LABELS extended with labels for all new features.
-• generate_focus_summary() passes cluster_forecast to the AI narrative when the
-  per-cluster prediction DataFrame is available.
-
-All other behaviour is unchanged from v2.6.
+All other behaviour is unchanged from v3.0.
 
 Output paths:
   data/predictions/<stem>_predictions.csv
-  data/predictions/<stem>_predictions_by_cluster.csv  ← NEW
+  data/predictions/<stem>_predictions_by_category.csv  ← NEW (always)
+  data/predictions/<stem>_predictions_by_cluster.csv   (when --cluster-csv given)
   data/predictions/<stem>_predictions_importance.csv
   data/predictions/<stem>_predictions_leading_indicators.csv
   data/predictions/<stem>_predictions_focus_summary.txt
@@ -70,48 +63,34 @@ warnings.filterwarnings("ignore")
 
 PREDICTION_GUIDE = """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║           PDR-I DEFECT PREDICTION — HOW TO READ THIS OUTPUT                ║
+║           PDR-I DEFECT PREDICTION v4.0 — HOW TO READ THIS OUTPUT           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  TARGET VARIABLE                                                            ║
-║  ─────────────                                                              ║
-║  The model predicts 'bug_count' for each module in the NEXT build.         ║
-║  bug_count = number of new bugs filed against that module in one build.    ║
-║  It is NOT severity-weighted; it is a raw head-count of new defects.       ║
 ║                                                                             ║
-║  CORE FEATURES                                                              ║
-║  ─────────────                                                              ║
-║  bugs_1 / bugs_3 / bugs_5        Bugs filed in last 1 / 3 / 5 builds      ║
-║  sev_1  / sev_3  / sev_5         Severity-weighted sum over same windows   ║
-║  crit_1 / crit_3 / crit_5        Critical (S1) count over same windows     ║
-║  trend                            bugs in last build minus bugs 3 ago      ║
-║  severity_escalation  (NEW)       negative = worsening toward S1           ║
-║  builds_since_last_crit (NEW)     builds elapsed since last critical       ║
+║  WHAT THIS TOOL PREDICTS                                                    ║
+║  ───────────────────────                                                    ║
+║  For each module, the model predicts:                                       ║
+║   1. A risk level (Low / Medium / High / Critical) for the NEXT build.     ║
+║   2. WHAT TYPES of bugs are expected (by QA category), based on recent     ║
+║      bug descriptions — not just "how many" but "what kind."               ║
 ║                                                                             ║
-║  CLUSTER FEATURES (when --cluster-csv provided)                            ║
-║  ─────────────────────────────────────────────                             ║
-║  cluster_entropy_3/5  Bug-theme diversity index (higher = more spread)     ║
-║  top_cluster_velocity Growth rate of the dominant bug theme                ║
+║  QA BUG CATEGORIES (auto-classified from descriptions)                     ║
+║  ────────────────────────────────────────────────────                       ║
+║  • Crash / Stability              • Feature not working as intended        ║
+║  • UI / Display problem           • UX / Usability problem                 ║
+║  • Translation / Localization     • Data / File / Sync issue               ║
 ║                                                                             ║
-║  OUTPUT COLUMNS                                                             ║
-║  ──────────────                                                             ║
-║  target           Actual bug count in most recent build (ground truth)     ║
-║  predicted        Model's forecast for the NEXT build                      ║
-║  risk_level       Low(<3) / Medium(3-5) / High(6-10) / Critical(>10)      ║
-║  dominant_bug_type  Most common severity in recent history (recency-wtd)   ║
-║  leading_signal   Feature most predictive of this module's future bugs     ║
-║  ai_narrative     Plain-English AI explanation of risk and what to test    ║
-║                                                                             ║
-║  BUG-TYPE PREDICTION OUTPUT (_predictions_by_cluster.csv)                  ║
-║  ──────────────────────────────────────────────────────                    ║
-║  module, cluster_id, cluster_label  Which theme is expected                ║
-║  historical_pct   Fraction of recent bugs that belonged to this theme      ║
-║  predicted_count  Expected bugs in this theme next build                   ║
+║  CATEGORY PREDICTION OUTPUT (_predictions_by_category.csv)                 ║
+║  ─────────────────────────────────────────────────────────                  ║
+║  module, category          Which bug category is expected                   ║
+║  historical_count          How many recent bugs fell in this category       ║
+║  historical_pct            Fraction of recent bugs in this category         ║
+║  expected_next_build       Scaled count for next build                      ║
 ║                                                                             ║
 ║  HOW TO ACT ON IT                                                           ║
 ║  ────────────────                                                           ║
 ║  Critical/High modules → add to mandatory test suite for the next build.  ║
-║  Read 'ai_narrative' for a plain-English explanation of why.               ║
-║  Read '_by_cluster.csv' to know WHAT KIND of bugs to test for.             ║
+║  Read '_by_category.csv' to know WHAT TYPES of bugs to test for.           ║
+║  Read 'ai_narrative' for a plain-English explanation of what to expect.    ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -155,6 +134,82 @@ _RISK_ADVICE = {
     "Medium":   "Standard — include in sprint regression pass.",
     "Low":      "Monitor — include in release-candidate pass.",
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Change 15 — QA bug category taxonomy
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Each key is a human-readable QA category; values are lowercase keyword fragments
+# that, when found in a bug description, score a point toward that category.
+# Priority order (highest first) matters for tie-breaking.
+BUG_CATEGORIES = {
+    "Crash / Stability": [
+        "crash", "exception", "fatal", "abort", "force close", "forcibly closed",
+        "terminate", "stop working", "out of memory", "oom", "memory leak",
+        "deadlock", "unresponsive", "hang", "freeze", "hung", "blue screen",
+        "application error", "access violation",
+    ],
+    "Feature not working as intended": [
+        "not work", "doesn't work", "does not work", "no longer work",
+        "incorrect behavior", "wrong result", "not function", "broken",
+        "fail", "failure", "unexpected", "not as expected", "supposed to",
+        "incorrect", "mismatch", "should be", "should not", "not correct",
+        "behaves", "regression", "stopped working",
+    ],
+    "UI / Display problem": [
+        "display", "layout", "alignment", "visual", "render", "style",
+        "color", "colour", "font", "icon", "button", "overlap", "cut off",
+        "cutoff", "truncat", "clipping", "overflow", "ui ", " ui,", "interface",
+        "appearance", "look and feel", "dark mode", "light mode", "theme",
+        "blank screen", "blank page", "not show", "missing icon", "wrong icon",
+        "z-order", "z order", "overlapping", "misaligned", "pixel",
+    ],
+    "UX / Usability problem": [
+        "usability", "confusing", "confus", "navigation", "workflow",
+        "hard to find", "not intuitive", "difficult to use", "frustrat",
+        "response time", "slow", "lag ", "no feedback", "unclear", "unintuitive",
+        "too many clicks", "hard to", "not obvious", "awkward",
+    ],
+    "Translation / Localization": [
+        "translation", "localization", "localisation", "missing string",
+        "wrong string", "language", "missing text", "garbled", "encoding",
+        "locale", "region", "l10n", "i18n", "chinese", "japanese", "korean",
+        "german", "french", "spanish", "traditional chinese", "simplified chinese",
+        "zh-tw", "zh-cn", " de ", " fr ", " ja ", " ko ",
+    ],
+    "Data / File / Sync issue": [
+        "data", "corrupt", "import", "export", "sync", "cannot save",
+        "cannot load", "cannot open", "wrong data", "missing data",
+        "incorrect data", "file", "read error", "write error", "database",
+        "cloud", "upload", "download", "transfer", "backup",
+    ],
+}
+
+_CATEGORY_ORDER = list(BUG_CATEGORIES.keys())  # priority: first wins on tie
+
+
+def classify_bug_category(text: str) -> str:
+    """Assign a bug description to the highest-scoring QA category.
+
+    Scoring: count keyword hits per category; if tied, first in _CATEGORY_ORDER wins.
+    Falls back to 'Feature not working as intended' when no keywords match.
+    """
+    if not isinstance(text, str) or len(text.strip()) < 5:
+        return "Feature not working as intended"
+    t = text.lower()
+    scores: dict = {}
+    for cat, keywords in BUG_CATEGORIES.items():
+        scores[cat] = sum(1 for kw in keywords if kw in t)
+
+    best_score = max(scores.values())
+    if best_score == 0:
+        return "Feature not working as intended"
+
+    # Among tied categories keep the one that appears first in _CATEGORY_ORDER
+    for cat in _CATEGORY_ORDER:
+        if scores[cat] == best_score:
+            return cat
+    return "Feature not working as intended"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -662,6 +717,80 @@ def predict_bug_type(latest_preds: pd.DataFrame,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Change 15 — Category breakdown prediction (no cluster CSV required)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def predict_category_breakdown(latest_preds: pd.DataFrame,
+                               orig_df: pd.DataFrame,
+                               mod_col: str = "parsed_module",
+                               text_col: str = "parsed_description",
+                               build_col: str = "Build#",
+                               history_builds: int = 5) -> "pd.DataFrame | None":
+    """
+    Classify each recent bug into a QA category (BUG_CATEGORIES) and scale
+    the distribution by the ML-model total prediction to produce expected
+    per-category counts for the next build.
+
+    Parameters
+    ----------
+    latest_preds   : DataFrame with [module, predicted] from train_predict()
+    orig_df        : raw bug-level DataFrame with parsed_description
+    history_builds : number of most recent builds to use for the distribution
+
+    Returns
+    -------
+    DataFrame: module, category, historical_count, historical_pct, expected_next_build
+    Sorted by module, then expected_next_build descending.
+    Returns None if parsed_description is absent or no data can be built.
+    """
+    if text_col not in orig_df.columns or mod_col not in orig_df.columns:
+        print(f"  NOTE: '{text_col}' not found — skipping category breakdown prediction.")
+        return None
+
+    working = orig_df.copy()
+    working[build_col] = pd.to_numeric(working[build_col], errors="coerce")
+    working = working.dropna(subset=[build_col, mod_col])
+    working = working[working[text_col].notna()]
+    working[build_col] = working[build_col].astype(int)
+    working["_bug_category"] = working[text_col].apply(classify_bug_category)
+
+    results = []
+    for _, pred_row in latest_preds.iterrows():
+        mod        = pred_row["module"]
+        pred_total = float(pred_row.get("predicted", 0))
+
+        mod_data = working[working[mod_col] == mod]
+        if len(mod_data) < 3:
+            continue
+
+        recent_builds = sorted(mod_data[build_col].unique())[-history_builds:]
+        recent = mod_data[mod_data[build_col].isin(recent_builds)]
+        if len(recent) == 0:
+            continue
+
+        total_recent = len(recent)
+        for cat, cnt in recent["_bug_category"].value_counts().items():
+            pct = cnt / total_recent
+            results.append({
+                "module": mod,
+                "category": cat,
+                "historical_count": int(cnt),
+                "historical_pct": round(float(pct), 3),
+                "expected_next_build": round(pred_total * pct, 1),
+            })
+
+    if not results:
+        print("  NOTE: No category breakdown could be built (insufficient description data).")
+        return None
+
+    out = pd.DataFrame(results)
+    out = out.sort_values(["module", "expected_next_build"], ascending=[True, False])
+    print(f"  Category breakdown: {len(out)} module×category rows across "
+          f"{out['module'].nunique()} modules.")
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Description sampler  (unchanged from v2.6)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -686,35 +815,44 @@ def _sample_descriptions(orig_df, module, mod_col="parsed_module",
 
 def generate_ai_narrative(module, predicted, risk_level, dominant_bug_type,
                            leading_signal, descriptions, api_key,
-                           cluster_forecast: "dict | None" = None) -> str:
+                           cluster_forecast: "dict | None" = None,
+                           category_forecast: "dict | None" = None) -> str:
     desc_block = "\n".join(f" - {d}" for d in descriptions[:12]) if descriptions \
         else " (no description samples available)"
 
-    # Build a plain-English cluster forecast block if available
-    cluster_block = ""
-    if cluster_forecast:
+    # Build category forecast block (preferred over cluster)
+    type_block = ""
+    if category_forecast:
+        lines = []
+        for cat, pct in list(category_forecast.items())[:6]:
+            lines.append(f"  • {cat} ({pct*100:.0f}% of recent bugs)")
+        type_block = (
+            "\n\nExpected bug category distribution for next build "
+            f"(risk level: {risk_level}):\n" + "\n".join(lines)
+        )
+    elif cluster_forecast:
         lines = []
         for label, count in list(cluster_forecast.items())[:5]:
-            lines.append(f"  • ~{count:.0f} bugs expected in theme: '{label}'")
-        cluster_block = (
-            "\n\nExpected bug-type breakdown for next build:\n" + "\n".join(lines)
+            lines.append(f"  • '{label}'")
+        type_block = (
+            "\n\nExpected bug themes for next build:\n" + "\n".join(lines)
         )
 
     prompt = (
         f"You are a QA lead writing a pre-build risk briefing for your team.\n\n"
         f"Module: {module}\n"
-        f"Predicted bugs next build: {predicted:.0f}\n"
         f"Risk level: {risk_level}\n"
         f"Dominant bug type historically: {dominant_bug_type}\n"
         f"Strongest predictive signal: {leading_signal}"
-        f"{cluster_block}\n\n"
+        f"{type_block}\n\n"
         f"Sample of recent bug descriptions for this module:\n{desc_block}\n\n"
         f"Write a concise 3-5 sentence paragraph that:\n"
-        f"1. States clearly why this module is high risk next build.\n"
-        f"2. Describes the specific kinds of issues to expect — use the "
-        f"expected bug-type breakdown above if present.\n"
-        f"3. Gives concrete, actionable testing advice (what flows/scenarios to prioritise).\n\n"
-        f"Be specific and direct. Plain prose only. No bullet points. No headers."
+        f"1. Describes WHAT specific types of bugs are most likely to appear "
+        f"(use the category distribution above — name the categories).\n"
+        f"2. Identifies which features, flows, or scenarios to prioritise in testing.\n"
+        f"3. Highlights any recurring patterns visible in the recent descriptions.\n\n"
+        f"Do NOT state or estimate a total bug count. Focus on WHAT will break, "
+        f"not how many bugs. Be specific and direct. Plain prose only. No bullet points. No headers."
     )
     payload = json.dumps({
         "model": "claude-sonnet-4-20250514",
@@ -744,34 +882,43 @@ def generate_ai_narrative(module, predicted, risk_level, dominant_bug_type,
 
 def generate_ai_narrative_ollama(module, predicted, risk_level, dominant_bug_type,
                                   leading_signal, descriptions, model="llama3.1",
-                                  cluster_forecast: "dict | None" = None) -> str:
+                                  cluster_forecast: "dict | None" = None,
+                                  category_forecast: "dict | None" = None) -> str:
     desc_block = "\n".join(f" - {d}" for d in descriptions[:12]) if descriptions \
         else " (no description samples available)"
 
-    cluster_block = ""
-    if cluster_forecast:
+    type_block = ""
+    if category_forecast:
+        lines = []
+        for cat, pct in list(category_forecast.items())[:6]:
+            lines.append(f"  • {cat} ({pct*100:.0f}% of recent bugs)")
+        type_block = (
+            "\n\nExpected bug category distribution for next build "
+            f"(risk level: {risk_level}):\n" + "\n".join(lines)
+        )
+    elif cluster_forecast:
         lines = []
         for label, count in list(cluster_forecast.items())[:5]:
-            lines.append(f"  • ~{count:.0f} bugs expected in theme: '{label}'")
-        cluster_block = (
-            "\n\nExpected bug-type breakdown for next build:\n" + "\n".join(lines)
+            lines.append(f"  • '{label}'")
+        type_block = (
+            "\n\nExpected bug themes for next build:\n" + "\n".join(lines)
         )
 
     prompt = (
         f"You are a QA lead writing a pre-build risk briefing for your team.\n\n"
         f"Module: {module}\n"
-        f"Predicted bugs next build: {predicted:.0f}\n"
         f"Risk level: {risk_level}\n"
         f"Dominant bug type historically: {dominant_bug_type}\n"
         f"Strongest predictive signal: {leading_signal}"
-        f"{cluster_block}\n\n"
+        f"{type_block}\n\n"
         f"Sample of recent bug descriptions for this module:\n{desc_block}\n\n"
         f"Write a concise 3-5 sentence paragraph that:\n"
-        f"1. States clearly why this module is high risk next build.\n"
-        f"2. Describes the specific kinds of issues to expect — use the "
-        f"expected bug-type breakdown above if present.\n"
-        f"3. Gives concrete, actionable testing advice (what flows/scenarios to prioritise).\n\n"
-        f"Be specific and direct. Plain prose only. No bullet points. No headers."
+        f"1. Describes WHAT specific types of bugs are most likely to appear "
+        f"(use the category distribution above — name the categories).\n"
+        f"2. Identifies which features, flows, or scenarios to prioritise in testing.\n"
+        f"3. Highlights any recurring patterns visible in the recent descriptions.\n\n"
+        f"Do NOT state or estimate a total bug count. Focus on WHAT will break, "
+        f"not how many bugs. Be specific and direct. Plain prose only. No bullet points. No headers."
     )
     payload = json.dumps({
         "model": model,
@@ -799,12 +946,13 @@ def generate_ai_narrative_ollama(module, predicted, risk_level, dominant_bug_typ
 def generate_focus_summary(preds, leading, orig_df,
                             mod_col="parsed_module", top_n=8,
                             api_key="", provider="none", model="llama3.1",
-                            cluster_preds_df: "pd.DataFrame | None" = None) -> str:
+                            cluster_preds_df: "pd.DataFrame | None" = None,
+                            category_preds_df: "pd.DataFrame | None" = None) -> str:
     lines = [
         "=" * 78,
         " PDR-I DEFECT PREDICTION — FOCUS SUMMARY FOR NEXT BUILD",
         "=" * 78, "",
-        " Modules ranked by predicted bug count.", "",
+        " Modules ranked by risk level. Category breakdown shows WHAT bugs to expect.", "",
     ]
 
     dom_type_series = preds.set_index("module").get(
@@ -844,9 +992,18 @@ def generate_focus_summary(preds, leading, orig_df,
                             best_corr, best_col = r, fc
                 mod_feat_label = _FEATURE_LABELS.get(best_col, best_col)
 
-        # Build cluster_forecast dict for this module if available
+        # Build category_forecast dict for this module (preferred)
+        category_forecast = None
+        if category_preds_df is not None and not category_preds_df.empty:
+            mod_cats = category_preds_df[category_preds_df["module"] == mod].head(6)
+            if not mod_cats.empty:
+                category_forecast = dict(
+                    zip(mod_cats["category"], mod_cats["historical_pct"])
+                )
+
+        # Fall back to cluster_forecast if no category data
         cluster_forecast = None
-        if cluster_preds_df is not None and not cluster_preds_df.empty:
+        if category_forecast is None and cluster_preds_df is not None and not cluster_preds_df.empty:
             mod_clusters = cluster_preds_df[cluster_preds_df["module"] == mod].head(5)
             if not mod_clusters.empty:
                 cluster_forecast = dict(
@@ -855,11 +1012,17 @@ def generate_focus_summary(preds, leading, orig_df,
                 )
 
         lines.append(f"  {'─' * 74}")
-        lines.append(f"  📍 {mod} → predicted {pred:.0f} bugs [{rl}]")
-        if cluster_forecast:
-            lines.append(f"     Bug type breakdown:")
+        lines.append(f"  📍 {mod}  [{rl} risk]")
+        lines.append(f"     Leading signal : {mod_feat_label}")
+
+        if category_forecast:
+            lines.append(f"     Expected bug categories (from recent history):")
+            for cat, pct in list(category_forecast.items())[:4]:
+                lines.append(f"       • {cat} ({pct*100:.0f}%)")
+        elif cluster_forecast:
+            lines.append(f"     Expected bug themes:")
             for lbl, cnt in list(cluster_forecast.items())[:4]:
-                lines.append(f"       • ~{cnt:.0f}  {lbl}")
+                lines.append(f"       • {lbl}")
 
         if provider == "ollama":
             descriptions = _sample_descriptions(orig_df, mod, mod_col=mod_col)
@@ -868,6 +1031,7 @@ def generate_focus_summary(preds, leading, orig_df,
                 dominant_bug_type=dtype, leading_signal=mod_feat_label,
                 descriptions=descriptions, model=model,
                 cluster_forecast=cluster_forecast,
+                category_forecast=category_forecast,
             )
             for narrative_line in narrative.splitlines():
                 lines.append(f"  {narrative_line}")
@@ -879,6 +1043,7 @@ def generate_focus_summary(preds, leading, orig_df,
                 dominant_bug_type=dtype, leading_signal=mod_feat_label,
                 descriptions=descriptions, api_key=api_key,
                 cluster_forecast=cluster_forecast,
+                category_forecast=category_forecast,
             )
             for narrative_line in narrative.splitlines():
                 lines.append(f"  {narrative_line}")
@@ -1020,7 +1185,7 @@ def main():
     display_cols = [c for c in display_cols if c in preds.columns]
     print(preds[display_cols].head(20).to_string(index=False))
 
-    # ── Bug-type prediction (Change 13) ───────────────────────────────────────
+    # ── Bug-type prediction (Change 13 — cluster-based) ──────────────────────
     cluster_preds_df = None
     cluster_csv_for_type = cluster_csv_path
     if cluster_csv_for_type is None:
@@ -1037,6 +1202,15 @@ def main():
             print(f"  Bug-type predictions saved → {by_cluster_path}")
             print(f"  ({len(cluster_preds_df)} module×cluster rows)")
 
+    # ── Change 15 — QA category breakdown prediction (always runs) ───────────
+    print("\nBuilding QA category breakdown predictions …")
+    category_preds_df = predict_category_breakdown(preds, orig_df)
+    if category_preds_df is not None:
+        by_category_path = str(out_stem) + "_predictions_by_category.csv"
+        category_preds_df.to_csv(by_category_path, index=False, encoding="utf-8-sig")
+        print(f"  Category predictions saved → {by_category_path}")
+        print(f"  ({len(category_preds_df)} module×category rows)")
+
     # ── Focus summary ─────────────────────────────────────────────────────────
     use_ai = provider in ("claude", "ollama")
     print(f"\nGenerating focus summary (provider={provider})...")
@@ -1045,6 +1219,7 @@ def main():
         top_n=8, api_key=api_key,
         provider=provider, model=model,
         cluster_preds_df=cluster_preds_df,
+        category_preds_df=category_preds_df,
     )
     print("\n" + summary_text)
 
@@ -1059,9 +1234,17 @@ def main():
             row = preds[preds["module"] == mod].iloc[0]
             descriptions = _sample_descriptions(orig_df, mod)
 
-            # Build cluster_forecast for this module
+            # Build category_forecast for this module (preferred)
+            category_forecast = None
+            if category_preds_df is not None and not category_preds_df.empty:
+                mod_cats = category_preds_df[category_preds_df["module"] == mod].head(6)
+                if not mod_cats.empty:
+                    category_forecast = dict(
+                        zip(mod_cats["category"], mod_cats["historical_pct"]))
+
+            # Fall back to cluster_forecast
             cluster_forecast = None
-            if cluster_preds_df is not None and not cluster_preds_df.empty:
+            if category_forecast is None and cluster_preds_df is not None and not cluster_preds_df.empty:
                 mod_c = cluster_preds_df[cluster_preds_df["module"] == mod].head(5)
                 if not mod_c.empty:
                     cluster_forecast = dict(
@@ -1075,6 +1258,7 @@ def main():
                 leading_signal=str(row.get("leading_signal", "")),
                 descriptions=descriptions,
                 cluster_forecast=cluster_forecast,
+                category_forecast=category_forecast,
             )
             if provider == "ollama":
                 narrative = generate_ai_narrative_ollama(**kwargs, model=model)
@@ -1101,6 +1285,8 @@ def main():
 
     print(f"\nOutputs:")
     print(f"  {out}              ← main predictions (includes ai_narrative)")
+    if category_preds_df is not None:
+        print(f"  {out_stem}_predictions_by_category.csv ← expected bug categories per module")
     if cluster_preds_df is not None:
         print(f"  {out_stem}_predictions_by_cluster.csv  ← bug-type forecast per cluster")
     print(f"  {imp_path}         ← model feature importances")
