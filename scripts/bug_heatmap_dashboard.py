@@ -2248,16 +2248,18 @@ Use this to know what kind of regression testing to prioritise — not how many 
 
 ### 🚦 Risk Level Thresholds
 
-The ML count model classifies modules into risk levels used for prioritisation only:
+Risk levels are **percentile-based** within each prediction run, so they always produce a meaningful spread regardless of absolute bug counts:
 
-| Level | Signal | What to do |
-|-------|--------|------------|
-| 🔴 **Critical** | High historical bug volume | Test **every build** |
-| 🟠 **High** | Moderate-high historical volume | Test **every sprint** |
-| 🟡 **Medium** | Occasional bugs | Include in **release-candidate** pass |
-| 🟢 **Low** | Low historical volume | **Standard release cycle** coverage |
+| Level | Percentile | What to do |
+|-------|-----------|------------|
+| 🔴 **Critical** | Top 5% of predicted counts | Test **every build** |
+| 🟠 **High** | 85th–95th percentile | Test **every sprint** |
+| 🟡 **Medium** | 60th–85th percentile | Include in **release-candidate** pass |
+| 🟢 **Low** | Below 60th percentile | **Standard release cycle** coverage |
 
-> Bug count thresholds are internal signals. The actionable output is the *scenario list*, not the count.
+> Risk levels rank modules *relative to each other* — they are not absolute bug-count bands.
+> A "Critical" module in a low-bug dataset may predict fewer bugs than a "Medium" module in a high-bug dataset.
+> Use the scenario predictions for the actual test targets.
 
 ---
 

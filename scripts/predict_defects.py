@@ -1456,16 +1456,38 @@ def main():
     model_obj, preds, imp, leading = train_predict(fdf, orig_df)
 
     preds = preds.sort_values("predicted", ascending=False)
-    preds["risk_level"] = pd.cut(
-        preds["predicted"],
-        bins=[-1, 2, 5, 10, float("inf")],
-        labels=["Low", "Medium", "High", "Critical"],
-    )
+
+    # Percentile-based risk levels so the distribution is always meaningful
+    # regardless of whether average bug counts are 1-5 or 10-50 per build.
+    #   Critical : top 5%  (~1-7 modules in a 131-module dataset)
+    #   High     : next 10% (85th–95th percentile)
+    #   Medium   : next 25% (60th–85th percentile)
+    #   Low      : bottom 60%
+    # Absolute-count floors ensure a module never reaches Critical/High on
+    # noise (predicted < 1 is always Low regardless of percentile rank).
+    _p95 = float(preds["predicted"].quantile(0.95))
+    _p85 = float(preds["predicted"].quantile(0.85))
+    _p60 = float(preds["predicted"].quantile(0.60))
+
+    def _assign_risk(val: float) -> str:
+        if val < 1.0:
+            return "Low"
+        if val >= _p95:
+            return "Critical"
+        if val >= _p85:
+            return "High"
+        if val >= _p60:
+            return "Medium"
+        return "Low"
+
+    preds["risk_level"] = preds["predicted"].apply(_assign_risk)
 
     print("\n" + "─" * 78)
     print(" PREDICTED BUG COUNT — next build estimate per module")
     print(" target = actual bugs in most recent build | predicted = next build forecast")
-    print(" risk_level thresholds: Low <3 | Medium 3-5 | High 6-10 | Critical >10")
+    print(f" risk_level thresholds (percentile): "
+          f"Critical ≥p95 ({_p95:.1f}), High ≥p85 ({_p85:.1f}), "
+          f"Medium ≥p60 ({_p60:.1f}), Low <p60")
     print("─" * 78)
     display_cols = ["module", "target", "predicted", "risk_level",
                     "dominant_bug_type", "leading_signal"]
