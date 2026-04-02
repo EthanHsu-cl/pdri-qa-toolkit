@@ -1,36 +1,27 @@
 #!/usr/bin/env python3
-"""PDR-I Defect Prediction v4.0
+"""PDR-I Defect Prediction v5.0
 
-Changes from v3.0
+Changes from v4.0
 ─────────────────
-Change 15 — QA category classification (always on, no extra CSV needed)
-• BUG_CATEGORIES dict maps six QA-meaningful category names to keyword lists.
-• classify_bug_category(text) assigns each bug description to a category.
-• predict_category_breakdown() computes per-module category distributions from
-  the last N builds and scales them by the ML-model total to produce expected
-  counts per category for the next build.
-  Output: data/predictions/<stem>_predictions_by_category.csv with columns:
-      module, category, historical_count, historical_pct, expected_next_build
+Change 18 — Scenario-first prediction output (primary forecast artifact)
+• generate_bug_scenarios_heuristic() extracts recurring bug patterns per module
+  and formats them as concrete, testable scenario statements without AI.
+• generate_bug_scenarios_ollama() uses a local Ollama model (e.g. llama3.1) to
+  generate specific, feature-level bug scenarios from recent descriptions.
+• generate_bug_scenarios() orchestrates both paths: Ollama when provider=ollama,
+  heuristic otherwise.
+• Output: data/predictions/<stem>_predictions_by_scenario.csv with columns:
+      module, risk_level, predicted_build, scenario_rank, scenario_text,
+      source_bug_examples, supporting_categories, leading_signal, confidence
+• The ML count prediction is retained as an internal ranking/prioritisation
+  signal but is no longer the primary user-facing output.
 
-Change 16 — AI narrative re-focused on "what" not "how many"
-• generate_ai_narrative() and generate_ai_narrative_ollama() now receive the
-  category_forecast dict (from predict_category_breakdown) instead of the raw
-  predicted count as the headline.
-• The prompt explicitly asks the AI to describe WHAT types of bugs to expect and
-  which flows to prioritise — NOT to state or re-derive a total count.
-• This eliminates the mismatch between the AI Risk Briefing text and the
-  Predicted Bug Count chart (which always shows the ML model's prediction).
-
-Change 17 — Focus summary shows category breakdown
-• generate_focus_summary() uses category_preds_df for per-module breakdowns.
-• Each module entry now lists its top expected bug categories instead of a
-  raw count.
-
-All other behaviour is unchanged from v3.0.
+All v4.0 behaviour (category breakdown, focus summary, narratives) unchanged.
 
 Output paths:
   data/predictions/<stem>_predictions.csv
-  data/predictions/<stem>_predictions_by_category.csv  ← NEW (always)
+  data/predictions/<stem>_predictions_by_scenario.csv  ← NEW (always, primary)
+  data/predictions/<stem>_predictions_by_category.csv
   data/predictions/<stem>_predictions_by_cluster.csv   (when --cluster-csv given)
   data/predictions/<stem>_predictions_importance.csv
   data/predictions/<stem>_predictions_leading_indicators.csv
@@ -810,6 +801,302 @@ def _sample_descriptions(orig_df, module, mod_col="parsed_module",
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Change 18 — Bug scenario generation (second-stage, scenario-first output)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _dedupe_descriptions(descs: list, max_n: int = 5, min_len: int = 20) -> list:
+    """Return up to max_n descriptions with near-duplicates removed.
+
+    Deduplication uses word-overlap ratio: two descriptions sharing > 65% of
+    their words (Jaccard on split tokens) are considered duplicates; only the
+    first one is kept.
+    """
+    seen_tokens: list = []
+    out: list = []
+    for d in descs:
+        d = str(d).strip()
+        if len(d) < min_len:
+            continue
+        tokens = set(d.lower().split())
+        is_dup = any(
+            len(tokens & s) / max(len(tokens | s), 1) > 0.65
+            for s in seen_tokens
+        )
+        if not is_dup:
+            seen_tokens.append(tokens)
+            out.append(d)
+        if len(out) >= max_n:
+            break
+    return out
+
+
+def generate_bug_scenarios_heuristic(
+    module: str,
+    risk_level: str,
+    leading_signal: str,
+    orig_df: pd.DataFrame,
+    category_forecast: "dict | None" = None,
+    mod_col: str = "parsed_module",
+    text_col: str = "parsed_description",
+    build_col: str = "Build#",
+    history_builds: int = 8,
+    max_scenarios: int = 5,
+) -> list:
+    """Generate scenario predictions by surfacing recurring bug patterns.
+
+    For each QA category (ordered by recent frequency), finds the most
+    recurring description pattern within that category and formats it as a
+    concrete, testable scenario statement.
+
+    Returns a list of dicts matching predictions_by_scenario.csv columns.
+    """
+    if text_col not in orig_df.columns:
+        return []
+    working = orig_df[orig_df[mod_col] == module].copy()
+    if len(working) < 3:
+        return []
+    working[build_col] = pd.to_numeric(working[build_col], errors="coerce")
+    working = working.dropna(subset=[build_col, text_col])
+    working[build_col] = working[build_col].astype(int)
+    working["_cat"] = working[text_col].apply(classify_bug_category)
+
+    recent_builds = sorted(working[build_col].unique())[-history_builds:]
+    recent = working[working[build_col].isin(recent_builds)]
+    if recent.empty:
+        return []
+
+    scenarios: list = []
+    rank = 1
+    for cat, total_in_cat in recent["_cat"].value_counts().items():
+        if rank > max_scenarios:
+            break
+        cat_bugs_raw = recent[recent["_cat"] == cat][text_col].dropna().tolist()
+        if not cat_bugs_raw:
+            continue
+
+        # Group by first-12-words key to find the most recurring description.
+        freq: dict = {}
+        canonical: dict = {}
+        for desc in cat_bugs_raw:
+            d = str(desc).strip()
+            if len(d) < 15:
+                continue
+            key = " ".join(d.lower().split()[:12])
+            if key not in canonical:
+                canonical[key] = d
+            freq[key] = freq.get(key, 0) + 1
+
+        if freq:
+            top_key = max(freq, key=lambda k: freq[k])
+            representative = canonical[top_key]
+            top_freq = freq[top_key]
+        else:
+            representative = cat_bugs_raw[0]
+            top_freq = 1
+
+        source_examples = _dedupe_descriptions(cat_bugs_raw, max_n=2)
+
+        if top_freq >= 5 or total_in_cat >= 12:
+            confidence = "High"
+        elif top_freq >= 2 or total_in_cat >= 4:
+            confidence = "Medium"
+        else:
+            confidence = "Low"
+
+        scenarios.append({
+            "module":                module,
+            "risk_level":            risk_level,
+            "predicted_build":       "next",
+            "scenario_rank":         rank,
+            "scenario_text":         f"[{cat}] {module}: {representative}",
+            "source_bug_examples":   " | ".join(source_examples),
+            "supporting_categories": cat,
+            "leading_signal":        leading_signal,
+            "confidence":            confidence,
+        })
+        rank += 1
+
+    return scenarios
+
+
+def generate_bug_scenarios_ollama(
+    module: str,
+    risk_level: str,
+    leading_signal: str,
+    descriptions: list,
+    category_forecast: "dict | None",
+    model: str = "llama3.1",
+    max_scenarios: int = 5,
+) -> list:
+    """Use a local Ollama model to generate concrete, testable bug scenarios.
+
+    The prompt explicitly forbids vague/count-based language and requires
+    scenarios to be specific to a feature, user action, and visible symptom.
+
+    Returns a list of scenario text strings (not dicts); caller wraps in dicts.
+    """
+    if not descriptions:
+        return []
+
+    desc_block = "\n".join(f"  {i+1}. {d}" for i, d in enumerate(descriptions[:15]))
+    if category_forecast:
+        cat_block = "\n".join(
+            f"  • {cat} ({pct * 100:.0f}% of recent bugs)"
+            for cat, pct in list(category_forecast.items())[:6]
+        )
+    else:
+        cat_block = "  (not available)"
+
+    prompt = (
+        f"You are a QA engineer predicting the most likely bugs for the next release.\n\n"
+        f"Module: {module}\n"
+        f"Risk level: {risk_level}\n"
+        f"Leading risk signal: {leading_signal}\n"
+        f"Recent bug category distribution:\n{cat_block}\n\n"
+        f"Recent bug descriptions from this module (actual past bugs):\n{desc_block}\n\n"
+        f"Task: Write exactly {max_scenarios} numbered bug scenario statements that are "
+        f"most likely to occur in the next build, based on recurring patterns above.\n\n"
+        f"Requirements:\n"
+        f"- Each statement must follow this format exactly: "
+        f"[Category] {module}: <specific feature or flow> <specific failure mode or symptom>\n"
+        f"- Base ONLY on patterns visible in the bug descriptions provided above.\n"
+        f"- Be specific: name the feature, the user action, and the visible failure.\n"
+        f"- Do NOT say 'may', 'might', 'could', or other uncertain language.\n"
+        f"- Do NOT mention bug counts or numbers.\n"
+        f"- Do NOT add explanations or commentary — output ONLY the numbered list.\n\n"
+        f"Valid categories: Crash / Stability | Feature not working as intended | "
+        f"UI / Display problem | UX / Usability problem | Translation / Localization | "
+        f"Data / File / Sync issue\n\n"
+        f"Example output format:\n"
+        f"1. [UI / Display problem] {module}: Text label is truncated with '...' "
+        f"when the string exceeds the container width\n"
+        f"2. [Feature not working as intended] {module}: Export fails silently when "
+        f"project contains clips longer than 30 seconds\n"
+    )
+    payload = json.dumps({
+        "model":   model,
+        "prompt":  prompt,
+        "stream":  False,
+        "options": {"temperature": 0.2, "num_predict": 700},
+    }).encode()
+    req = urllib.request.Request(
+        f"{OLLAMA_BASE}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            raw  = json.loads(resp.read().decode())
+            text = raw.get("response", "").strip()
+            scenarios = []
+            for line in text.splitlines():
+                line = line.strip()
+                m = re.match(r"^\d+[.)]\s+(.+)$", line)
+                if m:
+                    scenarios.append(m.group(1).strip())
+            return scenarios[:max_scenarios]
+    except Exception as e:
+        print(f"    Ollama scenario generation failed for {module} (model={model}): {e}")
+        return []
+
+
+def generate_bug_scenarios(
+    preds: pd.DataFrame,
+    orig_df: pd.DataFrame,
+    provider: str = "none",
+    model: str = "llama3.1",
+    category_preds_df: "pd.DataFrame | None" = None,
+    mod_col: str = "parsed_module",
+    top_n: int = 10,
+) -> "pd.DataFrame | None":
+    """Second-stage scenario generation: produce a ranked list of likely bug
+    scenarios for each high-risk module.
+
+    Uses Ollama when provider='ollama', heuristic pattern extraction otherwise.
+    The ML count prediction (preds["predicted"]) is used only to prioritise
+    which modules receive scenario generation — not as the final output.
+
+    Returns a DataFrame with columns:
+        module, risk_level, predicted_build, scenario_rank, scenario_text,
+        source_bug_examples, supporting_categories, leading_signal, confidence
+    Or None if no scenarios could be generated.
+    """
+    target = preds[preds["risk_level"].isin(["Critical", "High"])].head(top_n)
+    if target.empty:
+        target = preds.head(min(top_n, len(preds)))
+
+    all_rows: list = []
+    for _, row in target.iterrows():
+        mod            = str(row["module"])
+        rl             = str(row.get("risk_level", "Medium"))
+        leading_signal = str(row.get("leading_signal", "recent bug momentum"))
+
+        category_forecast: "dict | None" = None
+        if category_preds_df is not None and not category_preds_df.empty:
+            mc = category_preds_df[category_preds_df["module"] == mod].head(6)
+            if not mc.empty:
+                category_forecast = dict(zip(mc["category"], mc["historical_pct"]))
+
+        if provider == "ollama":
+            descriptions = _sample_descriptions(orig_df, mod, mod_col=mod_col, n=15)
+            ai_texts = generate_bug_scenarios_ollama(
+                module=mod, risk_level=rl, leading_signal=leading_signal,
+                descriptions=descriptions, category_forecast=category_forecast,
+                model=model,
+            )
+            if ai_texts:
+                working = orig_df[orig_df[mod_col] == mod].copy()
+                text_col = "parsed_description" if "parsed_description" in working.columns else None
+                if text_col and "Build#" in working.columns:
+                    working["_b"] = pd.to_numeric(working["Build#"], errors="coerce")
+                    working = working.dropna(subset=["_b"])
+                    working["_b"] = working["_b"].astype(int)
+                    recent_builds = sorted(working["_b"].unique())[-8:]
+                    working = working[working["_b"].isin(recent_builds)]
+                    working["_cat"] = working[text_col].apply(classify_bug_category)
+
+                for rank, scenario_text in enumerate(ai_texts, start=1):
+                    inferred_cat = classify_bug_category(scenario_text)
+                    source_str = ""
+                    if text_col and "_cat" in working.columns:
+                        matching = working[working["_cat"] == inferred_cat][text_col].dropna().tolist()
+                        sources  = _dedupe_descriptions(matching, max_n=2)
+                        source_str = " | ".join(sources)
+                    all_rows.append({
+                        "module":                mod,
+                        "risk_level":            rl,
+                        "predicted_build":       "next",
+                        "scenario_rank":         rank,
+                        "scenario_text":         scenario_text,
+                        "source_bug_examples":   source_str,
+                        "supporting_categories": inferred_cat,
+                        "leading_signal":        leading_signal,
+                        "confidence":            "Medium",
+                    })
+                continue  # Skip heuristic for this module
+
+        # Heuristic fallback
+        heuristic_rows = generate_bug_scenarios_heuristic(
+            module=mod, risk_level=rl, leading_signal=leading_signal,
+            orig_df=orig_df, category_forecast=category_forecast,
+            mod_col=mod_col,
+        )
+        all_rows.extend(heuristic_rows)
+
+    if not all_rows:
+        print("  NOTE: No bug scenarios could be generated (insufficient description data).")
+        return None
+
+    out = pd.DataFrame(all_rows)
+    out = out.sort_values(["module", "scenario_rank"]).reset_index(drop=True)
+    print(
+        f"  Bug scenario predictions: {len(out)} scenarios across "
+        f"{out['module'].nunique()} modules."
+    )
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # AI narrative — Claude  (updated for v3.0 cluster_forecast param)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1211,6 +1498,20 @@ def main():
         print(f"  Category predictions saved → {by_category_path}")
         print(f"  ({len(category_preds_df)} module×category rows)")
 
+    # ── Change 18 — Bug scenario generation (second-stage, primary output) ───
+    print("\nGenerating bug scenario predictions …")
+    scenario_preds_df = generate_bug_scenarios(
+        preds, orig_df,
+        provider=provider, model=model,
+        category_preds_df=category_preds_df,
+    )
+    if scenario_preds_df is not None:
+        by_scenario_path = str(out_stem) + "_predictions_by_scenario.csv"
+        scenario_preds_df.to_csv(by_scenario_path, index=False, encoding="utf-8-sig")
+        print(f"  Scenario predictions saved → {by_scenario_path}")
+        print(f"  ({len(scenario_preds_df)} scenarios across "
+              f"{scenario_preds_df['module'].nunique()} modules)")
+
     # ── Focus summary ─────────────────────────────────────────────────────────
     use_ai = provider in ("claude", "ollama")
     print(f"\nGenerating focus summary (provider={provider})...")
@@ -1285,6 +1586,8 @@ def main():
 
     print(f"\nOutputs:")
     print(f"  {out}              ← main predictions (includes ai_narrative)")
+    if scenario_preds_df is not None:
+        print(f"  {out_stem}_predictions_by_scenario.csv ← ranked bug scenarios per module  [PRIMARY]")
     if category_preds_df is not None:
         print(f"  {out_stem}_predictions_by_category.csv ← expected bug categories per module")
     if cluster_preds_df is not None:
