@@ -1,0 +1,271 @@
+{
+  "name": "(Dashboard) Query eBug List_v3",
+  "nodes": [
+    {
+      "parameters": {
+        "fieldToSplitOut": "results",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        416,
+        288
+      ],
+      "id": "70572a50-7aa6-46f0-8572-c41cdd9e9008",
+      "name": "Split Out"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "82746bb5-e140-4720-98a3-d1965900274d-v3",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -144,
+        288
+      ],
+      "id": "6dedbd50-49b0-4d8b-999c-0377ce4256ec",
+      "name": "Webhook",
+      "webhookId": "82746bb5-e140-4720-98a3-d1965900274d"
+    },
+    {
+      "parameters": {
+        "respondWith": "allIncomingItems",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        768,
+        288
+      ],
+      "id": "0b2b4051-8293-48d8-bd83-d649758df6d7",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "dca7640e-bf61-4294-be46-a2e112b9f111",
+      "name": "When clicking 'Execute workflow'"
+    },
+    {
+      "parameters": {
+        "operation": "GetMany",
+        "queryPayload": "={\n  \"queryModel\": \"TSR.EbugSearch\",\n  \"pageSize\": 50000,\n  \"pageIndex\": 1,\n  \"isDesc\": true,\n  \"sortBy\": \"CreateTime\",\n  \"conditions\": [\n    {\n      \"field\": \"CreateTime\",\n      \"range\": {\n        \"gte\": \"{{ $now.minus(3,'year').format('yyyy-MM-dd') }} 00:00:00\",\n        \"lte\": \"{{ $now.format('yyyy-MM-dd HH:mm:ss') }}\"\n      }\n    },\n    {\n      \"field\": \"IsValid\",\n      \"termNot\": {\n        \"query\": \"false\"\n      }\n    },\n    {\n      \"field\": \"ProductName\",\n      \"term\": {\n        \"querys\": [\"PowerDirector Mobile for iOS\"]\n      }\n    }\n  ]\n}"
+      },
+      "type": "CUSTOM.eCL eBug",
+      "typeVersion": 1,
+      "position": [
+        144,
+        288
+      ],
+      "id": "95f328f4-be83-42b1-81be-d002f18f0ca3",
+      "name": "Get many eBugs_All Products",
+      "credentials": {
+        "eExpenseApi": {
+          "id": "edMebIct1x35zHDJ",
+          "name": "eCL Key account 79"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "4d042e0b-6af2-4485-a012-bccc9ff3aaa0",
+              "name": "BugCode",
+              "value": "={{ $json.BugCode }}",
+              "type": "string"
+            },
+            {
+              "id": "ed79bdd4-5685-4bfd-ba77-deaa441fab08",
+              "name": "Priority",
+              "value": "={{ $json.EbugPriority }}",
+              "type": "string"
+            },
+            {
+              "id": "9c8d6a26-5087-42a8-b16a-d70701912079",
+              "name": "Severity",
+              "value": "={{ $json.EbugSeverity }}",
+              "type": "string"
+            },
+            {
+              "id": "2b864bc0-32ed-4411-9c77-984f4345eeb4",
+              "name": "ProductName",
+              "value": "={{ $json.ProductName }}",
+              "type": "string"
+            },
+            {
+              "id": "68279a5a-d365-463f-834e-907c14e6df0e",
+              "name": "Create Date",
+              "value": "={{ $json.CreateTime }}",
+              "type": "string"
+            },
+            {
+              "id": "0c3632a9-3d24-47f0-89b7-202044ce20ea",
+              "name": "Closed Date",
+              "value": "={{ $json.CloseTime }}",
+              "type": "string"
+            },
+            {
+              "id": "d6ed94f2-bdf0-4749-b02e-d887d3c37ac1",
+              "name": "BugBelong",
+              "value": "={{ $json.BugBelong }}",
+              "type": "string"
+            },
+            {
+              "id": "da49d97b-fa3a-4a9e-b0a8-0bcf9646bcad",
+              "name": "Status",
+              "value": "={{ $json.Status }}",
+              "type": "string"
+            },
+            {
+              "id": "6c64f803-667e-439b-bf0a-2f65aa7f4ad7",
+              "name": "Short Description",
+              "value": "={{ $json.ShortDescription }}",
+              "type": "string"
+            },
+            {
+              "id": "64db81e4-e064-432b-8369-93b2231ea9f8",
+              "name": "Version",
+              "value": "={{ $json.Version }}",
+              "type": "string"
+            },
+            {
+              "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+              "name": "Build#",
+              "value": "={{ $json.Build }}",
+              "type": "string"
+            },
+            {
+              "id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+              "name": "Close Build#",
+              "value": "={{ $json.CloseToBuild }}",
+              "type": "string"
+            },
+            {
+              "id": "c3d4e5f6-a7b8-9012-cdef-123456789012",
+              "name": "Creator",
+              "value": "={{ $json.Creator }}",
+              "type": "string"
+            },
+            {
+              "id": "d4e5f6a7-b8c9-0123-defa-234567890123",
+              "name": "Handler",
+              "value": "={{ $json.Handler }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        592,
+        288
+      ],
+      "id": "bcef2f9a-5175-417a-ad26-46b6b877e9b9",
+      "name": "Get Columns_v3"
+    },
+    {
+      "parameters": {
+        "operation": "GetMany",
+        "queryPayload": "={\n  \"queryModel\": \"TSR.EbugSearch\",\n  \"pageSize\": 15000,\n  \"pageIndex\": 1,\n  \"isDesc\": true,\n  \"sortBy\": \"CreateTime\",\n  \"conditions\": [\n    {\n      \"field\": \"CreateTime\",\n      \"range\": {\n        \"gte\": \"{{ $now.minus(6,'month').format('yyyy-MM-dd') }} 00:00:00\",\n        \"lte\": \"{{ $now.format('yyyy-MM-dd HH:mm:ss') }}\"\n      }\n    },\n    {\n      \"field\": \"IsValid\",\n      \"termNot\": {\n        \"query\": \"false\"\n      }\n    },\n    {\n      \"field\": \"ProductName\",\n      \"term\": {\n        \"querys\": [\"PowerDirector\", \"PhotoDirector\", \"Promeo\", \"PowerDirector Mobile for Android\", \"PowerDirector Mobile for iOS\", \"PhotoDirector Mobile for Android\", \"PhotoDirector Mobile for iOS\"]\n      }\n    }\n  ]\n}"
+      },
+      "type": "CUSTOM.eCL eBug",
+      "typeVersion": 1,
+      "position": [
+        528,
+        592
+      ],
+      "id": "0ae52df1-8ab3-4497-96e7-e64ac5e4cc07",
+      "name": "Get many eBugs - All",
+      "credentials": {
+        "eExpenseApi": {
+          "id": "edMebIct1x35zHDJ",
+          "name": "eCL Key account 79"
+        }
+      }
+    }
+  ],
+  "pinData": {
+    "When clicking 'Execute workflow'": [
+      {
+        "json": {
+          "body": {
+            "product_name": ""
+          }
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Split Out": {
+      "main": [
+        [
+          {
+            "node": "Get Columns_v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Get many eBugs_All Products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get many eBugs_All Products": {
+      "main": [
+        [
+          {
+            "node": "Split Out",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Columns_v3": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "5d7320d2-6e57-42c7-839c-86175cb4687b",
+  "meta": {
+    "instanceId": "e9bed60b3a9169dc966f0ab2014f06e4196f08528b8b81b71c0556b4c3f2c51b"
+  },
+  "id": "HuFuPhpb7Vb5KAy1",
+  "tags": []
+}

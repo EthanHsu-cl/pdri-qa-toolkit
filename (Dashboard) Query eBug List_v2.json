@@ -1,0 +1,433 @@
+{
+  "name": "(Dashboard) Query eBug List_v2",
+  "nodes": [
+    {
+      "parameters": {
+        "fieldToSplitOut": "results",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        624,
+        0
+      ],
+      "id": "6af3bc2a-9c73-4e12-860c-f2258e50624d",
+      "name": "Split Out"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "82746bb5-e140-4720-98a3-d1965900274d",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        64,
+        0
+      ],
+      "id": "cb0e5a6e-4fb3-4719-990f-777b52d8b2e6",
+      "name": "Webhook",
+      "webhookId": "82746bb5-e140-4720-98a3-d1965900274d"
+    },
+    {
+      "parameters": {
+        "respondWith": "allIncomingItems",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        976,
+        0
+      ],
+      "id": "c2569ebe-684b-49d4-b6f3-b179b04e229e",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        208,
+        -288
+      ],
+      "id": "0b3b547e-e195-41a7-8112-d52540ee0b3d",
+      "name": "When clicking ‘Execute workflow’"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "1f4bcb48-fde2-45d0-8ecb-0df21e9750bc",
+              "leftValue": "={{ $json.body.product_name }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        256,
+        0
+      ],
+      "id": "b643a3a3-8a8f-48c2-b44c-dd817a199bd6",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "operation": "GetMany",
+        "queryPayload": "={\n  \"queryModel\": \"TSR.EbugSearch\",\n  \"pageSize\": 50000,\n  \"pageIndex\": 1,\n  \"isDesc\": true,\n  \"sortBy\": \"CreateTime\",\n  \"conditions\": [\n    {\n      \"field\": \"CreateTime\",\n      \"range\": {\n        \"gte\": \"{{ $now.minus(8,'month').format('yyyy-MM-dd') }} 00:00:00\",\n        \"lte\": \"{{ $now.format('yyyy-MM-dd HH:mm:ss') }}\"\n      }\n    },\n    {\n      \"field\": \"IsValid\",\n      \"termNot\": {\n        \"query\": \"false\"\n      }\n    },\n    {\n      \"field\": \"ProductName\",\n      \"term\": {\n        \"querys\": [\"PowerDirector\", \"PhotoDirector\", \"Promeo\", \"PowerDirector Mobile for Android\", \"PowerDirector Mobile for iOS\", \"PhotoDirector Mobile for Android\", \"PhotoDirector Mobile for iOS\", \"MyEdit\", \"MyEdit Biz\"]\n      }\n    }\n  ]\n}"
+      },
+      "type": "CUSTOM.eCL eBug",
+      "typeVersion": 1,
+      "position": [
+        448,
+        112
+      ],
+      "id": "70ca14a7-3ec7-423d-a53b-e9ac2a6a3c1c",
+      "name": "Get many eBugs_All Products",
+      "credentials": {
+        "eExpenseApi": {
+          "id": "mqmQP0HX5dELWd65",
+          "name": "ECL Key account 6"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "GetMany",
+        "queryPayload": "={\n  \"queryModel\": \"TSR.EbugSearch\",\n  \"pageSize\": 15000,\n  \"pageIndex\": 1,\n  \"isDesc\": true,\n  \"sortBy\": \"CreateTime\",\n  \"conditions\": [\n    {\n      \"field\": \"CreateTime\",\n      \"range\": {\n        \"gte\": \"{{ $now.minus(3,'month').format('yyyy-MM-dd') }} 07:00:01\",\n        \"lte\": \"{{ $now.format('yyyy-MM-dd') }} 07:00:00\"\n      }\n    },\n    {\n      \"field\": \"IsValid\",\n      \"termNot\": {\n        \"query\": \"false\"\n      }\n    },\n    {\n      \"field\": \"ProductName\",\n      \"term\": {\n        \"query\": \"{{ $json.body.product_name }}\"\n      }\n    }\n  ]\n}"
+      },
+      "type": "CUSTOM.eCL eBug",
+      "typeVersion": 1,
+      "position": [
+        448,
+        -96
+      ],
+      "id": "f4540911-9177-401d-9431-9139e186d948",
+      "name": "Get many eBugs_Specific Product",
+      "credentials": {
+        "eExpenseApi": {
+          "id": "mqmQP0HX5dELWd65",
+          "name": "ECL Key account 6"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "4d042e0b-6af2-4485-a012-bccc9ff3aaa0",
+              "name": "BugCode",
+              "value": "={{ $json.BugCode }}",
+              "type": "string"
+            },
+            {
+              "id": "ed79bdd4-5685-4bfd-ba77-deaa441fab08",
+              "name": "Priority",
+              "value": "={{ $json.EbugPriority }}",
+              "type": "string"
+            },
+            {
+              "id": "9c8d6a26-5087-42a8-b16a-d70701912079",
+              "name": "Severity",
+              "value": "={{ $json.EbugSeverity }}",
+              "type": "string"
+            },
+            {
+              "id": "2b864bc0-32ed-4411-9c77-984f4345eeb4",
+              "name": "ProductName",
+              "value": "={{ $json.ProductName }}",
+              "type": "string"
+            },
+            {
+              "id": "4a0e503a-97d6-44e4-9386-ab7f6dd806ee",
+              "name": "ProjectName",
+              "value": "={{ $json.TemplateName.split($json.ProductName)[1].trim() }}",
+              "type": "string"
+            },
+            {
+              "id": "68279a5a-d365-463f-834e-907c14e6df0e",
+              "name": "CreateTime",
+              "value": "={{ $json.CreateTime }}",
+              "type": "string"
+            },
+            {
+              "id": "9ec8f29a-eda2-4afa-a2e1-0b257b403a8e",
+              "name": "DueDate",
+              "value": "={{ $json.DueDate }}",
+              "type": "string"
+            },
+            {
+              "id": "0c3632a9-3d24-47f0-89b7-202044ce20ea",
+              "name": "CloseTime",
+              "value": "={{ $json.CloseTime }}",
+              "type": "string"
+            },
+            {
+              "id": "d6ed94f2-bdf0-4749-b02e-d887d3c37ac1",
+              "name": "BugBelong",
+              "value": "={{ $json.BugBelong }}",
+              "type": "string"
+            },
+            {
+              "id": "da49d97b-fa3a-4a9e-b0a8-0bcf9646bcad",
+              "name": "Status",
+              "value": "={{ $json.Status }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        800,
+        -288
+      ],
+      "id": "77d90eec-5761-4a92-a47d-94ccb53bfc6b",
+      "name": "Get Columns_Original"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "4d042e0b-6af2-4485-a012-bccc9ff3aaa0",
+              "name": "BugCode",
+              "value": "={{ $json.BugCode }}",
+              "type": "string"
+            },
+            {
+              "id": "ed79bdd4-5685-4bfd-ba77-deaa441fab08",
+              "name": "Priority",
+              "value": "={{ $json.EbugPriority }}",
+              "type": "string"
+            },
+            {
+              "id": "9c8d6a26-5087-42a8-b16a-d70701912079",
+              "name": "Severity",
+              "value": "={{ $json.EbugSeverity }}",
+              "type": "string"
+            },
+            {
+              "id": "2b864bc0-32ed-4411-9c77-984f4345eeb4",
+              "name": "ProductName",
+              "value": "={{ $json.ProductName }}",
+              "type": "string"
+            },
+            {
+              "id": "4a0e503a-97d6-44e4-9386-ab7f6dd806ee",
+              "name": "ProjectName",
+              "value": "={{ $json.TemplateName }}",
+              "type": "string"
+            },
+            {
+              "id": "68279a5a-d365-463f-834e-907c14e6df0e",
+              "name": "CreateTime",
+              "value": "={{ $json.CreateTime }}",
+              "type": "string"
+            },
+            {
+              "id": "9ec8f29a-eda2-4afa-a2e1-0b257b403a8e",
+              "name": "DueDate",
+              "value": "={{ $json.DueDate }}",
+              "type": "string"
+            },
+            {
+              "id": "0c3632a9-3d24-47f0-89b7-202044ce20ea",
+              "name": "CloseTime",
+              "value": "={{ $json.CloseTime }}",
+              "type": "string"
+            },
+            {
+              "id": "d6ed94f2-bdf0-4749-b02e-d887d3c37ac1",
+              "name": "BugBelong",
+              "value": "={{ $json.BugBelong }}",
+              "type": "string"
+            },
+            {
+              "id": "da49d97b-fa3a-4a9e-b0a8-0bcf9646bcad",
+              "name": "Status",
+              "value": "={{ $json.Status }}",
+              "type": "string"
+            },
+            {
+              "id": "6c64f803-667e-439b-bf0a-2f65aa7f4ad7",
+              "name": "ShortDescription",
+              "value": "={{ $json.ShortDescription }}",
+              "type": "string"
+            },
+            {
+              "id": "64db81e4-e064-432b-8369-93b2231ea9f8",
+              "name": "ProductVersion",
+              "value": "={{ $json.Version }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        800,
+        0
+      ],
+      "id": "a183d016-468e-41d6-aa55-c75268cde889",
+      "name": "Get Columns_v2"
+    },
+    {
+      "parameters": {
+        "operation": "GetMany",
+        "queryPayload": "={\n  \"queryModel\": \"TSR.EbugSearch\",\n  \"pageSize\": 15000,\n  \"pageIndex\": 1,\n  \"isDesc\": true,\n  \"sortBy\": \"CreateTime\",\n  \"conditions\": [\n    {\n      \"field\": \"CreateTime\",\n      \"range\": {\n        \"gte\": \"{{ $now.minus(6,'month').format('yyyy-MM-dd') }} 00:00:00\",\n        \"lte\": \"{{ $now.format('yyyy-MM-dd HH:mm:ss') }}\"\n      }\n    },\n    {\n      \"field\": \"IsValid\",\n      \"termNot\": {\n        \"query\": \"false\"\n      }\n    },\n    {\n      \"field\": \"ProductName\",\n      \"term\": {\n        \"querys\": [\"PowerDirector\", \"PhotoDirector\", \"Promeo\", \"PowerDirector Mobile for Android\", \"PowerDirector Mobile for iOS\", \"PhotoDirector Mobile for Android\", \"PhotoDirector Mobile for iOS\"]\n      }\n    }\n  ]\n}"
+      },
+      "type": "CUSTOM.eCL eBug",
+      "typeVersion": 1,
+      "position": [
+        736,
+        304
+      ],
+      "id": "1c0750e6-c74c-42af-b336-8bf448fbf56f",
+      "name": "Get many eBugs - All",
+      "credentials": {
+        "eExpenseApi": {
+          "id": "mqmQP0HX5dELWd65",
+          "name": "ECL Key account 6"
+        }
+      }
+    }
+  ],
+  "pinData": {
+    "When clicking ‘Execute workflow’": [
+      {
+        "json": {
+          "body": {
+            "product_name": ""
+          }
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Split Out": {
+      "main": [
+        [
+          {
+            "node": "Get Columns_v2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        []
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Get many eBugs_Specific Product",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get many eBugs_All Products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get many eBugs_All Products": {
+      "main": [
+        [
+          {
+            "node": "Split Out",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get many eBugs_Specific Product": {
+      "main": [
+        [
+          {
+            "node": "Split Out",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Columns_Original": {
+      "main": [
+        []
+      ]
+    },
+    "Get Columns_v2": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get many eBugs - All": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "5fc19e52-2192-4744-a875-14427ad17533",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "e9bed60b3a9169dc966f0ab2014f06e4196f08528b8b81b71c0556b4c3f2c51b"
+  },
+  "id": "0gyj14g7VwQZzz9d",
+  "tags": []
+}

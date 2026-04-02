@@ -136,8 +136,8 @@ _RISK_ADVICE = {
 BUG_CATEGORIES = {
     "Crash / Stability": [
         "crash", "exception", "fatal", "abort", "force close", "forcibly closed",
-        "terminate", "stop working", "out of memory", "oom", "memory leak",
-        "deadlock", "unresponsive", "hang", "freeze", "hung", "blue screen",
+        "terminate", "stop working", "out of memory", " oom ", "memory leak",
+        "deadlock", "unresponsive", " hang", "freeze", " hung ", "blue screen",
         "application error", "access violation",
     ],
     "Feature not working as intended": [
@@ -804,6 +804,25 @@ def _sample_descriptions(orig_df, module, mod_col="parsed_module",
 # Change 18 — Bug scenario generation (second-stage, scenario-first output)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _clean_description(text: str) -> str:
+    """Remove noise from raw bug descriptions for use in scenario text.
+
+    Strips numbered prefixes (e.g. '1] :', '9] :'), parenthetical bug IDs
+    (e.g. '(1169430436082878248)'), leading/trailing whitespace, and collapses
+    multiple spaces.
+    """
+    import re
+    if not isinstance(text, str):
+        return text
+    # Remove parenthetical numeric IDs (10+ digits)
+    text = re.sub(r'\s*\(\d{10,}\)', '', text)
+    # Remove numbered prefixes like "1] :" or "9] :"
+    text = re.sub(r'^\d+\]\s*:?\s*', '', text)
+    # Collapse multiple spaces and strip
+    text = re.sub(r' +', ' ', text).strip()
+    return text
+
+
 def _dedupe_descriptions(descs: list, max_n: int = 5, min_len: int = 20) -> list:
     """Return up to max_n descriptions with near-duplicates removed.
 
@@ -888,13 +907,14 @@ def generate_bug_scenarios_heuristic(
 
         if freq:
             top_key = max(freq, key=lambda k: freq[k])
-            representative = canonical[top_key]
+            representative = _clean_description(canonical[top_key])
             top_freq = freq[top_key]
         else:
-            representative = cat_bugs_raw[0]
+            representative = _clean_description(cat_bugs_raw[0])
             top_freq = 1
 
-        source_examples = _dedupe_descriptions(cat_bugs_raw, max_n=2)
+        source_examples = _dedupe_descriptions(
+            [_clean_description(d) for d in cat_bugs_raw], max_n=2)
 
         if top_freq >= 5 or total_in_cat >= 12:
             confidence = "High"
@@ -1337,7 +1357,6 @@ def generate_focus_summary(preds, leading, orig_df,
 
         else:
             lines.append(f"  Bug type to expect : {dtype}")
-            lines.append(f"  Leading signal     : {mod_feat_label}")
             lines.append(f"  Testing advice     : {_RISK_ADVICE.get(rl, 'Review.')}")
 
     lines += ["", "=" * 78, ""]

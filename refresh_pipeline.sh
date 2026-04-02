@@ -10,9 +10,15 @@
 # Usage:
 #   ./refresh_pipeline.sh                    # run immediately
 #   ./refresh_pipeline.sh --dry-run          # print steps, don't execute
-#   ./refresh_pipeline.sh --skip-ollama      # use heuristic scorer (faster)
+#   ./refresh_pipeline.sh --skip-ollama      # use heuristic scorer / TF-IDF
 #   ./refresh_pipeline.sh --skip-cluster     # skip clustering (saves ~5 min)
 #   ./refresh_pipeline.sh --skip-predict     # skip predictions
+#
+# Also accepted for compatibility:
+#   --skip_ollama[=true|false]
+#   --skip_cluster[=true|false]
+#   --skip_predict[=true|false]
+#   --dry_run[=true|false]
 #
 # Cron example (runs every day at 03:00):
 #   0 3 * * * /Users/yourname/pdri-qa-toolkit/refresh_pipeline.sh >> /Users/yourname/pdri-qa-toolkit/logs/refresh.log 2>&1
@@ -38,12 +44,33 @@ SKIP_OLLAMA=false
 SKIP_CLUSTER=false
 SKIP_PREDICT=false
 
+parse_bool_flag() {
+  local raw
+  raw="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$raw" in
+    true|1|yes|on|"")  echo true ;;
+    false|0|no|off)     echo false ;;
+    *)
+      echo "ERROR: invalid boolean value '$1'" >&2
+      exit 1
+      ;;
+  esac
+}
+
 for arg in "$@"; do
   case $arg in
-    --dry-run)      DRY_RUN=true ;;
-    --skip-ollama)  SKIP_OLLAMA=true ;;
-    --skip-cluster) SKIP_CLUSTER=true ;;
-    --skip-predict) SKIP_PREDICT=true ;;
+    --dry-run|--dry_run)                  DRY_RUN=true ;;
+    --dry-run=*|--dry_run=*)              DRY_RUN=$(parse_bool_flag "${arg#*=}") ;;
+    --skip-ollama|--skip_ollama)          SKIP_OLLAMA=true ;;
+    --skip-ollama=*|--skip_ollama=*)      SKIP_OLLAMA=$(parse_bool_flag "${arg#*=}") ;;
+    --skip-cluster|--skip_cluster)        SKIP_CLUSTER=true ;;
+    --skip-cluster=*|--skip_cluster=*)    SKIP_CLUSTER=$(parse_bool_flag "${arg#*=}") ;;
+    --skip-predict|--skip_predict)        SKIP_PREDICT=true ;;
+    --skip-predict=*|--skip_predict=*)    SKIP_PREDICT=$(parse_bool_flag "${arg#*=}") ;;
+    *)
+      echo "ERROR: unknown argument '$arg'" >&2
+      exit 1
+      ;;
   esac
 done
 
@@ -257,9 +284,11 @@ else
   mkdir -p "$CLUSTER_OUT"
 
   if $SKIP_OLLAMA; then
+    log "  Using TF-IDF clustering (--skip-ollama)"
     run "python scripts/cluster_bugs.py \
       '$DATA/ecl_parsed.csv' \
-      '$CLUSTER_OUT/ecl_parsed_clustered.csv'"
+      '$CLUSTER_OUT/ecl_parsed_clustered.csv' \
+      --provider tfidf"
   else
     run "python scripts/cluster_bugs.py \
       '$DATA/ecl_parsed.csv' \
@@ -306,7 +335,8 @@ fi
 log ""
 log "── Restarting Streamlit ────────────────────────────────"
 
-STREAMLIT_PID=$(lsof -ti tcp:"$STREAMLIT_PORT" 2>/dev/null || true)
+# Find only the LISTENING process on the port (not browser clients connected to it)
+STREAMLIT_PID=$(lsof -ti tcp:"$STREAMLIT_PORT" -sTCP:LISTEN 2>/dev/null || true)
 if [ -n "$STREAMLIT_PID" ]; then
   if $DRY_RUN; then
     log "  [DRY-RUN] kill $STREAMLIT_PID"
@@ -314,7 +344,7 @@ if [ -n "$STREAMLIT_PID" ]; then
     kill "$STREAMLIT_PID" 2>/dev/null || true
     # Wait up to 10 s for the port to become free
     for _i in $(seq 1 10); do
-      lsof -ti tcp:"$STREAMLIT_PORT" >/dev/null 2>&1 || break
+      lsof -ti tcp:"$STREAMLIT_PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
       sleep 1
     done
     log "  Stopped Streamlit (PID $STREAMLIT_PID)"

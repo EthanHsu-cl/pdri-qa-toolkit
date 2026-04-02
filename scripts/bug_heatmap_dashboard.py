@@ -2362,29 +2362,6 @@ In the sidebar → **Step 4**, set the path to `predictions_by_scenario.csv` (pr
 
     st.markdown("---")
 
-    # ── Severity escalation alerts ────────────────────────────────────────
-    if "severity_escalation" in pred_df.columns:
-        _esc = pred_df[["module", "predicted", "risk_level", "severity_escalation"]].copy()
-        _esc["severity_escalation"] = pd.to_numeric(_esc["severity_escalation"], errors="coerce")
-        _worsening = _esc[_esc["severity_escalation"] < -0.3].sort_values(
-            "severity_escalation").head(8)
-        if not _worsening.empty:
-            st.subheader("⚠️ Severity Escalation Alerts")
-            st.caption(
-                "These modules have bugs getting **more severe** in recent builds — "
-                "the average severity is trending toward Critical (S1). "
-                "Flag for immediate investigation even if raw bug counts look low."
-            )
-            for _, _er in _worsening.iterrows():
-                _esc_val = float(_er["severity_escalation"])
-                _esc_icon = "🚨" if _esc_val < -0.8 else "⚠️"
-                st.warning(
-                    f"{_esc_icon} **{_er['module']}** — severity worsening by "
-                    f"{abs(_esc_val):.2f} points toward S1 "
-                    f"(predicted {_er['predicted']:.0f} bugs, {_er['risk_level']} risk)"
-                )
-            st.markdown("---")
-
     # ── NEW v3.0 — builds_since_last_crit summary ─────────────────────────
     if "builds_since_last_crit" in pred_df.columns:
         _bslc = pred_df[["module", "predicted", "risk_level", "builds_since_last_crit"]].copy()
@@ -2429,30 +2406,14 @@ In the sidebar → **Step 4**, set the path to `predictions_by_scenario.csv` (pr
     }
     RISK_ORDER = ["Critical", "High", "Medium", "Low"]
 
-    # Top-N slider — used by scenario section, category chart, and advanced section
-    _pred_n = len(pred_df)
-    if _pred_n <= 1:
-        top_n_pred = _pred_n
-    else:
-        _slider_min = min(1, _pred_n - 1)
-        _slider_max = min(40, _pred_n)
-        _slider_val = min(20, _pred_n)
-        top_n_pred = st.slider(
-            "Show top N modules",
-            min_value=_slider_min,
-            max_value=_slider_max,
-            value=_slider_val,
-            key="pred_bar_n",
-        )
-
     if pred_scenario_df is not None and not pred_scenario_df.empty:
         _CONF_ICONS = {"High": "🔴", "Medium": "🟡", "Low": "🟢"}
-        # Determine which modules to show (respect top_n_pred order from ML ranking)
-        _top_mod_order = pred_df.head(top_n_pred)["module"].tolist()
-        _scenario_mods = [m for m in _top_mod_order
+        # Show all Critical/High modules with scenarios
+        _crit_high_mods = pred_df[pred_df["risk_level"].isin(["Critical", "High"])]["module"].tolist()
+        _scenario_mods = [m for m in _crit_high_mods
                           if m in pred_scenario_df["module"].values]
 
-        for _sc_mod in _scenario_mods[:10]:
+        for _sc_mod in _scenario_mods:
             _mod_sc = pred_scenario_df[pred_scenario_df["module"] == _sc_mod].sort_values(
                 "scenario_rank")
             if _mod_sc.empty:
@@ -2544,6 +2505,23 @@ In the sidebar → **Step 4**, set the path to `predictions_by_scenario.csv` (pr
     # ─────────────────────────────────────────────────────────────────────
     # Bug Category Breakdown chart
     # ─────────────────────────────────────────────────────────────────────
+
+    # Top-N slider — controls category chart and advanced diagnostics below
+    _pred_n = len(pred_df)
+    if _pred_n <= 1:
+        top_n_pred = _pred_n
+    else:
+        _slider_min = min(1, _pred_n - 1)
+        _slider_max = min(40, _pred_n)
+        _slider_val = min(20, _pred_n)
+        top_n_pred = st.slider(
+            "Show top N modules",
+            min_value=_slider_min,
+            max_value=_slider_max,
+            value=_slider_val,
+            key="pred_bar_n",
+        )
+
     if pred_category_df is not None and not pred_category_df.empty:
         st.markdown("---")
         st.subheader("📋 Bug Category Breakdown — What Types to Expect")
