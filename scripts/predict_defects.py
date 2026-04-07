@@ -97,21 +97,21 @@ SCENARIO_HISTORY_BUILDS = 5
 
 _FEATURE_LABELS = {
     "crit_1":  "critical-bug momentum (last build)",
+    "crit_2":  "critical-bug momentum (last 2 builds)",
     "crit_3":  "critical-bug momentum (last 3 builds)",
-    "crit_5":  "critical-bug momentum (last 5 builds)",
     "bugs_1":  "recent bug-count momentum (last build)",
+    "bugs_2":  "recent bug-count momentum (last 2 builds)",
     "bugs_3":  "recent bug-count momentum (last 3 builds)",
-    "bugs_5":  "recent bug-count momentum (last 5 builds)",
     "sev_1":   "severity-weighted momentum (last build)",
+    "sev_2":   "severity-weighted momentum (last 2 builds)",
     "sev_3":   "severity-weighted momentum (last 3 builds)",
-    "sev_5":   "severity-weighted momentum (last 5 builds)",
     "trend":   "upward bug-count trend",
     # Change 11 — new features
     "severity_escalation":     "severity escalation (negative = worsening toward S1)",
     "builds_since_last_crit":  "builds elapsed since last critical bug",
     # Change 12 — cluster features
+    "cluster_entropy_2":       "bug-theme diversity index (last 2 builds)",
     "cluster_entropy_3":       "bug-theme diversity index (last 3 builds)",
-    "cluster_entropy_5":       "bug-theme diversity index (last 5 builds)",
     "top_cluster_velocity":    "fastest-growing bug theme velocity",
     # existing optional features
     "repro_rate":             "high reproduce rate (consistently reproducible bugs)",
@@ -123,7 +123,7 @@ _FEATURE_LABELS = {
 
 # Cluster feature columns — excluded from per-module leading_signal search
 # because they are more structural signals than per-build time-series signals.
-_CLUSTER_FEATURE_COLS = {"cluster_entropy_3", "cluster_entropy_5", "top_cluster_velocity"}
+_CLUSTER_FEATURE_COLS = {"cluster_entropy_2", "cluster_entropy_3", "top_cluster_velocity"}
 
 _RISK_ADVICE = {
     "Critical": "Mandatory — add to test suite for every build. Focus on crash and data-loss scenarios.",
@@ -300,8 +300,8 @@ def load_cluster_features(cluster_csv: str,
     Read the clustered bug CSV produced by cluster_bugs.py and build per-module
     per-build cluster-derived features:
 
+      cluster_entropy_2   Shannon entropy of bug-theme distribution, last 2 builds
       cluster_entropy_3   Shannon entropy of bug-theme distribution, last 3 builds
-      cluster_entropy_5   Shannon entropy of bug-theme distribution, last 5 builds
       top_cluster_velocity  Growth ratio of the dominant theme over last 3 builds
 
     Returns a DataFrame keyed on (module, build) for merging into fdf,
@@ -346,7 +346,7 @@ def load_cluster_features(cluster_csv: str,
             build_num = builds_sorted[idx]
             r = {"module": mod, "build": build_num}
 
-            for lag in [3, 5]:
+            for lag in [2, 3]:
                 prev_builds = builds_sorted[max(0, idx - lag):idx]
                 window_bugs = mod_bugs[
                     mod_bugs[build_col].isin(prev_builds) & (mod_bugs["cluster_id"] != -1)
@@ -384,7 +384,7 @@ def load_cluster_features(cluster_csv: str,
 
     cf = pd.DataFrame(rows)
     print(f"  Cluster features: {len(cf)} rows  "
-          f"(cluster_entropy_3/5, top_cluster_velocity)")
+          f"(cluster_entropy_2/3, top_cluster_velocity)")
     return cf
 
 
@@ -428,7 +428,7 @@ def build_features(df, build_col="Build#", mod_col="parsed_module",
                  "target": md.loc[i, "bug_count"]}
 
             # Existing lag windows
-            for lag in [1, 3, 5]:
+            for lag in [1, 2, 3]:
                 w = md.loc[max(0, i - lag):i - 1]
                 r[f"bugs_{lag}"] = w["bug_count"].sum()
                 r[f"sev_{lag}"]  = w["sev_w"].sum()
@@ -475,7 +475,7 @@ def build_features(df, build_col="Build#", mod_col="parsed_module",
     # Change 12 — merge cluster features
     if cluster_features is not None and not fdf.empty:
         fdf = fdf.merge(cluster_features, on=["module", "build"], how="left")
-        for col in ["cluster_entropy_3", "cluster_entropy_5", "top_cluster_velocity"]:
+        for col in ["cluster_entropy_2", "cluster_entropy_3", "top_cluster_velocity"]:
             if col in fdf.columns:
                 fdf[col] = fdf[col].fillna(0.0)
         added = [c for c in _CLUSTER_FEATURE_COLS if c in fdf.columns]

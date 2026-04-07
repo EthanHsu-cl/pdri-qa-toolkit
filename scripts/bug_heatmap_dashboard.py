@@ -573,6 +573,14 @@ include_inactive = st.sidebar.checkbox(
 if not include_inactive:
     df = df[df["status_active"] == True]
 
+only_s1_s2 = st.sidebar.checkbox(
+    "Only show S1/S2 bugs (Critical & Major)",
+    value=True,
+    help="S1 = Critical, S2 = Major. Uncheck to include S3 (Normal) and S4 (Minor) bugs.",
+)
+if only_s1_s2 and "severity_num" in df.columns:
+    df = df[df["severity_num"].isin([1, 2])]
+
 if "parsed_version" in df.columns:
     # ── Version ordering: recency-first, sparse versions last ─────────────
     # We read version_catalogue.csv (produced by parse_ecl_export.py) when
@@ -1213,7 +1221,7 @@ elif active_tab == "📊 KPI Dashboard":
 | **Regression Bug Rate** | % of bugs tagged `[Side Effect]` in their Short Description | Side-effect bugs are regressions — features that previously worked and broke after a code change. A rate above 20% indicates insufficient regression test coverage for the complexity of changes being made. |
 | **Active vs Inactive** | Active = Open / In-Progress; Inactive = Closed / NAB / Won't Fix | Active count = live unresolved risk in the current filter. |
 | **P1 Modules** | Modules with I×P×D risk score > 90 (from loaded risk register) | Every P1 module must be tested every single build — no exceptions. |
-| **P2 Modules** | Modules with I×P×D risk score 70–90 | Test every sprint or major build. |
+| **P2 Modules** | Modules with I×P×D risk score 70–90 | Also test every build alongside P1. |
 | **Avg Risk Score** | Mean I×P×D risk score across all modules in the current filter | Overall risk health signal. A rising trend = cumulative risk is growing. A declining trend = risk is being managed and reduced. |
 
 ---
@@ -1317,6 +1325,14 @@ elif active_tab == "🔥 Risk Heatmap":
     tm_agg["quadrant"] = tm_agg["parsed_module"].map(
         df.groupby("parsed_module")["quadrant"].first().to_dict()
     ).fillna("P4 - Low")
+
+    if risk_df is not None:
+        for col, default in [("impact_score", 3), ("detectability_score", 3),
+                             ("probability_score_auto", 3)]:
+            if col in risk_df.columns:
+                tm_agg[col] = tm_agg["parsed_module"].map(
+                    risk_df.set_index("parsed_module")[col].to_dict()
+                ).fillna(default).astype(int)
 
     all_modules    = sorted(tm_agg["parsed_module"].dropna().unique().tolist())
     all_categories = sorted(tm_agg["module_category"].dropna().unique().tolist())
@@ -1436,7 +1452,7 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
 | **Right detail panel** | Both files joined | Total bugs, critical count, risk score, and full bug list for the selected module. Before clicking a block, shows the top 5 modules by bug count as a quick reference. |
 | **🌞 Sunburst View** (expander below treemap) | Both files | Same data in a nested pie chart. Use it to compare the proportion of bugs across categories — the outer ring is modules, the inner ring is categories. |
 | **📋 Category Summary** (expander below treemap) | Both files | Aggregate table: one row per category showing total modules, total bugs, severity weight, average risk score, and count of P1 modules. Sort by Avg Risk Score to quickly identify the riskiest category. |
-| **🔴 P1 Modules bar chart** | `risk_register_scored.csv` | All P1-priority modules ranked by risk score, highest first. These are the mandatory test-every-build targets. Each bar is coloured by category. |
+| **🔴 P1 + P2 Modules bar chart** | `risk_register_scored.csv` | All P1 and P2 modules ranked by risk score, highest first. These are the mandatory test-every-build targets. Each bar is coloured by priority. |
 | **Risk Score vs Probability scatter** | `risk_register_scored.csv` | I×P×D score on the Y axis vs historical defect probability rank (1–5) on the X axis. X values are slightly jittered (±0.35) so overlapping dots separate visually — hover for the true integer value. Threshold lines at 50, 70, 90 define the four risk zones. Look for modules in the top-right corner: both high-risk AND historically bug-prone — these are the highest-priority targets. |
 
 > **Tip:** Heuristic scores are a strong starting point but should be reviewed with the team.
@@ -1478,15 +1494,24 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
         else:
             st.caption("Click a module block to view its bugs →")
 
+        _ipd_cols = {k: True for k in ["impact_score", "probability_score_auto", "detectability_score"]
+                     if k in tm_agg.columns}
+        _ipd_labels = {
+            "impact_score": "I (Impact)",
+            "probability_score_auto": "P (Probability)",
+            "detectability_score": "D (Detectability)",
+        }
+
         if color_opt == "Risk Score (LLM)":
             fig_tm = px.treemap(
                 tm_agg, path=["module_category", "parsed_module"],
                 values="bug_count", color="risk_score",
                 color_continuous_scale="YlOrRd",
+                range_color=[0, 125],
                 labels={"bug_count": "Bugs", "risk_score": "Risk Score",
-                        "module_category": "Category", "parsed_module": "Module"},
+                        "module_category": "Category", "parsed_module": "Module", **_ipd_labels},
                 hover_data={"bug_count": True, "risk_score": ":.1f",
-                            "critical_count": True, "quadrant": True},
+                            "critical_count": True, "quadrant": True, **_ipd_cols},
             )
         elif color_opt == "Priority":
             fig_tm = px.treemap(
@@ -1494,8 +1519,9 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
                 values="bug_count", color="quadrant",
                 color_discrete_map=QUADRANT_COLORS,
                 labels={"bug_count": "Bugs", "quadrant": "Priority",
-                        "module_category": "Category", "parsed_module": "Module"},
-                hover_data={"bug_count": True, "risk_score": ":.1f", "critical_count": True},
+                        "module_category": "Category", "parsed_module": "Module", **_ipd_labels},
+                hover_data={"bug_count": True, "risk_score": ":.1f",
+                            "critical_count": True, **_ipd_cols},
             )
         elif color_opt == "Critical Count":
             fig_tm = px.treemap(
@@ -1503,7 +1529,8 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
                 values="bug_count", color="critical_count",
                 color_continuous_scale="Reds",
                 labels={"bug_count": "Bugs", "critical_count": "Critical Bugs",
-                        "module_category": "Category", "parsed_module": "Module"},
+                        "module_category": "Category", "parsed_module": "Module", **_ipd_labels},
+                hover_data={**_ipd_cols},
             )
         else:
             fig_tm = px.treemap(
@@ -1511,7 +1538,8 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
                 values="bug_count", color="sev_weight",
                 color_continuous_scale="YlOrRd",
                 labels={"bug_count": "Bugs", "sev_weight": "Severity Weight",
-                        "module_category": "Category", "parsed_module": "Module"},
+                        "module_category": "Category", "parsed_module": "Module", **_ipd_labels},
+                hover_data={**_ipd_cols},
             )
 
         fig_tm.update_layout(
@@ -1656,25 +1684,32 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
                         "Severity Weight", "Avg Risk Score", "P1 Modules"]
         st.dataframe(cats, width='stretch', hide_index=True)
 
-    st.subheader("🔴 P1 Modules — Test Every Build")
-    q4 = tm_agg[tm_agg["quadrant"] == "P1 - Critical"].sort_values("risk_score", ascending=False)
+    st.subheader("🔴 P1 + P2 Modules — Test Every Build")
+    q4 = tm_agg[tm_agg["quadrant"].isin(["P1 - Critical", "P2 - High"])].sort_values("risk_score", ascending=False)
     if len(q4):
         fig_q4 = px.bar(
-            q4.head(20), x="parsed_module", y="risk_score", color="module_category",
+            q4.head(30), x="parsed_module", y="risk_score", color="quadrant",
+            color_discrete_map=QUADRANT_COLORS,
             labels={"parsed_module": "Module", "risk_score": "Risk Score",
-                    "module_category": "Category"},
-            title="P1 Modules by Risk Score",
+                    "quadrant": "Priority"},
+            title="P1 + P2 Modules by Risk Score",
         )
         fig_q4.update_layout(height=400, xaxis_tickangle=-30)
         st.plotly_chart(fig_q4, width='stretch')
     else:
-        st.info("No P1 modules in current filter.")
+        st.info("No P1 or P2 modules in current filter.")
 
     if risk_df is not None and "probability_score_auto" in risk_df.columns:
         st.subheader("Risk Score vs Probability")
         scatter_df = tm_agg.copy()
         prob_map = risk_df.set_index("parsed_module")["probability_score_auto"].to_dict()
         scatter_df["probability"] = scatter_df["parsed_module"].map(prob_map).fillna(2.5)
+
+        for col, default in [("impact_score", 3), ("detectability_score", 3)]:
+            if col in risk_df.columns:
+                scatter_df[col] = scatter_df["parsed_module"].map(
+                    risk_df.set_index("parsed_module")[col].to_dict()
+                ).fillna(default)
 
         def assign_zone(score: float) -> str:
             if score > 90: return "Critical Risk (>90)"
@@ -1698,17 +1733,23 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
             "Medium Risk (50-69)": "#BCBD22",
             "Low Risk (<50)":      "#2CA02C",
         }
+        zone_order = ["Critical Risk (>90)", "High Risk (70-90)", "Medium Risk (50-69)", "Low Risk (<50)"]
+        scatter_df["risk_zone"] = pd.Categorical(scatter_df["risk_zone"], categories=zone_order, ordered=True)
+
         fig_scatter = px.scatter(
             scatter_df,
             x="probability_jittered",
             y="risk_score",
             color="risk_zone",
             color_discrete_map=zone_colors,
+            category_orders={"risk_zone": zone_order},
             size="bug_count",
             hover_name="parsed_module",
             hover_data={
                 "probability_jittered": False,        # hide the jittered value
                 "probability": True,                  # show the real integer
+                "impact_score": True,
+                "detectability_score": True,
                 "risk_score": ":.1f",
                 "bug_count": True,
                 "risk_zone": False,
@@ -1717,9 +1758,12 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
                 "probability_jittered": "Probability Score (1–5, jittered for readability)",
                 "risk_score": "Risk Score (I×P×D)",
                 "bug_count": "Bug Count",
+                "impact_score": "Impact (I)",
+                "detectability_score": "Detectability (D)",
+                "probability": "Probability (P)",
             },
-            size_max=18,          # smaller max bubble so dense clusters separate
-            opacity=0.75,         # transparency lets overlapping dots show through
+            size_max=32,
+            opacity=0.80,
         )
         # Overlay true integer tick labels on x-axis so jitter doesn't confuse
         fig_scatter.update_xaxes(
@@ -1727,14 +1771,18 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
             ticktext=["1", "2", "3", "4", "5"],
             range=[0.3, 5.7],
         )
+        # Pin threshold labels to the left to keep the right side clear for the legend
         for y_val, label in [
-            (50, "Medium threshold"), (70, "High threshold"), (90, "Critical threshold")
+            (50, "Medium threshold"),
+            (70, "High threshold"),
+            (90, "Critical threshold"),
         ]:
             fig_scatter.add_hline(
                 y=y_val, line_dash="dash", line_color="gray", line_width=1,
-                annotation_text=label, annotation_position="right",
+                annotation_text=label,
+                annotation_position="top left",
             )
-        fig_scatter.update_layout(height=500)
+        fig_scatter.update_layout(height=520, legend=dict(x=1.01, y=1, xanchor="left"))
         st.caption(
             "ℹ️ X-axis values are slightly jittered (±0.35) so dots at the same probability "
             "level separate visually. Hover any dot for the true score."
@@ -1801,8 +1849,8 @@ Expand any card to see:
 - **Bug count** — how many bugs belong to this theme
 - **Avg severity** — 1 (Critical) to 4 (Minor)
 - **Share of clustered bugs** — this theme's proportion of all grouped bugs
-- **Velocity (recent vs prior 3 builds)** — the acceleration ratio; >1.5 = growing, <0.67 = declining
-- **Recurrence rate** — fraction of recent bugs from modules that also appeared in the prior 3-build window (high = same modules keep re-introducing this bug type)
+- **Velocity (recent vs prior 2 builds)** — the acceleration ratio; >1.5 = growing, <0.67 = declining
+- **Recurrence rate** — fraction of recent bugs from modules that also appeared in the prior 2-build window (high = same modules keep re-introducing this bug type)
 - **Modules affected** — which modules contribute bugs to this theme
 - **Sample bug descriptions** — up to 6 real ECL examples so you can judge the pattern yourself
 - **Action line** — a plain-English recommendation based on severity, amplified if the velocity or recurrence signals are also firing:
@@ -1816,10 +1864,10 @@ Expand any card to see:
 ### 🚨 Alert Banners (shown before the chart when thresholds are hit)
 
 **🔺 Growing theme alerts** fire when `cluster_velocity_ratio` ≥ 1.5.
-> **Velocity ratio** = (bugs in last 3 builds) ÷ (bugs in prior 3 builds). A ratio of 1.5 means 50% more bugs than the preceding window — a strong signal that something changed recently.
+> **Velocity ratio** = (bugs in last 2 builds) ÷ (bugs in prior 2 builds). A ratio of 1.5 means 50% more bugs than the preceding window — a strong signal that something changed recently.
 
 **🔁 Fix-not-holding alerts** fire when `recurrence_rate` ≥ 0.6.
-> **Recurrence rate** = fraction of recent bugs (last 3 builds) from modules that also contributed to this theme in the prior 3-build window. 60%+ means the same modules keep re-introducing the same type of bug — a root-cause fix, not another patch, is needed.
+> **Recurrence rate** = fraction of recent bugs (last 2 builds) from modules that also contributed to this theme in the prior 2-build window. 60%+ means the same modules keep re-introducing the same type of bug — a root-cause fix, not another patch, is needed.
 
 ---
 
@@ -2113,10 +2161,10 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
             # Velocity / trend / recurrence row
             vc1, vc2, vc3 = st.columns(3)
             vel_delta_color = "inverse" if trend_val == "declining" else ("off" if trend_val == "stable" else "normal")
-            vc1.metric("Velocity (recent vs prior 3 builds)", f"{vel_val:.2f}×",
+            vc1.metric("Velocity (recent vs prior 2 builds)", f"{vel_val:.2f}×",
                        delta=f"{trend_icon} {trend_val.capitalize()}",
                        delta_color=vel_delta_color,
-                       help="Ratio of bugs in the last 3 builds vs the 3 builds before that. Above 1.5 = growing.")
+                       help="Ratio of bugs in the last 2 builds vs the 2 builds before that. Above 1.5 = growing.")
             vc2.metric("Recurrence rate", f"{recur_val * 100:.0f}%",
                        help="Fraction of recent bugs from modules that also contributed to this theme in the prior window. High = fix not holding.")
             recur_label = "⚠️ Fix not holding" if recur_val > 0.5 else ("🔶 Moderate" if recur_val > 0.25 else "✅ Low")
@@ -2181,7 +2229,7 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
         st.markdown("---")
         st.subheader("📈 Cluster Velocity — Which Themes Are Growing?")
         st.caption(
-            "Velocity ratio compares bug count in the most recent 3 builds vs the prior 3 builds. "
+            "Velocity ratio compares bug count in the most recent 2 builds vs the prior 2 builds. "
             "**Above 1.5** = theme is growing (🔺 alert). **Below 0.67** = theme is declining (✅ improving). "
             "Focus testing effort on growing themes."
         )
@@ -2213,7 +2261,7 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
             hover_data={"cluster_velocity_ratio": ":.2f",
                         "count": True, "modules": True,
                         "label_short": False, "trend_color": False},
-            labels={"cluster_velocity_ratio": "Velocity ratio (recent / prior 3 builds)",
+            labels={"cluster_velocity_ratio": "Velocity ratio (recent / prior 2 builds)",
                     "label_short": "Theme",
                     "count": "Total bugs",
                     "modules": "Modules"},
@@ -2538,13 +2586,13 @@ A horizontal bar chart ranking features by **Pearson correlation coefficient (r)
 The correlations are computed across all (module, build) rows in the training dataset by comparing each feature column against the `target` (actual bug count in the next build).
 
 **Features ranked here include:**
-- `crit_1/3/5` — critical bug momentum over last 1/3/5 builds
-- `bugs_1/3/5` — total bug count momentum over last 1/3/5 builds
-- `sev_1/3/5` — severity-weighted momentum
+- `crit_1/2/3` — critical bug momentum over last 1/2/3 builds
+- `bugs_1/2/3` — total bug count momentum over last 1/2/3 builds
+- `sev_1/2/3` — severity-weighted momentum
 - `trend` — last build minus 3 builds ago (upward slope)
 - `severity_escalation` — worsening severity signal
 - `builds_since_last_crit` — how long since the last S1
-- `cluster_entropy_3/5` — bug-theme diversity index (when cluster data is loaded)
+- `cluster_entropy_2/3` — bug-theme diversity index (when cluster data is loaded)
 - `top_cluster_velocity` — growth rate of the dominant bug theme
 - TF-IDF text features — keyword loadings from module descriptions
 - Risk features (when loaded) — impact, detectability, probability scores from `ai_risk_scorer.py`
@@ -2566,7 +2614,7 @@ The correlations are computed across all (module, build) rows in the training da
 
 **Training validation:** 3-fold `TimeSeriesSplit` cross-validation (respects time ordering — no data leakage). The CV MAE (Mean Absolute Error) is printed at run time: it tells you how many bugs off the forecast is on average.
 
-**Feature matrix:** Built by `build_features()` in `predict_defects.py`. Each row is a (module, build) pair. Features are computed as rolling window statistics from the prior 1/3/5 builds. Requires at least **5 builds of history** per module; modules with less are excluded.
+**Feature matrix:** Built by `build_features()` in `predict_defects.py`. Each row is a (module, build) pair. Features are computed as rolling window statistics from the prior 1/2/3 builds. Requires at least **5 builds of history** per module; modules with less are excluded.
 
 **Risk level assignment:** Risk levels are **not directly from the model output**. They are assigned from a composite risk score that weights: predicted bug count, severity escalation trend, domain impact score (from `ai_risk_scorer.py` if loaded), and historical probability score.
 

@@ -56,7 +56,7 @@ from pathlib import Path
 
 OLLAMA_BASE            = "http://localhost:11434"
 EMBED_CHECKPOINT_EVERY = 50
-VELOCITY_WINDOW        = 3    # builds per velocity comparison window
+VELOCITY_WINDOW        = 2    # builds per velocity comparison window
 MIN_BUGS_STRATIFIED    = 20   # min bugs per severity tier to run a stratified cluster pass
 
 
