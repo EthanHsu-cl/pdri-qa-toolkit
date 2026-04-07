@@ -116,17 +116,21 @@ PRODUCT_MAP = {
     "phda":   "PhotoDirector Mobile (Android)",
     "pdr":    "PowerDirector",
     "phd":    "PhotoDirector",
+    "vvg":    "Vivid Glam",
     "promeo": "Promeo",
 }
 
 _products_dir = Path("data/products")
+_PRODUCT_ORDER = ["pdri", "pdra", "phdi", "phda", "pdr", "vvg", "promeo"]
 _available_products = []
 if _products_dir.exists():
-    for d in sorted(_products_dir.iterdir()):
-        if d.is_dir() and (d / "ecl_parsed.csv").exists():
-            slug = d.name
-            label = PRODUCT_MAP.get(slug, slug)
-            _available_products.append((slug, label))
+    _existing_slugs = {d.name for d in _products_dir.iterdir() if d.is_dir() and (d / "ecl_parsed.csv").exists()}
+    for slug in _PRODUCT_ORDER:
+        if slug in _existing_slugs:
+            _available_products.append((slug, PRODUCT_MAP.get(slug, slug)))
+    # Append any unknown slugs not in the fixed order
+    for slug in sorted(_existing_slugs - set(_PRODUCT_ORDER)):
+        _available_products.append((slug, PRODUCT_MAP.get(slug, slug)))
 
 if _available_products:
     _product_labels = [f"{label} ({slug})" for slug, label in _available_products]
