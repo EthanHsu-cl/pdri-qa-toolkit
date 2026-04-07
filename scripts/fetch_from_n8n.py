@@ -16,9 +16,11 @@ Or run both steps in one go:
 """
 
 import argparse
+import calendar
 import json
 import subprocess
 import sys
+import time
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -54,35 +56,61 @@ OPTIONAL_FIELDS  = {"Build#", "Close Build#", "Version", "Creator"}
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def fetch_bugs(webhook_url: str, payload: dict, timeout: int = 120) -> list[dict]:
-    """POST to the n8n webhook and return a flat list of bug records."""
+class FetchError(Exception):
+    """Raised when the webhook returns a non-retryable error."""
+
+
+def fetch_bugs(
+    webhook_url: str,
+    payload: dict,
+    timeout: int = 120,
+    max_retries: int = 3,
+    retry_delay: int = 15,
+) -> list[dict]:
+    """POST to the n8n webhook and return a flat list of bug records.
+
+    Retries up to `max_retries` times on 5xx errors and network timeouts
+    (exponential backoff starting at `retry_delay` seconds).
+    Raises FetchError immediately on 4xx — those won't be fixed by retrying.
+    """
     body = json.dumps(payload).encode("utf-8")
-    req  = urllib.request.Request(
-        webhook_url,
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    print(f"→ POST {webhook_url}")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        print(f"HTTP {e.code}: {e.reason}")
-        body_preview = e.read().decode("utf-8", errors="replace")[:500]
-        print(body_preview)
-        sys.exit(1)
-    except urllib.error.URLError as e:
-        print(f"Connection error: {e.reason}")
-        print("Check that n8n is running and the webhook URL is correct.")
-        sys.exit(1)
+
+    for attempt in range(1, max_retries + 2):  # +2 so last pass shows attempt N
+        req = urllib.request.Request(
+            webhook_url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        label = f"(attempt {attempt}/{max_retries + 1})"
+        print(f"→ POST {webhook_url}  {label}")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+            break  # success — exit retry loop
+
+        except urllib.error.HTTPError as e:
+            body_preview = e.read().decode("utf-8", errors="replace")[:300]
+            if 400 <= e.code < 500:
+                # Client error — retrying won't help
+                raise FetchError(f"HTTP {e.code} {e.reason}: {body_preview}")
+            # 5xx — may be transient
+            print(f"  HTTP {e.code} {e.reason}: {body_preview}")
+
+        except (urllib.error.URLError, TimeoutError) as e:
+            print(f"  Network error: {e}")
+
+        if attempt > max_retries:
+            raise FetchError(f"Webhook failed after {max_retries + 1} attempts.")
+
+        wait = retry_delay * (2 ** (attempt - 1))
+        print(f"  Retrying in {wait}s…")
+        time.sleep(wait)
 
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
-        print(f"Failed to parse JSON response: {e}")
-        print("Raw response (first 500 chars):", raw[:500])
-        sys.exit(1)
+        raise FetchError(f"Failed to parse JSON response: {e}\nRaw (500 chars): {raw[:500]}")
 
     # n8n "Respond to Webhook → allIncomingItems" wraps each item as
     # {"json": {...}} OR returns a plain list of dicts depending on version.
@@ -98,8 +126,7 @@ def fetch_bugs(webhook_url: str, payload: dict, timeout: int = 120) -> list[dict
     elif isinstance(data, dict):
         return [data.get("json", data)]
     else:
-        print(f"Unexpected response shape: {type(data)}")
-        sys.exit(1)
+        raise FetchError(f"Unexpected response shape: {type(data)}")
 
 
 def audit_fields(records: list[dict]) -> bool:
@@ -115,7 +142,7 @@ def audit_fields(records: list[dict]) -> bool:
     if missing_required:
         print(f"\n❌ MISSING REQUIRED fields: {sorted(missing_required)}")
         print("   These are needed for module/tag/severity parsing.")
-        print("   Check the 'Get Columns_v3' Set node in your n8n workflow.")
+        print("   Check the 'Get Columns_v4' Set node in your n8n workflow.")
         return False
 
     if missing_optional:
@@ -242,6 +269,59 @@ def resolve_scope(args) -> str:
         return "latest"
 
 
+def subtract_months(dt: datetime, months: int) -> datetime:
+    """Return dt shifted back by `months` months, clamping to the last valid day."""
+    month = dt.month - months
+    year = dt.year
+    while month <= 0:
+        month += 12
+        year -= 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+def fetch_bugs_chunked(
+    webhook_url: str,
+    base_payload: dict,
+    duration_months: int,
+    chunk_months: int,
+    timeout: int,
+) -> list[dict]:
+    """Split a large date range into `chunk_months`-sized windows and merge results.
+
+    Sends `date_from` / `date_to` string fields in each payload so the n8n
+    workflow uses explicit bounds instead of the `duration_months` fallback.
+    Deduplicates by BugCode across all chunks.
+    """
+    now = datetime.now()
+    chunks: list[tuple[str, str]] = []
+    end = now
+    remaining = duration_months
+    while remaining > 0:
+        size = min(chunk_months, remaining)
+        start = subtract_months(end, size)
+        chunks.append((
+            start.strftime("%Y-%m-%d") + " 00:00:00",
+            end.strftime("%Y-%m-%d %H:%M:%S"),
+        ))
+        end = start
+        remaining -= size
+
+    all_records: dict[str, dict] = {}
+    for i, (date_from, date_to) in enumerate(chunks, 1):
+        print(f"  Chunk {i}/{len(chunks)}: {date_from[:10]} → {date_to[:10]}")
+        payload = {**base_payload, "date_from": date_from, "date_to": date_to}
+        records = fetch_bugs(webhook_url, payload, timeout=timeout)
+        print(f"    → {len(records):,} records")
+        for rec in records:
+            code = rec.get("BugCode")
+            if code:
+                all_records[code] = rec
+    merged = list(all_records.values())
+    print(f"  Chunks complete — {len(merged):,} unique bugs total")
+    return merged
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Fetch eBugs from n8n webhook and save as JSON."
@@ -306,6 +386,16 @@ def main():
         default=None,
         help="Duration in months for the date range filter (sent to n8n). Default: 36.",
     )
+    parser.add_argument(
+        "--chunk-months",
+        type=int,
+        default=None,
+        help=(
+            "Split the date range into chunks of this many months to avoid "
+            "504 timeouts on large products (e.g. --chunk-months 6). "
+            "Omit to fetch in one request."
+        ),
+    )
     args = parser.parse_args()
 
     # Resolve product-aware output paths
@@ -342,7 +432,18 @@ def main():
             payload["latest_version"] = latest_ver
             print(f"  Sending latest_version={latest_ver!r} in webhook payload")
 
-    records = fetch_bugs(args.webhook_url, payload, timeout=args.timeout)
+    try:
+        if args.chunk_months and args.chunk_months < duration_months:
+            print(f"  Chunked mode: {duration_months}mo ÷ {args.chunk_months}mo/chunk")
+            records = fetch_bugs_chunked(
+                args.webhook_url, payload, duration_months, args.chunk_months, timeout=args.timeout
+            )
+        else:
+            records = fetch_bugs(args.webhook_url, payload, timeout=args.timeout)
+    except FetchError as e:
+        print(f"\n❌ Fetch failed: {e}")
+        sys.exit(1)
+
     print(f"  Received {len(records):,} records")
 
     if not records:

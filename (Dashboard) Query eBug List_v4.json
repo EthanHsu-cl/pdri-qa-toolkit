@@ -92,7 +92,7 @@
     {
       "parameters": {
         "operation": "GetMany",
-        "queryPayload": "={\n  \"queryModel\": \"TSR.EbugSearch\",\n  \"pageSize\": 50000,\n  \"pageIndex\": 1,\n  \"isDesc\": true,\n  \"sortBy\": \"CreateTime\",\n  \"conditions\": [\n    {\n      \"field\": \"CreateTime\",\n      \"range\": {\n        \"gte\": \"{{ $now.minus($('Webhook').item.json.body.duration_months || 36, 'month').format('yyyy-MM-dd') }} 00:00:00\",\n        \"lte\": \"{{ $now.format('yyyy-MM-dd HH:mm:ss') }}\"\n      }\n    },\n    {\n      \"field\": \"IsValid\",\n      \"termNot\": {\n        \"query\": \"false\"\n      }\n    },\n    {\n      \"field\": \"ProductName\",\n      \"term\": {\n        \"querys\": [\"{{ $('Webhook').item.json.body.product_name }}\"]\n      }\n    }\n  ]\n}"
+        "queryPayload": "={\n  \"queryModel\": \"TSR.EbugSearch\",\n  \"pageSize\": 50000,\n  \"pageIndex\": 1,\n  \"isDesc\": true,\n  \"sortBy\": \"CreateTime\",\n  \"conditions\": [\n    {\n      \"field\": \"CreateTime\",\n      \"range\": {\n        \"gte\": \"{{ $('Webhook').item.json.body.date_from || $now.minus($('Webhook').item.json.body.duration_months || 36, 'month').format('yyyy-MM-dd') + ' 00:00:00' }}\",\n        \"lte\": \"{{ $('Webhook').item.json.body.date_to || $now.format('yyyy-MM-dd HH:mm:ss') }}\"\n      }\n    },\n    {\n      \"field\": \"IsValid\",\n      \"termNot\": {\n        \"query\": \"false\"\n      }\n    },\n    {\n      \"field\": \"ProductName\",\n      \"term\": {\n        \"querys\": [\"{{ $('Webhook').item.json.body.product_name }}\"]\n      }\n    }\n  ]\n}"
       },
       "type": "CUSTOM.eCL eBug",
       "typeVersion": 1,
@@ -228,7 +228,7 @@
         288
       ],
       "id": "bcef2f9a-5175-417a-ad26-46b6b877e9b9",
-      "name": "Get Columns_v3"
+      "name": "Get Columns_v4"
     }
   ],
   "pinData": {
@@ -299,14 +299,14 @@
       "main": [
         [
           {
-            "node": "Get Columns_v3",
+            "node": "Get Columns_v4",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Get Columns_v3": {
+    "Get Columns_v4": {
       "main": [
         [
           {

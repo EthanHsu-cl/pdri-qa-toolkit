@@ -162,9 +162,13 @@ def get_ollama_embeddings(
     if new_indices:
         print(f"  Sending {len(new_indices):,} new bugs to Ollama...")
 
+    if not new_indices:
+        print(f"  All {len(texts):,} bugs served from cache — nothing to embed.")
+        # fall through to assemble vectors from cache
+
     new_done = 0
     for i in tqdm(new_indices, desc="Embedding bugs", unit="bug",
-                  file=sys.stderr, dynamic_ncols=True):
+                  file=sys.stderr, dynamic_ncols=True) if new_indices else []:
         code = str(bug_codes[i])
         vec = _ollama_embed(texts[i][:512], model=model)
         if vec is None:
