@@ -208,10 +208,18 @@ run_product_pipeline() {
   log ""
   log "── [$SLUG] Stage 1: Fetch + Parse ───────────────────────"
 
+  # Desktop products (pdr, phd) have far more bugs — chunk into 6-month windows
+  # to avoid 504 Gateway Timeout on the n8n webhook.
+  case "$SLUG" in
+    pdr|phd) CHUNK_ARG="--chunk-months 6" ;;
+    *)       CHUNK_ARG="" ;;
+  esac
+
   run "python scripts/fetch_from_n8n.py \
     --product '$SLUG' \
     --duration-months '$DURATION' \
     --scope all \
+    $CHUNK_ARG \
     --output '$STAGING_PRODUCT/ecl_raw.json' \
     --parsed-output '$STAGING_PRODUCT/ecl_parsed.csv' \
     --then-parse"
@@ -411,12 +419,25 @@ fi
 ACTIVE_PRODUCTS=$(resolve_product_schedule)
 log "Active products: $ACTIVE_PRODUCTS"
 
-# Run pipeline for each product
+# Run pipeline for each product — failures are isolated per product.
+# A failed product is logged and skipped; the rest continue.
+FAILED_PRODUCTS=()
 for entry in $ACTIVE_PRODUCTS; do
   SLUG="${entry%%:*}"
   DURATION="${entry##*:}"
-  run_product_pipeline "$SLUG" "$DURATION"
+  if ( run_product_pipeline "$SLUG" "$DURATION" ); then
+    log "✅ [$SLUG] Pipeline succeeded."
+  else
+    log "❌ [$SLUG] Pipeline FAILED — skipping to next product."
+    FAILED_PRODUCTS+=("$SLUG")
+  fi
 done
+
+if [ ${#FAILED_PRODUCTS[@]} -gt 0 ]; then
+  log ""
+  log "⚠️  Products with failures: ${FAILED_PRODUCTS[*]}"
+  log "   Re-run with: ./refresh_pipeline.sh --products $(IFS=,; echo "${FAILED_PRODUCTS[*]}") --duration-months $DURATION"
+fi
 
 # ── Restart Streamlit ────────────────────────────────────────────────────────
 log ""
