@@ -212,11 +212,22 @@ def score_file(in_csv: str, out_csv: str, provider: str, model: str, verbose: bo
     to_score    = max(0, total - skipped)
     done_so_far = 0
 
+    # Build a stable version label from the input filename
+    basename   = os.path.basename(in_csv)
+    ver_raw    = basename.replace("risk_register_", "").replace(".csv", "")
+    ver_label  = ver_raw.replace("_", ".") if re.match(r"^\d", ver_raw) else ver_raw
+    if provider == "ollama":
+        provider_label = f"ollama/{model}"
+    else:
+        provider_label = provider
+    # Fixed-width desc so the bar width stays constant
+    desc_str = f"v{ver_label:<8} [{provider_label:<12}]"
+
     print(f"  {chr(9472) * 78}")
     print(f"  {'#':>4}  {'Module':<30}  {'I':>2} {'P':>2} {'D':>2}  {'Risk':>6}  {'Quadrant':<14}  Reasoning")
     print(f"  {chr(9472) * 78}")
 
-    pbar = tqdm(total=to_score, desc="Scoring modules", unit="mod",
+    pbar = tqdm(total=to_score, desc=desc_str, unit="mod",
                 file=sys.stderr, dynamic_ncols=True)
     for idx, row in df.iterrows():
         module_name = str(row.get("module", ""))
@@ -243,7 +254,8 @@ def score_file(in_csv: str, out_csv: str, provider: str, model: str, verbose: bo
         reason_display  = r[3][:55] + "..." if len(r[3]) > 55 else r[3]
 
         pbar.update(1)
-        pbar.set_postfix_str(f"{module_name[:20]} → {quadrant_inline}")
+        # Fixed-width postfix: module padded to 20, quadrant padded to 14
+        pbar.set_postfix_str(f"{module_name[:20]:<20} → {quadrant_inline:<14}")
 
         print(
             f"  [{done_so_far:>3}/{to_score}]  {module_name:<30}"

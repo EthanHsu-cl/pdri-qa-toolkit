@@ -1596,7 +1596,7 @@ def main():
 
     if len(fdf) < 20:
         print("Not enough data for prediction. Need ≥5 builds per module.")
-        sys.exit(1)
+        sys.exit(0)
 
     model_obj, preds, imp, leading = train_predict(fdf, orig_df)
 

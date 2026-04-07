@@ -11,7 +11,9 @@
       "Bash(ps -p 50604 -o pid,command)",
       "Bash(kill 50604)",
       "Bash(brew services:*)",
-      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f'OK — embedding dim: {len\\(d[\\\\\"embedding\\\\\"]\\)}'\\)\")"
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f'OK — embedding dim: {len\\(d[\\\\\"embedding\\\\\"]\\)}'\\)\")",
+      "Bash(crontab -l)",
+      "Read(//Users/ethanhsuqa2/Library/LaunchAgents/**)"
     ]
   }
 }

@@ -1,46 +1,89 @@
 #!/bin/bash
-# PDR-I QA Toolkit - Mac Mini M1 Setup v2.1
+# PDR-I QA Toolkit - Mac Mini M1 Setup v2.2
 set -e
 echo "=== PDR-I QA Toolkit Setup (Mac Mini M1) ==="
 
-echo "\n[1/7] Checking prerequisites..."
+TOOLKIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$TOOLKIT_DIR"
+
+# ── [1/8] Prerequisites ───────────────────────────────────────────────────────
+echo ""
+echo "[1/8] Checking prerequisites..."
 which brew || { echo "ERROR: Homebrew not found. Install from https://brew.sh"; exit 1; }
 
-PY_BIN=$(which python3.14 || true)
+PY_BIN=$(which python3.14 2>/dev/null || true)
 if [ -z "$PY_BIN" ]; then
     echo "ERROR: python3.14 not found. Install via: brew install python@3.14"
     exit 1
 fi
-echo "Using Python: $PY_BIN"
+echo "  Using Python: $PY_BIN"
 
-
-echo "\n[2/7] Installing system dependencies..."
+# ── [2/8] System dependencies ─────────────────────────────────────────────────
+echo ""
+echo "[2/8] Installing system dependencies..."
 brew install node 2>/dev/null || true
 npm install -g appium 2>/dev/null || true
 appium driver install xcuitest 2>/dev/null || true
 
-echo "\\n[3/7] Setting up Python environment..."
+# ── [3/8] Python environment ──────────────────────────────────────────────────
+echo ""
+echo "[3/8] Setting up Python environment..."
 "$PY_BIN" -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 
-echo "\n[4/7] Creating directories..."
-mkdir -p data visual_baselines visual_results tests/generated
+# ── [4/8] Directory structure ─────────────────────────────────────────────────
+echo ""
+echo "[4/8] Creating directories..."
+mkdir -p \
+    data/staging \
+    data/products \
+    logs \
+    visual_baselines \
+    visual_results \
+    tests/generated
+echo "  Directories ready."
 
-echo "\n[5/7] Installing Ollama (optional)..."
+# ── [5/8] Ollama + models ─────────────────────────────────────────────────────
+echo ""
+echo "[5/8] Installing Ollama and pulling models..."
 if ! which ollama > /dev/null 2>&1; then
     brew install ollama
 fi
-echo "To pull model: ollama pull llama3.1"
-echo "  (llama3.1 for M1 16GB, phi3 for M1 8GB)"
 
-echo "\\n[6/7] Verifying..."
-python -c "import pandas, streamlit, plotly, sklearn, PIL; print('All packages OK')"
+# Start Ollama server if not already running (needed for pulls)
+OLLAMA_STARTED=false
+if ! pgrep -x ollama > /dev/null 2>&1; then
+    echo "  Starting Ollama server for model pulls..."
+    ollama serve &>/dev/null &
+    sleep 5
+    OLLAMA_STARTED=true
+fi
 
-echo "\n[7/7] Creating LaunchAgent..."
+echo "  Pulling gemma4:e2b-it-q4_K_M  (primary LLM — AI scoring, clustering, predictions)..."
+ollama pull gemma4:e2b-it-q4_K_M
+
+echo "  Pulling llama3.1               (fallback LLM)..."
+ollama pull llama3.1
+
+echo "  Pulling nomic-embed-text       (embedding model — bug clustering)..."
+ollama pull nomic-embed-text
+
+if $OLLAMA_STARTED; then
+    echo "  Stopping temporary Ollama server (LaunchAgent will manage it in production)..."
+    pkill -x ollama 2>/dev/null || true
+fi
+
+# ── [6/8] Verify Python packages ─────────────────────────────────────────────
+echo ""
+echo "[6/8] Verifying Python packages..."
+python -c "import pandas, streamlit, plotly, sklearn, PIL, rapidfuzz, tqdm; print('  All packages OK')"
+
+# ── [7/8] Streamlit LaunchAgent ───────────────────────────────────────────────
+echo ""
+echo "[7/8] Creating LaunchAgent for Streamlit dashboard..."
 PLIST=~/Library/LaunchAgents/com.pdri.dashboard.plist
-TOOLKIT_DIR=$(pwd)
 cat > "$PLIST" << EOFPLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -69,15 +112,34 @@ cat > "$PLIST" << EOFPLIST
 </dict>
 </plist>
 EOFPLIST
-launchctl load "$PLIST" 2>/dev/null || true
 
-echo "\n=== SETUP COMPLETE ==="
-echo "Dashboard URL: http://$(hostname):8501"
+if launchctl list com.pdri.dashboard &>/dev/null; then
+    launchctl unload "$PLIST" 2>/dev/null || true
+fi
+launchctl load "$PLIST"
+echo "  Dashboard LaunchAgent loaded (starts at login, auto-restarts on crash)."
+
+# ── [8/8] Daily refresh cron job ─────────────────────────────────────────────
 echo ""
-echo "Quick start:"
-echo "  source .venv/bin/activate"
-echo "  python scripts/parse_ecl_export.py data/ecl_export.xlsx data/ecl_parsed.csv"
-echo "  python scripts/compute_risk_scores.py data/ecl_parsed.csv data/risk_register.csv"
-echo "  ollama serve & python scripts/ai_risk_scorer.py data/risk_register.csv data/risk_register_scored.csv --provider ollama --model llama3.1"
-echo "  python scripts/auto_tag_tests.py data/risk_register_scored.csv --generate-skeletons tests/generated/ --summary"
-echo "  streamlit run scripts/bug_heatmap_dashboard.py"
+echo "[8/8] Setting up daily refresh cron job (03:00 daily)..."
+CRON_LINE="0 3 * * * ${TOOLKIT_DIR}/refresh_pipeline.sh >> ${TOOLKIT_DIR}/logs/cron.log 2>&1"
+if crontab -l 2>/dev/null | grep -qF "refresh_pipeline.sh"; then
+    echo "  Cron job already present — skipped."
+else
+    (crontab -l 2>/dev/null; echo "$CRON_LINE") | crontab -
+    echo "  Cron job added: runs daily at 03:00."
+fi
+
+# ── Done ──────────────────────────────────────────────────────────────────────
+echo ""
+echo "=== SETUP COMPLETE ==="
+echo "  Dashboard:  http://$(hostname):8501"
+echo "  Pipeline:   ./refresh_pipeline.sh [--dry-run | --skip-ollama | --weekend]"
+echo "  Cron log:   ${TOOLKIT_DIR}/logs/cron.log"
+echo ""
+echo "  Default models:"
+echo "    LLM:    gemma4:e2b-it-q4_K_M"
+echo "    Embeds: nomic-embed-text"
+echo ""
+echo "  To run a full refresh now:"
+echo "    ./refresh_pipeline.sh --weekend"

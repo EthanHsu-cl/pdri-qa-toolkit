@@ -64,12 +64,12 @@ MIN_BUGS_STRATIFIED    = 20   # min bugs per severity tier to run a stratified c
 # Input fingerprint helpers  (unchanged from v2.4)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _compute_fingerprint(df: pd.DataFrame) -> str:
+def _compute_fingerprint(df: pd.DataFrame, embed_model: str = "") -> str:
     n = len(df)
     latest = ""
     if "Create Date" in df.columns:
         latest = str(pd.to_datetime(df["Create Date"], errors="coerce").max())
-    raw = f"{n}|{latest}"
+    raw = f"{n}|{latest}|{embed_model}"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
@@ -190,6 +190,15 @@ def get_ollama_embeddings(
             print(f"  BugCode {code} still missing from cache after embedding — aborting Ollama path.")
             return None
         vecs.append(v)
+
+    # Validate uniform embedding dimensions (cache may contain stale vectors from a different model)
+    dims = {len(v) for v in vecs}
+    if len(dims) > 1:
+        print(f"  Inhomogeneous embedding dimensions {dims} — cache is stale (model changed?). Clearing and re-embedding.")
+        # Drop all cached entries and re-embed everything
+        if cache_path and cache_path.exists():
+            cache_path.unlink()
+        return None
 
     arr = np.array(vecs, dtype=np.float32)
     print(f"  Embeddings ready: shape={arr.shape}  (new={len(new_indices)}, cached={cached_count})")
@@ -628,7 +637,8 @@ def main():
           + (" | stratify-severity=ON" if args.stratify_severity else ""))
 
     # ── Fingerprint check ─────────────────────────────────────────────────────
-    fingerprint = _compute_fingerprint(df)
+    embed_model_for_fp = args.embed_model if args.provider == "ollama" else ""
+    fingerprint = _compute_fingerprint(df, embed_model=embed_model_for_fp)
 
     if not args.force and not args.no_cache:
         cached_fp = _load_fingerprint(cache_path)
