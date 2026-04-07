@@ -15,7 +15,7 @@ No extra arguments needed.
 
 Usage:
   python ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv --provider heuristic
-  python ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv --provider ollama --model llama3.1
+  python ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv --provider ollama --model gemma4
   python ai_risk_scorer.py data/risk_register_all.csv data/risk_register_scored_all.csv --provider ollama --verbose
 """
 import warnings
@@ -58,7 +58,7 @@ def score_heuristic(row):
     return impact, detect, "heuristic", reasoning
 
 
-def score_ollama(row, model="llama3.1"):
+def score_ollama(row, model="gemma4"):
     mod = row.get("module", "Unknown")
     prompt = (
         "You are a QA risk analyst.\n"
@@ -302,7 +302,7 @@ def main():
     p.add_argument("input_csv")
     p.add_argument("output_csv")
     p.add_argument("--provider", choices=["heuristic", "ollama", "openai"], default="heuristic")
-    p.add_argument("--model", default="qwen3:7b")
+    p.add_argument("--model", default="gemma4")
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Print full AI reasoning per module during scoring")
     a = p.parse_args()

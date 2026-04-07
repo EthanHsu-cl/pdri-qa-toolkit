@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ollama list:*)",
+      "Bash(ollama pull:*)",
+      "Bash(curl -s http://127.0.0.1:11434/api/embeddings -H 'Content-Type: application/json' -d '{\"model\": \"nomic-embed-text\", \"prompt\": \"test bug summary\"}')",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s http://127.0.0.1:11434/api/embed -H 'Content-Type: application/json' -d '{\"model\": \"nomic-embed-text\", \"input\": \"test bug summary\"}')",
+      "Bash(ollama --version)",
+      "Read(//Applications/Ollama.app/Contents/**)",
+      "Bash(ps -p 50604 -o pid,command)",
+      "Bash(kill 50604)",
+      "Bash(brew services:*)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f'OK — embedding dim: {len\\(d[\\\\\"embedding\\\\\"]\\)}'\\)\")"
+    ]
+  }
+}

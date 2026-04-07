@@ -32,7 +32,7 @@ Output paths:
 Usage:
   python predict_defects.py <input_csv>
   python predict_defects.py <input_csv> --cluster-csv data/clusters/ecl_parsed_clustered.csv
-  python predict_defects.py <input_csv> --provider ollama --model llama3.1
+  python predict_defects.py <input_csv> --provider ollama --model gemma4
   python predict_defects.py <input_csv> --provider claude --api-key <key>
   python predict_defects.py <input_csv> --no-ai
   python predict_defects.py <input_csv> --scored-csv <path>
@@ -962,7 +962,7 @@ def _generate_scenarios_ai_ollama(
     category_distribution: "dict | None" = None,
     cluster_labels: "list | None" = None,
     leading_signal: str = "",
-    model: str = "llama3.1",
+    model: str = "gemma4",
 ) -> list:
     """AI scenario generator using Ollama. Returns list of scenario dicts."""
     desc_block = "\n".join(f" - {d}" for d in descriptions[:15]) if descriptions \
@@ -1106,7 +1106,7 @@ def generate_bug_scenarios(
     category_preds_df: "pd.DataFrame | None",
     cluster_preds_df: "pd.DataFrame | None",
     provider: str = "none",
-    model: str = "llama3.1",
+    model: str = "gemma4",
     api_key: str = "",
     mod_col: str = "parsed_module",
     text_col: str = "parsed_description",
@@ -1300,7 +1300,7 @@ def generate_ai_narrative(module, predicted, risk_level, dominant_bug_type,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_ai_narrative_ollama(module, predicted, risk_level, dominant_bug_type,
-                                  leading_signal, descriptions, model="llama3.1",
+                                  leading_signal, descriptions, model="gemma4",
                                   cluster_forecast: "dict | None" = None,
                                   category_forecast: "dict | None" = None) -> str:
     desc_block = "\n".join(f" - {d}" for d in descriptions[:12]) if descriptions \
@@ -1364,7 +1364,7 @@ def generate_ai_narrative_ollama(module, predicted, risk_level, dominant_bug_typ
 
 def generate_focus_summary(preds, leading, orig_df,
                             mod_col="parsed_module", top_n=8,
-                            api_key="", provider="none", model="llama3.1",
+                            api_key="", provider="none", model="gemma4",
                             cluster_preds_df: "pd.DataFrame | None" = None,
                             category_preds_df: "pd.DataFrame | None" = None,
                             scenario_df: "pd.DataFrame | None" = None) -> str:
@@ -1507,7 +1507,7 @@ def main():
     scored_csv_path  = None
     cluster_csv_path = None
     provider = "claude"
-    model    = "llama3.1"
+    model    = "gemma4"
     api_key  = os.environ.get("ANTHROPIC_API_KEY", "")
 
     if "--no-ai" in args:

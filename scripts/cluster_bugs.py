@@ -124,7 +124,7 @@ def _load_cache(cache_path: Path) -> dict:
 # Ollama helpers  (unchanged from v2.4)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _ollama_embed(text: str, model: str = "llama3.1") -> "list[float] | None":
+def _ollama_embed(text: str, model: str = "nomic-embed-text") -> "list[float] | None":
     payload = json.dumps({"model": model, "prompt": text}).encode()
     req = urllib.request.Request(
         f"{OLLAMA_BASE}/api/embeddings",
@@ -142,7 +142,7 @@ def _ollama_embed(text: str, model: str = "llama3.1") -> "list[float] | None":
 def get_ollama_embeddings(
     texts: "list[str]",
     bug_codes: "list[str]",
-    model: str = "llama3.1",
+    model: str = "nomic-embed-text",
     cache: "dict | None" = None,
     cache_path: "Path | None" = None,
     fingerprint: str = "",
@@ -192,7 +192,7 @@ def get_ollama_embeddings(
     return arr
 
 
-def _ollama_label_cluster(samples: "list[str]", model: str = "llama3.1") -> str:
+def _ollama_label_cluster(samples: "list[str]", model: str = "gemma4") -> str:
     joined = "\n".join(f"- {s}" for s in samples[:8])
     prompt = (
         "You are a QA analyst. Given these bug descriptions from the same cluster, "
@@ -247,7 +247,8 @@ def cluster_bugs(
     eps=0.7,
     min_samples=3,
     provider="tfidf",
-    model="llama3.1",
+    model="gemma4",
+    embed_model="nomic-embed-text",
     embed_cache: "dict | None" = None,
     cache_path: "Path | None" = None,
     fingerprint: str = "",
@@ -273,7 +274,7 @@ def cluster_bugs(
             bug_codes = [str(i) for i in valid_idx]
 
         arr = get_ollama_embeddings(
-            texts, bug_codes=bug_codes, model=model,
+            texts, bug_codes=bug_codes, model=embed_model,
             cache=embed_cache, cache_path=cache_path, fingerprint=fingerprint,
         )
         if arr is not None:
@@ -464,7 +465,8 @@ def cluster_bugs_stratified(df: pd.DataFrame,
                               method: str = "kmeans",
                               n_clusters: int = 15,
                               provider: str = "tfidf",
-                              model: str = "llama3.1",
+                              model: str = "gemma4",
+                              embed_model: str = "nomic-embed-text",
                               embed_cache: "dict | None" = None,
                               fingerprint: str = "") -> pd.DataFrame:
     """
@@ -497,7 +499,7 @@ def cluster_bugs_stratified(df: pd.DataFrame,
         k = min(n_clusters, max(2, len(s12_df) // 5))
         print(f"  Stratified S1/S2: clustering {len(s12_df)} bugs into {k} clusters …")
         s12c = cluster_bugs(s12_df, method=method, n_clusters=k,
-                            provider=provider, model=model,
+                            provider=provider, model=model, embed_model=embed_model,
                             embed_cache=embed_cache, cache_path=None,
                             fingerprint=fingerprint)
         df.loc[s12_mask, "cluster_id_s12"]    = s12c["cluster_id"].values
@@ -512,7 +514,7 @@ def cluster_bugs_stratified(df: pd.DataFrame,
         k = min(n_clusters, max(2, len(s34_df) // 5))
         print(f"  Stratified S3/S4: clustering {len(s34_df)} bugs into {k} clusters …")
         s34c = cluster_bugs(s34_df, method=method, n_clusters=k,
-                            provider=provider, model=model,
+                            provider=provider, model=model, embed_model=embed_model,
                             embed_cache=embed_cache, cache_path=None,
                             fingerprint=fingerprint)
         df.loc[s34_mask, "cluster_id_s34"]    = s34c["cluster_id"].values
@@ -594,7 +596,10 @@ def main():
     parser.add_argument("input_csv")
     parser.add_argument("output_csv")
     parser.add_argument("--provider", choices=["tfidf", "ollama"], default="tfidf")
-    parser.add_argument("--model", default="llama3.1")
+    parser.add_argument("--model", default="gemma4",
+                        help="Ollama model for cluster label generation")
+    parser.add_argument("--embed-model", default="nomic-embed-text",
+                        help="Ollama model for bug embeddings (must support /api/embeddings)")
     parser.add_argument("--force",    action="store_true")
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument(
@@ -615,6 +620,7 @@ def main():
     # ── Load input ────────────────────────────────────────────────────────────
     df = pd.read_csv(str(inp))
     print(f"Loaded {len(df):,} bugs | provider={args.provider} model={args.model}"
+          + (f" embed-model={args.embed_model}" if args.provider == "ollama" else "")
           + (" | stratify-severity=ON" if args.stratify_severity else ""))
 
     # ── Fingerprint check ─────────────────────────────────────────────────────
@@ -657,7 +663,7 @@ def main():
     # ── Global clustering ─────────────────────────────────────────────────────
     df = cluster_bugs(
         df, method="kmeans", n_clusters=25,
-        provider=args.provider, model=args.model,
+        provider=args.provider, model=args.model, embed_model=args.embed_model,
         embed_cache=embed_cache,
         cache_path=cache_path if not args.no_cache else None,
         fingerprint=fingerprint,
@@ -668,7 +674,7 @@ def main():
         print("\nRunning severity-stratified clustering …")
         df = cluster_bugs_stratified(
             df, method="kmeans", n_clusters=15,
-            provider=args.provider, model=args.model,
+            provider=args.provider, model=args.model, embed_model=args.embed_model,
             embed_cache=embed_cache, fingerprint=fingerprint,
         )
 

@@ -22,6 +22,10 @@
 #   ./refresh_pipeline.sh --skip-ollama                  # use heuristic scorer
 #   ./refresh_pipeline.sh --skip-cluster                 # skip clustering
 #   ./refresh_pipeline.sh --skip-predict                 # skip predictions
+#   ./refresh_pipeline.sh --ollama-model gemma4                    # default
+#   ./refresh_pipeline.sh --ollama-model gemma4:e2b-it-q4_K_M     # quantised variant
+#   ./refresh_pipeline.sh --embed-model nomic-embed-text           # default embed model
+#   ./refresh_pipeline.sh --embed-model mxbai-embed-large          # alternative embed model
 #
 # Cron example (runs every day at 03:00):
 #   0 3 * * * /Users/yourname/pdri-qa-toolkit/refresh_pipeline.sh >> /Users/yourname/pdri-qa-toolkit/logs/refresh.log 2>&1
@@ -38,7 +42,8 @@ DATA="$SCRIPT_DIR/data"
 STAGING="$SCRIPT_DIR/data/staging"
 LOGS="$SCRIPT_DIR/logs"
 LOG_FILE="$LOGS/refresh_$(date +%Y%m%d_%H%M%S).log"
-OLLAMA_MODEL="llama3.1"
+OLLAMA_MODEL="gemma4"
+EMBED_MODEL="nomic-embed-text"
 STREAMLIT_PORT=8501
 export PYTHONUNBUFFERED=1   # force Python to flush stdout line-by-line when piped
 
@@ -68,6 +73,10 @@ for arg in "$@"; do
     --products)           ;; # value comes in next arg
     --duration-months=*)  OVERRIDE_DURATION="${arg#*=}" ;;
     --duration-months)    ;; # value comes in next arg
+    --ollama-model=*)     OLLAMA_MODEL="${arg#*=}" ;;
+    --ollama-model)       ;; # value comes in next arg
+    --embed-model=*)      EMBED_MODEL="${arg#*=}" ;;
+    --embed-model)        ;; # value comes in next arg
     *)
       # Handle --products VALUE and --duration-months VALUE (space-separated)
       ;;
@@ -86,6 +95,18 @@ while [[ $# -gt 0 ]]; do
     --duration-months)
       if [[ $# -gt 1 && ! "$2" =~ ^-- ]]; then
         OVERRIDE_DURATION="$2"
+        shift
+      fi
+      ;;
+    --ollama-model)
+      if [[ $# -gt 1 && ! "$2" =~ ^-- ]]; then
+        OLLAMA_MODEL="$2"
+        shift
+      fi
+      ;;
+    --embed-model)
+      if [[ $# -gt 1 && ! "$2" =~ ^-- ]]; then
+        EMBED_MODEL="$2"
         shift
       fi
       ;;
@@ -287,7 +308,8 @@ run_product_pipeline() {
         '$DATA_PRODUCT/ecl_parsed.csv' \
         '$CLUSTER_OUT/ecl_parsed_clustered.csv' \
         --provider ollama \
-        --model '$OLLAMA_MODEL'"
+        --model '$OLLAMA_MODEL' \
+        --embed-model '$EMBED_MODEL'"
     fi
 
     log "[$SLUG] Stage 5 complete."
@@ -365,7 +387,7 @@ resolve_product_schedule() {
 
 log "======================================================"
 log "QA Daily Refresh  $(date '+%Y-%m-%d %H:%M:%S')"
-log "dry_run=$DRY_RUN  skip_ollama=$SKIP_OLLAMA  skip_cluster=$SKIP_CLUSTER  skip_predict=$SKIP_PREDICT  force_schedule=$FORCE_SCHEDULE"
+log "dry_run=$DRY_RUN  skip_ollama=$SKIP_OLLAMA  skip_cluster=$SKIP_CLUSTER  skip_predict=$SKIP_PREDICT  force_schedule=$FORCE_SCHEDULE  ollama_model=$OLLAMA_MODEL  embed_model=$EMBED_MODEL"
 log "======================================================"
 
 # 1. Make sure Streamlit is up before we do anything
