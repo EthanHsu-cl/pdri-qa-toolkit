@@ -43,6 +43,7 @@ Usage:
 """
 import sys, json, hashlib, argparse, urllib.request, time
 import pandas as pd, numpy as np
+from tqdm import tqdm
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import DBSCAN, KMeans
 from sklearn.metrics.pairwise import cosine_distances
@@ -162,7 +163,8 @@ def get_ollama_embeddings(
         print(f"  Sending {len(new_indices):,} new bugs to Ollama...")
 
     new_done = 0
-    for i in new_indices:
+    for i in tqdm(new_indices, desc="Embedding bugs", unit="bug",
+                  file=sys.stderr, dynamic_ncols=True):
         code = str(bug_codes[i])
         vec = _ollama_embed(texts[i][:512], model=model)
         if vec is None:

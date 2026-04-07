@@ -3,8 +3,10 @@
 
 Usage:
     python scripts/fetch_from_n8n.py
+    python scripts/fetch_from_n8n.py --product pdri
+    python scripts/fetch_from_n8n.py --product phdi --duration-months 1
     python scripts/fetch_from_n8n.py --output data/ecl_raw.json
-    python scripts/fetch_from_n8n.py --webhook-url https://your-n8n-host/webhook/82746bb5-e140-4720-98a3-d1965900274d
+    python scripts/fetch_from_n8n.py --webhook-url https://your-n8n-host/webhook/82746bb5-e140-4720-98a3-d1965900274d-v4
 
 Then feed the output directly into the parser:
     python scripts/parse_ecl_export.py data/ecl_raw.json data/ecl_parsed.csv
@@ -26,14 +28,23 @@ import pandas as pd
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 DEFAULT_WEBHOOK_URL = (
-    "https://ecl-agent.cyberlink.com/webhook/82746bb5-e140-4720-98a3-d1965900274d-v3"
+    "https://ecl-agent.cyberlink.com/webhook/82746bb5-e140-4720-98a3-d1965900274d-v4"
 )
 DEFAULT_OUTPUT   = "data/ecl_raw.json"
 DEFAULT_PARSED   = "data/ecl_parsed.csv"
 
-# The n8n workflow reads body.product_name but the query condition is
-# hard-coded inside the workflow, so an empty string fetches all products.
-DEFAULT_PAYLOAD = {"product_name": "PowerDirector Mobile for iOS"}
+# Product slug → full eBug ProductName
+PRODUCT_MAP = {
+    "pdri":   "PowerDirector Mobile for iOS",
+    "phdi":   "PhotoDirector Mobile for iOS",
+    "pdra":   "PowerDirector Mobile for Android",
+    "phda":   "PhotoDirector Mobile for Android",
+    "pdr":    "PowerDirector",
+    "phd":    "PhotoDirector",
+    "promeo": "Promeo",
+}
+
+DEFAULT_PRODUCT = "pdri"
 
 # Fields that must be present for the parser to work correctly.
 # Build# and Close Build# are nice-to-have; Short Description is critical.
@@ -242,13 +253,19 @@ def main():
     )
     parser.add_argument(
         "--output", "-o",
-        default=DEFAULT_OUTPUT,
-        help=f"Output JSON file path (default: {DEFAULT_OUTPUT})",
+        default=None,
+        help=(
+            "Output JSON file path. When --product is used, defaults to "
+            "data/products/<slug>/ecl_raw.json; otherwise data/ecl_raw.json"
+        ),
     )
     parser.add_argument(
         "--parsed-output",
-        default=DEFAULT_PARSED,
-        help=f"Parsed CSV path used by --then-parse (default: {DEFAULT_PARSED})",
+        default=None,
+        help=(
+            "Parsed CSV path used by --then-parse. When --product is used, "
+            "defaults to data/products/<slug>/ecl_parsed.csv"
+        ),
     )
     parser.add_argument(
         "--timeout",
@@ -272,19 +289,55 @@ def main():
             "'auto' = choose by day of week (default)."
         ),
     )
+    # Multi-product support
+    parser.add_argument(
+        "--product",
+        choices=list(PRODUCT_MAP.keys()),
+        default=None,
+        help=(
+            f"Product slug ({', '.join(PRODUCT_MAP.keys())}). "
+            f"When set, output paths default to data/products/<slug>/. "
+            f"Default: {DEFAULT_PRODUCT} (backward-compatible legacy paths when omitted)."
+        ),
+    )
+    parser.add_argument(
+        "--duration-months",
+        type=int,
+        default=None,
+        help="Duration in months for the date range filter (sent to n8n). Default: 36.",
+    )
     args = parser.parse_args()
+
+    # Resolve product-aware output paths
+    product_slug = args.product
+    if product_slug:
+        product_dir = f"data/products/{product_slug}"
+        output_path = args.output or f"{product_dir}/ecl_raw.json"
+        parsed_path = args.parsed_output or f"{product_dir}/ecl_parsed.csv"
+        product_name = PRODUCT_MAP[product_slug]
+    else:
+        output_path = args.output or DEFAULT_OUTPUT
+        parsed_path = args.parsed_output or DEFAULT_PARSED
+        product_name = PRODUCT_MAP[DEFAULT_PRODUCT]
+
+    duration_months = args.duration_months or 36
 
     scope = resolve_scope(args)
     start_time = datetime.now()
-    print(f"Fetching eBugs — {start_time.strftime('%Y-%m-%d %H:%M:%S')}  [scope={scope}]")
+    product_label = f"{product_slug or DEFAULT_PRODUCT} ({product_name})"
+    print(
+        f"Fetching eBugs — {start_time.strftime('%Y-%m-%d %H:%M:%S')}  "
+        f"[product={product_label}  duration={duration_months}mo  scope={scope}]"
+    )
 
-    # Build the payload; when scope=latest, resolve the actual version string
-    # from the catalogue so the n8n workflow knows exactly which version to
-    # fetch rather than guessing by string sort order.
-    payload = dict(DEFAULT_PAYLOAD)
-    payload["scope"] = scope
+    # Build the payload
+    payload = {
+        "product_name": product_name,
+        "duration_months": duration_months,
+        "scope": scope,
+    }
     if scope == "latest":
-        latest_ver = get_latest_version(args.output)
+        latest_ver = get_latest_version(output_path)
         if latest_ver:
             payload["latest_version"] = latest_ver
             print(f"  Sending latest_version={latest_ver!r} in webhook payload")
@@ -300,19 +353,19 @@ def main():
     if not ok:
         sys.exit(1)
 
-    summary = save_json(records, args.output)
+    summary = save_json(records, output_path)
 
     elapsed = (datetime.now() - start_time).total_seconds()
     print(f"⏱  Fetch+save completed in {elapsed:.1f}s  (scope={scope})")
 
     if args.then_parse:
-        print(f"\nRunning parser → {args.parsed_output}")
+        print(f"\nRunning parser → {parsed_path}")
         result = subprocess.run(
             [
                 sys.executable,
                 "scripts/parse_ecl_export.py",
-                args.output,
-                args.parsed_output,
+                output_path,
+                parsed_path,
             ],
             check=False,
         )
@@ -322,7 +375,7 @@ def main():
     else:
         print(
             f"\nNext step:\n"
-            f"  python scripts/parse_ecl_export.py {args.output} {args.parsed_output}\n"
+            f"  python scripts/parse_ecl_export.py {output_path} {parsed_path}\n"
             f"\nOr re-run with --then-parse to do both in one command."
         )
 

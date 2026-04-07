@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
-"""PDR-I Bug Heatmap Dashboard v2.20
+"""QA Bug Dashboard v3.0
+
+Changes from v2.21:
+  - Renamed from "PDR-I QA Dashboard" to "QA Bug Dashboard" for multi-product.
+  - Added product selector dropdown in sidebar (scans data/products/ for
+    available product directories containing ecl_parsed.csv).
+  - All data paths are now dynamic based on selected product slug.
+  - Falls back to legacy data/ paths when no product directories exist.
+  - Version bumped to v3.0.
+
+Changes from v2.20:
+  - Tab 9 refactored to scenario-based bug forecasting layout.
+    Primary view now shows "What to Test Next Build" with concrete bug
+    scenario predictions per module, grouped by risk tier.
+  - New "Predicted Bug Scenarios by Module" section with per-module
+    expanders showing scenario text, confidence badges, and source examples.
+  - Module forecast cards enhanced with top predicted scenarios.
+  - Count-based sections (Predicted Bug Count chart, Actual vs Predicted,
+    Module Signals Table, Full predictions table) demoted into a single
+    collapsed "Advanced / Model Diagnostics" expander at the bottom.
+  - Bug Categories stacked bar chart promoted to higher position.
+  - Loads new _predictions_by_scenario.csv (v5.0) from predict_defects.py.
+  - Headline metrics replace MAE with scenario count.
 
 Changes from v2.19:
-  - Tab 9 (Defect Forecast): v4.0 category-based predictions.
-    New stacked bar chart "Predicted Bug Categories — What Will Break?"
-    shows per-module breakdown of expected QA bug categories (Crash/Stability,
-    Feature not working, UI/Display, UX/Usability, Translation, Data/File).
-  - Module forecast cards now show "What types of bugs to expect" section
-    with per-category percentages from recent history.  Card headers show
-    the top 2 expected categories. "Bug categories expected" metric replaces
-    raw bug count when category data is available.
-  - Loads new _predictions_by_category.csv (v4.0) from predict_defects.py.
-  - AI Risk Briefing and Predicted Bug Count chart now use consistent
-    numbers — the AI narrative no longer states or re-derives bug counts,
-    eliminating the previous mismatch between the briefing text and chart.
 
 Changes from v2.18:
   - Sidebar Steps 1–4 consolidated into a single "📁 Data Sources" expander.
@@ -87,6 +97,7 @@ Usage:
   streamlit run scripts/bug_heatmap_dashboard.py \\
     --server.address 0.0.0.0 --server.port 8501
 """
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -94,8 +105,71 @@ import plotly.express as px
 from pathlib import Path
 
 
-st.set_page_config(page_title="PDR-I QA Dashboard", layout="wide", page_icon="🔥")
-st.sidebar.title("🔥 PDR-I QA Dashboard v2.20")
+st.set_page_config(page_title="QA Bug Dashboard", layout="wide", page_icon="🔥")
+st.sidebar.title("🔥 QA Bug Dashboard v3.0")
+
+# ── Product selector ─────────────────────────────────────────────────────
+PRODUCT_MAP = {
+    "pdri":   "PowerDirector Mobile (iOS)",
+    "phdi":   "PhotoDirector Mobile (iOS)",
+    "pdra":   "PowerDirector Mobile (Android)",
+    "phda":   "PhotoDirector Mobile (Android)",
+    "pdr":    "PowerDirector",
+    "phd":    "PhotoDirector",
+    "promeo": "Promeo",
+}
+
+_products_dir = Path("data/products")
+_available_products = []
+if _products_dir.exists():
+    for d in sorted(_products_dir.iterdir()):
+        if d.is_dir() and (d / "ecl_parsed.csv").exists():
+            slug = d.name
+            label = PRODUCT_MAP.get(slug, slug)
+            _available_products.append((slug, label))
+
+if _available_products:
+    _product_labels = [f"{label} ({slug})" for slug, label in _available_products]
+    _selected_idx = st.sidebar.selectbox(
+        "Product",
+        range(len(_product_labels)),
+        format_func=lambda i: _product_labels[i],
+        key="product_selector",
+    )
+    selected_slug = _available_products[_selected_idx][0]
+    st.session_state["selected_product"] = selected_slug
+    _product_dir = f"data/products/{selected_slug}"
+else:
+    # Legacy fallback: no product directories, use flat data/
+    selected_slug = None
+    _product_dir = "data"
+
+# Reset product-scoped widget/session state when switching products.
+# Streamlit widget keys keep their prior values across reruns, so a changed
+# default path alone will not update text_input/radio values unless we clear
+# the old keys first.
+_product_state_key = selected_slug or "__legacy__"
+_prev_product_state_key = st.session_state.get("_last_product_state_key")
+if _prev_product_state_key != _product_state_key:
+    _prev_slug = None if _prev_product_state_key == "__legacy__" else _prev_product_state_key
+    _new_slug = None if _product_state_key == "__legacy__" else _product_state_key
+    for _k in [
+        "ds_bugs", "up_bugs", "fp_bugs",
+        "ds_risk", "fp_risk",
+        "ds_cluster", "fp_cluster", "fp_cluster_sum", "fp_cluster_ent",
+        "ds_pred", "fp_pred", "fp_pred_sum", "fp_pred_li",
+        "fp_pred_cluster", "fp_pred_category", "fp_pred_scenario",
+        "version_multiselect",
+    ]:
+        st.session_state.pop(_k, None)
+    st.session_state["_product_switched_notice"] = (
+        f"Product changed: {(_prev_slug or 'legacy data')} -> {(_new_slug or 'legacy data')}. "
+        "Data source paths were reset to this product's defaults."
+    )
+    st.session_state["_last_product_state_key"] = _product_state_key
+
+if st.session_state.get("_product_switched_notice"):
+    st.toast(st.session_state.pop("_product_switched_notice"), icon="🔄")
 
 
 # ---------------------------------------------------------------------
@@ -166,13 +240,26 @@ def is_active(status_val) -> bool:
     return str(status_val).strip().lower() not in INACTIVE_STATUSES
 
 
+def _file_mtime(fp: str) -> float:
+    """Return file mtime for cache-busting; 0 if missing."""
+    try:
+        return os.path.getmtime(fp)
+    except OSError:
+        return 0.0
+
+
 @st.cache_data
-def load_csv(fp: str) -> pd.DataFrame:
+def _load_csv_cached(fp: str, _mtime: float) -> pd.DataFrame:
     df = pd.read_csv(fp, low_memory=False)
     for dc in ["Create Date", "Closed Date"]:
         if dc in df.columns:
             df[dc] = pd.to_datetime(df[dc], errors="coerce")
     return df
+
+
+def load_csv(fp: str) -> pd.DataFrame:
+    """Load CSV with automatic cache-busting when the file changes on disk."""
+    return _load_csv_cached(fp, _file_mtime(fp))
 
 
 def normalise_module(name: str) -> str:
@@ -256,18 +343,19 @@ active_tab = st.sidebar.radio(
 
 # Probe all default paths up front so the expander label can show a
 # meaningful status badge even before the user opens it.
-_bugs_default         = "data/ecl_parsed.csv"
-_risk_default         = "data/risk_register_scored_all.csv"
-_cluster_default      = "data/clusters/ecl_parsed_clustered.csv"
-_cluster_sum_default  = "data/clusters/ecl_parsed_cluster_summary.csv"
-_cluster_ent_default  = "data/clusters/ecl_parsed_module_entropy.csv"      # v3.0 NEW
-_cluster_s12_default  = "data/clusters/ecl_parsed_cluster_summary_s12.csv" # v3.0 NEW
-_cluster_s34_default  = "data/clusters/ecl_parsed_cluster_summary_s34.csv" # v3.0 NEW
-_pred_default         = "data/predictions/ecl_parsed_predictions.csv"
-_pred_sum_def         = "data/predictions/ecl_parsed_predictions_focus_summary.txt"
-_pred_li_def          = "data/predictions/ecl_parsed_predictions_leading_indicators.csv"
-_pred_cluster_def     = "data/predictions/ecl_parsed_predictions_by_cluster.csv" # v3.0 NEW
-_pred_category_def    = "data/predictions/ecl_parsed_predictions_by_category.csv" # v4.0 NEW
+_bugs_default         = f"{_product_dir}/ecl_parsed.csv"
+_risk_default         = f"{_product_dir}/risk_register_scored_all.csv"
+_cluster_default      = f"{_product_dir}/clusters/ecl_parsed_clustered.csv"
+_cluster_sum_default  = f"{_product_dir}/clusters/ecl_parsed_cluster_summary.csv"
+_cluster_ent_default  = f"{_product_dir}/clusters/ecl_parsed_module_entropy.csv"
+_cluster_s12_default  = f"{_product_dir}/clusters/ecl_parsed_cluster_summary_s12.csv"
+_cluster_s34_default  = f"{_product_dir}/clusters/ecl_parsed_cluster_summary_s34.csv"
+_pred_default         = f"{_product_dir}/predictions/ecl_parsed_predictions.csv"
+_pred_sum_def         = f"{_product_dir}/predictions/ecl_parsed_predictions_focus_summary.txt"
+_pred_li_def          = f"{_product_dir}/predictions/ecl_parsed_predictions_leading_indicators.csv"
+_pred_cluster_def     = f"{_product_dir}/predictions/ecl_parsed_predictions_by_cluster.csv"
+_pred_category_def    = f"{_product_dir}/predictions/ecl_parsed_predictions_by_category.csv"
+_pred_scenario_def    = f"{_product_dir}/predictions/ecl_parsed_predictions_by_scenario.csv"
 
 _bugs_probe    = Path(_bugs_default).exists()
 _risk_probe    = Path(_risk_default).exists()
@@ -380,6 +468,7 @@ with st.sidebar.expander(_datasources_label, expanded=not _bugs_probe):
     pred_leading_df     = None
     pred_cluster_df     = None   # v3.0: per-cluster bug-type predictions
     pred_category_df    = None   # v4.0: per-category bug-type predictions
+    pred_scenario_df    = None   # v5.0: per-module bug scenario predictions
 
     pds = st.radio(
         "Prediction data source", ["File Path", "None"], key="ds_pred", index=0
@@ -400,6 +489,9 @@ with st.sidebar.expander(_datasources_label, expanded=not _bugs_probe):
         pcatfp = st.text_input(
             "Bug category predictions CSV (v4.0)", value=_pred_category_def, key="fp_pred_category",
         )
+        pscfp = st.text_input(
+            "Bug scenario predictions CSV (v5.0)", value=_pred_scenario_def, key="fp_pred_scenario",
+        )
         if Path(pfp).exists():
             pred_df = load_csv(pfp)
             st.caption(f"✅ {len(pred_df):,} modules loaded")
@@ -413,6 +505,8 @@ with st.sidebar.expander(_datasources_label, expanded=not _bugs_probe):
             pred_cluster_df = load_csv(pcfp)
         if Path(pcatfp).exists():
             pred_category_df = load_csv(pcatfp)
+        if Path(pscfp).exists():
+            pred_scenario_df = load_csv(pscfp)
 
 # ── End of expander ────────────────────────────────────────────────────────
 # Derived-field computation runs here, outside the expander, so it always
@@ -668,13 +762,19 @@ Cell colour and number = sum of **severity-weighted** bug counts:
 
 Weighting means a module with 2 critical bugs ranks higher than one with 20 minor bugs.
 
+**Sort order:** Rows are sorted by **S1 (Critical) count descending** first, then by **total weighted count descending**. This guarantees that modules with crash-level bugs always float to the top of the chart regardless of how many minor bugs exist alongside them.
+
+**View toggle:** Switch between **Category** (20 broad groups) and **Module (top 30)** (the 30 individual modules with the highest total weighted bug count).
+- Use **Category** first for a quick executive overview of which product area is most problematic.
+- Switch to **Module** to identify the specific sub-feature causing the most bugs — particularly useful when a category is large and bugs are concentrated in one or two spots inside it.
+
 **`[P1]` / `[P2]` badges** appear next to module names when risk data is loaded (sidebar Step 2).
 They show the module's test priority — see the Risk Heatmap tab for full detail.
 
-**Click any cell** to instantly filter the drill-down table below to that module + severity.
+**Click any cell** to instantly filter the drill-down table below the chart to that exact module + severity combination. The drill-down table lists every matching bug with its ECL link, severity, priority, and Short Description so you can immediately investigate without leaving the dashboard.
 
 ---
-**Where this data comes from:** Bugs are parsed from the ECL Excel export by `parse_ecl_export.py`. Severity is extracted from the ECL `Severity` column and mapped to S1-S4, with weights S1=10, S2=5, S3=2, S4=1 applied at parse time. The `[P1]`/`[P2]` priority badges come from `risk_register_scored.csv` loaded in sidebar Step 2 — produced by the I x P x D scoring pipeline described in the Risk Heatmap tab.
+**Where this data comes from:** Bugs are parsed from the ECL Excel export by `parse_ecl_export.py`. Severity is extracted from the ECL `Severity` column and mapped to S1–S4, with weights S1=10, S2=5, S3=2, S4=1 applied at parse time. The `[P1]`/`[P2]` priority badges come from `risk_register_scored.csv` loaded in sidebar Step 2 — produced by the I×P×D scoring pipeline described in the Risk Heatmap tab.
 """)
 
     vl = st.radio("View", ["Category", "Module (top 30)"], horizontal=True, key="t1v")
@@ -789,18 +889,27 @@ elif active_tab == "📅 Version Timeline":
     with st.expander("📖 How to read this chart", expanded=False):
         st.markdown("""
 **What this shows:** Severity-weighted bug counts per module (rows) per version (columns).
+Columns are sorted in **ascending version order** — oldest release on the left, most recent on the right — so you can read the history left to right as a timeline.
 
-**How to use it:**
-- A column that suddenly turns dark red = a bad release for that module — likely a regression.
-- A row that stays consistently warm across all versions = a chronic problem area.
-- Compare the last 3 versions (default filter) to spot recent regressions quickly.
+**How to interpret the cells:**
+- A single cell that suddenly darkens in one column = a regression was introduced in that specific release for that module.
+- A row that stays consistently warm across all versions = a **chronic problem** — this module is never stable regardless of release cadence. It likely needs an architectural fix, not just a patch.
+- A column that is uniformly dark across many rows = a **systemically bad release** — a large merge, SDK update, or new feature likely affected many areas at once.
+- A cell that goes dark → light → dark again = a fix was applied and then regressed in a later build. Escalate to RD for a root-cause review.
+- A cell that gradually lightens over time = bugs are being resolved and not reintroduced (healthy trend — ideally what every row looks like toward the end of a release cycle).
 
-**Severity weighting** is the same as Tab 1: Critical×10, Major×5, Normal×2, Minor×1.
+**Version filter:** Use the **version multiselect** in the sidebar to narrow the columns to a specific release window.
+- Default shows the 3 most recent versions — fast for spotting recent regressions.
+- Select all versions to see the full history and identify chronically unstable modules.
 
-**Tip:** Switch the filter in the sidebar to "All versions" to see the full history.
+**View toggle:** Switch between **Category** (broad groups) and **Module (top 25)** (the 25 individual modules with the highest total weighted bug count).
+- **Category** is faster for identifying which product area had the worst release.
+- **Module** pinpoints the exact sub-feature — useful once you know which category to investigate.
+
+**Severity weighting** is the same as Tab 1: S1×10, S2×5, S3×2, S4×1. A single S1 bug registers darker than many minor ones, keeping critical issues visually prominent.
 
 ---
-**Where this data comes from:** `parsed_version` is extracted from the ECL `Version` field by `parse_ecl_export.py`. Severity weighting (S1=10, S2=5, S3=2, S4=1) is stored as `severity_weight` per bug at parse time. `compute_risk_scores.py` also produces one `risk_register_<version>.csv` per version so the full I x P x D scoring can be run per-release if needed.
+**Where this data comes from:** `parsed_version` is extracted from the ECL `Version` field by `parse_ecl_export.py`. Severity weighting (S1=10, S2=5, S3=2, S4=1) is stored as `severity_weight` per bug at parse time. `compute_risk_scores.py` also produces one `risk_register_<version>.csv` per version so the full I×P×D scoring can be run per-release if needed.
 """)
 
     if "parsed_version" in df.columns:
@@ -853,15 +962,18 @@ For example: `PDR-I 16.2.5 - [EDF][UX] AI Storytelling: subtitle misplaced` → 
 | `UX` | User experience issue |
 | `MUI` | Multi-UI / platform consistency issue |
 
-**Regression Bug Rate (Side Effect %):** Modules with a high rate need extra regression coverage.
-A module at 30%+ side-effect rate means nearly 1 in 3 bugs is a regression — test it every build.
+**The main heatmap** (top of the tab) shows the raw count of each tag per module/category. Darker cells = more bugs with that tag in that area.
 
-**AT Found Rate:** Percentage of bugs caught by automated tests.
-- Green (≥30%) — good automation coverage
-- Orange (10–29%) — partial coverage, room to improve
-- Red (<10%) — automation blind spot, bugs are slipping through to manual
+**Regression Bug Rate (Side Effect %):** A dedicated bar chart below the main heatmap ranks modules by their side-effect rate — the fraction of all their bugs that are regressions.
+- A rate above **30%** means nearly 1 in 3 bugs is a regression — this module needs dedicated regression testing every single build.
+- Computed as: `(bugs tagged [Side Effect]) ÷ (total bugs) × 100`.
 
-**Automation Blind Spots** at the bottom lists modules with 0% AT coverage — highest priority for new automation.
+**AT Found Rate bar chart:** Ranks modules by what fraction of their bugs were caught by automated testing.
+- 🟢 **≥30%** — strong automation coverage; AT is an effective safety net for this module.
+- 🟡 **10–29%** — partial coverage; automation helps but manual gaps remain.
+- 🔴 **<10%** — automation blind spot; nearly all bugs reach human testers or are missed entirely.
+
+**Automation Blind Spots** (bottom of the tab) = modules with 0% AT-found rate. These are the highest-priority candidates for adding new automated tests — every bug in these modules currently relies entirely on manual discovery.
 
 ---
 **Where tags come from:** `parse_ecl_export.py` reads `[TAG]` prefixes in each bug's Short Description and creates boolean columns: `tag_side_effect`, `tag_at_found`, `tag_edf`, `tag_ux`, `tag_mui`, etc.
@@ -870,7 +982,7 @@ These feed directly into the risk scoring pipeline:
 - `regression_rate` = `side_effect_count / total_bugs` — computed in `compute_risk_scores.py`
 - `automation_catch_rate` = `at_found_count / total_bugs` — also from `compute_risk_scores.py`
 
-Both rates feed into **Detectability (D)** in `ai_risk_scorer.py`: a module with 0% AT coverage gets D+1 (harder to detect), pushing its overall I x P x D risk score up.
+Both rates feed into **Detectability (D)** in `ai_risk_scorer.py`: a module with 0% AT coverage gets D+1 (harder to detect), pushing its overall I×P×D risk score up.
 """)
 
     tc = [c for c in df.columns if c.startswith("tag_")]
@@ -967,6 +1079,22 @@ The chart has **RD Priority on the Y axis (rows)** and **QA Severity on the X ax
 | **N/A (not yet triaged)** | 🔴 **Urgent Gap** — critical bug not yet triaged by RD | ⚪ Expected — low-severity bugs often untriaged |
 
 **Priority N/A** means RD has not assigned a priority yet. Bugs on the **diagonal** (top-left and bottom-right) are well-aligned. Bugs in the **top-right or bottom-left** cells are mismatches worth investigating.
+
+---
+### 📊 The Three Mismatch Metrics (below the chart)
+
+| Metric | Definition | What to do |
+|--------|-----------|-----------|
+| **🔴 Critical Mismatch** | S1 or S2 bugs with RD Priority 4 (No Matter) or N/A | Escalate directly to RD — a confirmed crash or major functional failure must not be deprioritised without a written justification |
+| **🟡 Inverse Mismatch** | S3 or S4 bugs that RD has marked Fix Now or Must Fix | Verify scope: RD may know about a wider business impact that QA's severity rating didn't capture. If the higher priority is justified, update the severity. If not, discuss recalibration with RD. |
+| **⚪ Untriaged Critical** | S1 or S2 bugs where RD has not set any priority (N/A) | The most urgent gap — a crash- or data-loss-level bug with no triage decision is an uncontrolled release risk. Ping RD for a priority decision immediately. |
+
+**Critical Mismatch drill-down** (auto-expands when mismatches exist): lists every S1/S2 bug with a low or missing priority, with ECL links for direct follow-up.
+
+---
+**Where this data comes from:**
+- `priority_label` — mapped from the ECL `Priority` column by `parse_ecl_export.py` using the priority label map (1 = Fix Now → 2 = Must Fix → 3 = Better Fix → 4 = No Matter → 5 = N/A)
+- `severity_num` — extracted from the ECL `Severity` column and mapped S1=1 (Critical) → S4=4 (Minor)
 """)
 
     if "priority_label" in df.columns and "severity_num" in df.columns:
@@ -1027,16 +1155,21 @@ elif active_tab == "👥 Team Coverage":
 
     with st.expander("📖 How to read this chart", expanded=False):
         st.markdown("""
-**What this shows:** How many bugs each tester has filed per module category.
-A cell with a high number means that tester has deep experience in that area.
+**What this shows:** How many bugs each tester (row) has filed per module category (column). A darker cell = more bugs filed by that tester in that category — a proxy for hands-on test experience in that area.
 
-**Knowledge Silos** (flagged below the chart) = a category where only **one** tester has filed bugs.
-This is a bus-factor risk — if that person is unavailable, test coverage for that area drops to zero.
+**Important caveat:** This counts bugs *filed*, not simply bugs *tested*. A thorough tester who actively investigates will naturally file more bugs. A light cell does not necessarily mean low coverage — the module may have genuinely been stable or another tester already opened duplicates. Treat this as a rough experience signal, not an exact coverage map.
 
-**How to act on this:**
-- Pair the sole expert with a second tester for knowledge transfer.
-- Prioritise those categories for test documentation / runbook creation.
-- Consider cross-training during lower-pressure sprints.
+**Knowledge Silos** (flagged below the chart) = a category where only **one** tester has ever filed bugs.
+This is a **bus-factor risk**: if that person is unavailable — on holiday, leaves the team, or is reassigned — that entire area of the product has zero team members with direct hands-on experience. In a release crunch, this creates an undetected blind spot.
+
+**How to act on silos:**
+- **Pair the sole expert** with a second tester for 1–2 sprints of shadowed testing — the fastest, cheapest knowledge transfer.
+- **Document test runbooks** for silo categories: what to test, where the known edge cases are, which failure modes recur most often. If the expert leaves, the runbook preserves the knowledge.
+- **Cross-train during low-pressure sprints** — not mid-sprint before a release. The right time to address bus-factor risk is before it becomes urgent.
+- **Prioritise silo categories that also appear in the P1 list (Risk Heatmap tab)** — these are the most dangerous combination: high risk AND single point of failure for testing.
+
+---
+**Where this data comes from:** `Creator` is read directly from the ECL `Creator` field by `parse_ecl_export.py`. `module_category` is the normalised category assigned at parse time. Only bugs in the current sidebar filter (version, status, product) are counted — change filters to compare coverage across different release windows.
 """)
 
     if "Creator" in df.columns and "module_category" in df.columns:
@@ -1070,16 +1203,29 @@ elif active_tab == "📊 KPI Dashboard":
         st.markdown("""
 | KPI | What it measures | Why it matters |
 |-----|-----------------|----------------|
-| **Total Bugs** | Active bugs matching current sidebar filters | Filtered baseline — change version/status filters to slice |
-| **Critical Bugs (S1)** | Severity-1 (crash / data loss) open bugs | Any S1 in the release is a potential showstopper |
-| **Avg Days to Close** | Mean calendar days from bug creation to Close status | Measures RD fix velocity; rising trend = backlog pressure |
-| **Regression Bug Rate** | % of bugs tagged `[Side Effect]` | How often new code breaks existing functionality |
-| **P1 Modules** | Modules scored ≥60 on I×P×D risk scale | Must be tested every single build |
-| **P2 Modules** | Modules scored 30–59 | Test every sprint / major build |
-| **Avg Risk Score** | Mean I×P×D across all filtered modules | Overall health signal; rising = increasing risk exposure |
+| **Total Bugs** | All bugs matching the current sidebar filters (version, status, product) | Filtered baseline — change sidebar version/status filters to slice by release or bug state |
+| **Critical Bugs (S1)** | Count of Severity-1 (crash / data loss) bugs in the current filter | Any S1 in the release candidate is a potential showstopper. Zero S1s is the minimum gate criterion before releasing. |
+| **Avg Days to Close** | Mean calendar days from bug `Create Date` to `Closed Date` | Measures RD fix velocity. Rising trend = backlog is accumulating faster than it is being resolved. Compare across releases to detect if fix rate is deteriorating. |
+| **Regression Bug Rate** | % of bugs tagged `[Side Effect]` in their Short Description | Side-effect bugs are regressions — features that previously worked and broke after a code change. A rate above 20% indicates insufficient regression test coverage for the complexity of changes being made. |
+| **Active vs Inactive** | Active = Open / In-Progress; Inactive = Closed / NAB / Won't Fix | Active count = live unresolved risk in the current filter. |
+| **P1 Modules** | Modules with I×P×D risk score > 90 (from loaded risk register) | Every P1 module must be tested every single build — no exceptions. |
+| **P2 Modules** | Modules with I×P×D risk score 70–90 | Test every sprint or major build. |
+| **Avg Risk Score** | Mean I×P×D risk score across all modules in the current filter | Overall risk health signal. A rising trend = cumulative risk is growing. A declining trend = risk is being managed and reduced. |
 
-**Weekly Bug Trend:** A healthy project shows a declining or flat trend late in a release cycle.
-A spike mid-cycle usually indicates a large merge or new feature landing.
+---
+### 📈 Weekly Bug Trend
+
+Counts how many bugs were **created per calendar week** by resampling the `Create Date` field into 7-day buckets. The line chart lets you see whether bug creation is accelerating, stable, or declining.
+
+Healthy patterns:
+- **Declining trend late in a release cycle** — RD is closing bugs faster than new ones are being found. A good sign before RC sign-off.
+- **Flat trend mid-cycle** — Normal steady state during active development.
+- **Spike mid-cycle** — Often signals a large merge, SDK update, or new feature drop that introduced regressions. Cross-reference with Tab 2 (Version Timeline) to pinpoint which module spiked.
+- **Spike late in cycle** — Warning: regression testing uncovered a deep problem. Consider delaying release until the spike resolves.
+
+### 🥧 Severity Distribution
+
+Pie chart of all currently filtered bugs broken down by severity. A healthy end-of-cycle snapshot should show a large S3/S4 slice. A large S1 or S2 slice at release time is a risk signal requiring immediate RD escalation.
 
 ---
 **Where these numbers come from:**
@@ -1267,10 +1413,10 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
 
 | Priority | Score threshold | Testing cadence |
 |----------|----------------|-----------------|
-| P1 — Critical  | >= 60 | Every build, every sprint |
-| P2 — High      | 30-59 | Every sprint / major build |
-| P3 — Medium    | 10-29 | Every release candidate |
-| P4 — Low       | < 10  | Full release cycle only |
+| P1 — Critical  | > 90  | Every build, every sprint |
+| P2 — High      | 70-90 | Every sprint / major build |
+| P3 — Medium    | 50-69 | Every release candidate |
+| P4 — Low       | < 50  | Full release cycle only |
 
 ---
 
@@ -1279,13 +1425,15 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
 | Element | Data source | What it represents |
 |---------|-------------|-------------------|
 | **Block size** | `ecl_parsed.csv` | Bug count for this module |
-| **Colour — Risk Score** | `risk_register_scored.csv` | Final I x P x D value |
+| **Colour — Risk Score** | `risk_register_scored.csv` | Final I×P×D value |
 | **Colour — Priority** | `risk_register_scored.csv` | P1–P4 assignment |
 | **Colour — Critical Count** | `ecl_parsed.csv` | Number of S1 (crash-level) bugs |
-| **Colour — Severity Weight** | `ecl_parsed.csv` | Weighted bug sum S1x10 + S2x5 + S3x2 + S4x1 |
-| **Right detail panel** | Both files joined | Total bugs, critical count, risk score for selected module |
-| **P1 bar chart** | `risk_register_scored.csv` | P1 modules ranked by risk score, highest first |
-| **Risk vs Probability scatter** | `risk_register_scored.csv` | I x P x D vs P — shows which are both high-risk AND historically bug-prone |
+| **Colour — Severity Weight** | `ecl_parsed.csv` | Weighted bug sum S1×10 + S2×5 + S3×2 + S4×1 |
+| **Right detail panel** | Both files joined | Total bugs, critical count, risk score, and full bug list for the selected module. Before clicking a block, shows the top 5 modules by bug count as a quick reference. |
+| **🌞 Sunburst View** (expander below treemap) | Both files | Same data in a nested pie chart. Use it to compare the proportion of bugs across categories — the outer ring is modules, the inner ring is categories. |
+| **📋 Category Summary** (expander below treemap) | Both files | Aggregate table: one row per category showing total modules, total bugs, severity weight, average risk score, and count of P1 modules. Sort by Avg Risk Score to quickly identify the riskiest category. |
+| **🔴 P1 Modules bar chart** | `risk_register_scored.csv` | All P1-priority modules ranked by risk score, highest first. These are the mandatory test-every-build targets. Each bar is coloured by category. |
+| **Risk Score vs Probability scatter** | `risk_register_scored.csv` | I×P×D score on the Y axis vs historical defect probability rank (1–5) on the X axis. X values are slightly jittered (±0.35) so overlapping dots separate visually — hover for the true integer value. Threshold lines at 50, 70, 90 define the four risk zones. Look for modules in the top-right corner: both high-risk AND historically bug-prone — these are the highest-priority targets. |
 
 > **Tip:** Heuristic scores are a strong starting point but should be reviewed with the team.
 > Open `risk_register_scored.csv` in a spreadsheet, adjust any `impact_score` or
@@ -1525,10 +1673,10 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
         scatter_df["probability"] = scatter_df["parsed_module"].map(prob_map).fillna(2.5)
 
         def assign_zone(score: float) -> str:
-            if score >= 60: return "Critical Risk (≥60)"
-            if score >= 30: return "High Risk (30-59)"
-            if score >= 10: return "Medium Risk (10-29)"
-            return "Low Risk (<10)"
+            if score > 90: return "Critical Risk (>90)"
+            if score >= 70: return "High Risk (70-90)"
+            if score >= 50: return "Medium Risk (50-69)"
+            return "Low Risk (<50)"
 
         scatter_df["risk_zone"] = scatter_df["risk_score"].apply(assign_zone)
 
@@ -1541,10 +1689,10 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
         )
 
         zone_colors = {
-            "Critical Risk (≥60)": "#D62728",
-            "High Risk (30-59)":   "#FF7F0E",
-            "Medium Risk (10-29)": "#BCBD22",
-            "Low Risk (<10)":      "#2CA02C",
+            "Critical Risk (>90)": "#D62728",
+            "High Risk (70-90)":   "#FF7F0E",
+            "Medium Risk (50-69)": "#BCBD22",
+            "Low Risk (<50)":      "#2CA02C",
         }
         fig_scatter = px.scatter(
             scatter_df,
@@ -1576,7 +1724,7 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
             range=[0.3, 5.7],
         )
         for y_val, label in [
-            (10, "Medium threshold"), (30, "High threshold"), (60, "Critical threshold")
+            (50, "Medium threshold"), (70, "High threshold"), (90, "Critical threshold")
         ]:
             fig_scatter.add_hline(
                 y=y_val, line_dash="dash", line_color="gray", line_width=1,
@@ -1649,9 +1797,11 @@ Expand any card to see:
 - **Bug count** — how many bugs belong to this theme
 - **Avg severity** — 1 (Critical) to 4 (Minor)
 - **Share of clustered bugs** — this theme's proportion of all grouped bugs
+- **Velocity (recent vs prior 3 builds)** — the acceleration ratio; >1.5 = growing, <0.67 = declining
+- **Recurrence rate** — fraction of recent bugs from modules that also appeared in the prior 3-build window (high = same modules keep re-introducing this bug type)
 - **Modules affected** — which modules contribute bugs to this theme
-- **Sample bug descriptions** — 6 real examples from ECL so you can judge for yourself
-- **Action line** — a plain-English recommendation based on severity:
+- **Sample bug descriptions** — up to 6 real ECL examples so you can judge the pattern yourself
+- **Action line** — a plain-English recommendation based on severity, amplified if the velocity or recurrence signals are also firing:
   - 🚨 **Immediate attention** (avg sev ≤ 1.5) — crash-level or data-loss bugs. Escalate to RD.
   - ⚠️ **High priority** (avg sev ≤ 2.5) — major functional issues. Add to next sprint regression.
   - 📋 **Standard priority** (avg sev ≤ 3.5) — normal issues. Cover in release-candidate testing.
@@ -1659,14 +1809,64 @@ Expand any card to see:
 
 ---
 
+### 🚨 Alert Banners (shown before the chart when thresholds are hit)
+
+**🔺 Growing theme alerts** fire when `cluster_velocity_ratio` ≥ 1.5.
+> **Velocity ratio** = (bugs in last 3 builds) ÷ (bugs in prior 3 builds). A ratio of 1.5 means 50% more bugs than the preceding window — a strong signal that something changed recently.
+
+**🔁 Fix-not-holding alerts** fire when `recurrence_rate` ≥ 0.6.
+> **Recurrence rate** = fraction of recent bugs (last 3 builds) from modules that also contributed to this theme in the prior 3-build window. 60%+ means the same modules keep re-introducing the same type of bug — a root-cause fix, not another patch, is needed.
+
+---
+
+### 📈 Cluster Velocity Chart
+
+Ranks all themes by velocity ratio. The **red dashed threshold line at 1.5×** marks the growing boundary.
+- Bars to the right at 1.5 or beyond need immediate investigative attention regardless of total bug count.
+- Green bars (declining) indicate themes that are resolving — the fix is holding.
+
+---
+
+### 🔀 Module Cluster Entropy Chart
+
+**Shannon entropy** measures how spread out a module's bugs are across different themes.
+The formula: H = −Σ(pᵢ × log₂(pᵢ)) where pᵢ = the fraction of bugs belonging to theme i.
+
+| Entropy | Meaning | What to do |
+|---------|---------|-----------|
+| **< 1 (✅ Focused)** | Bugs concentrated in one theme — single well-defined failure mode | One root-cause fix likely resolves the majority of bugs |
+| **1–2 (🔶 Spreading)** | Bugs spread across a few themes | Investigate whether the themes share a common component or API |
+| **> 2 (⚠️ Broad instability)** | Bugs across many themes — systemic module instability | Comprehensive regression pass needed; no single fix will adequately cover this |
+
+Orange dashed line at 1.0 and red dashed line at 2.0 mark the thresholds on the chart.
+
+---
+
+### 🔬 Severity-Stratified Tabs (S1/S2 and S3/S4)
+
+When clustering was run with `--stratify-severity`, two additional sub-views appear:
+- **🔴 S1/S2 tier** — clusters built only from Critical and Major bugs. These show the most dangerous patterns without minor-bug noise diluting the keyword weighting.
+- **🟡 S3/S4 tier** — clusters built only from Normal and Minor bugs. Useful for UX and polish issues independently.
+
+Each tier has its own overview bar chart and detail cards with velocity and recurrence metrics.
+
+---
+
 ### 🔍 How to Investigate a Pattern
 
-1. Find the largest red/orange bars — these are the highest-priority themes.
-2. Open the card and check which modules are affected.
-   - If it's 1 module → isolated bug area. Add module to current sprint focus.
-   - If it's 3+ modules → shared root cause likely. Investigate common infrastructure (API, shared component, SDK version).
-3. Read the sample descriptions — do they describe the same underlying failure? If yes, this is a systematic problem, not random noise.
-4. Cross-check with **Tab 7 (Risk Heatmap)** — if the affected modules are P1/P2, the theme is high-priority regardless of bug count.
+1. Check alert banners first — growing or fix-not-holding themes are highest priority.
+2. Find the largest red/orange bars — combine severity and count.
+3. Open the card and check which modules are affected.
+   - **1 module** → isolated bug area. Add it to the current sprint focus.
+   - **3+ modules** → shared root cause likely. Investigate common infrastructure (API, SDK version, shared component).
+4. Read the sample descriptions — do they describe the same underlying failure? If yes, this is systematic.
+5. Cross-check with **Tab 7 (Risk Heatmap)** — if the affected modules are P1/P2, the theme is high-priority regardless of bug count.
+
+---
+
+### 📋 Full Theme Table
+
+The "Full theme table (raw data)" expander at the bottom provides a sortable table with all numeric columns: velocity ratio, trend, recurrence rate. Export or copy to a spreadsheet for offline analysis.
 
 ---
 
@@ -1689,11 +1889,11 @@ python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv
 
 v3.0 produces additional output files automatically:
 - `clusters/ecl_parsed_cluster_summary.csv` — includes velocity, trend, recurrence
-- `clusters/ecl_parsed_module_entropy.csv` — per-module theme-spread index
-- `clusters/ecl_parsed_cluster_summary_s12.csv` — critical/major tier (with `--stratify-severity`)
-- `clusters/ecl_parsed_cluster_summary_s34.csv` — normal/minor tier (with `--stratify-severity`)
+- `clusters/ecl_parsed_module_entropy.csv` — per-module Shannon entropy
+- `clusters/ecl_parsed_cluster_summary_s12.csv` — critical/major tier (requires `--stratify-severity`)
+- `clusters/ecl_parsed_cluster_summary_s34.csv` — normal/minor tier (requires `--stratify-severity`)
 
-Then in the sidebar: **Step 3** → set paths to the above files. The module entropy and stratified summaries load automatically from their default paths.
+In the sidebar: **Step 3** → set paths to the above files. The module entropy and stratified summaries load automatically from their default paths.
 
 Recommend re-running clustering **every Friday** or whenever a new batch of builds has been parsed.
 """)
@@ -2200,129 +2400,209 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
 
 
 # =====================================================================
-# TAB 9 – Defect Forecast
+# TAB 9 – Defect Forecast (v2.21 — scenario-based layout)
 # =====================================================================
 
 elif active_tab == "🔮 Defect Forecast":
-    st.header("🔮 Defect Forecast — What Will Break Next Build?")
+    st.header("🔮 Defect Forecast — What's Likely to Break")
 
     with st.expander("📖 How to read this tab — full guide", expanded=False):
         st.markdown("""
 ## 🔮 Defect Forecast — Complete Guide
 
-This tab shows a **machine-learning forecast** of how many bugs each module is likely to produce
-in the **next build**, based on its recent history. No data-science background needed.
+This tab shows you **what is likely to break in the next build** and **what concrete scenarios to test for**, driven by a machine-learning model trained on all historical ECL bug data.
 
 ---
 
-### 🎯 What Is Being Predicted?
+### 📊 Headline Metrics (Top Row)
 
-The model counts how many new bugs were filed against each module in each past build,
-learns the pattern over time, and extrapolates to the next build.
-
-> **Target variable:** raw bug count per module per build — not severity-weighted.
-> A module that consistently produces 12 minor bugs scores higher than one that produced 1 critical bug once.
-> Use **Tab 7 (Risk Heatmap)** alongside this tab to catch modules with low count but high severity.
-
----
-
-### 🔢 Features the Model Uses
-
-| Signal | Plain-English meaning |
-|--------|-----------------------|
-| **Bug count (last 1 build)** | Most recent data point — captures sudden spikes |
-| **Bug count (last 3 builds avg)** | Short-term trend — smooths out one-off outliers |
-| **Bug count (last 5 builds avg)** | Medium-term baseline — captures chronic instability |
-| **Critical bug count (last 3 builds)** | Crash/data-loss momentum — strongest predictor for high-impact modules |
-| **Trend (last 3 builds)** | Is the count rising, falling, or flat? |
-| **Severity-weighted count (last 3 builds)** | Weights Critical (×10) and Major (×5) bugs more heavily |
+| Metric | What it means |
+|--------|--------------|
+| **🔴 Critical modules** | Modules with composite risk score > 90 — must be tested every build |
+| **🟠 High-risk modules** | Modules with composite risk score 70–90 — test every sprint |
+| **🎯 Predicted scenarios** | Total count of concrete, testable bug scenario predictions across all modules |
+| **Total modules forecast** | Number of modules for which the model generated a prediction |
 
 ---
 
-### 🚦 Risk Level Thresholds
+### 🎯 What to Test Next Build (Primary Section)
 
-| Level | Predicted bugs | What to do |
-|-------|---------------|------------|
-| 🔴 **Critical** | > 10 | Test **every build**. High instability. Focus on crash scenarios, data loss, and recently changed areas. |
-| 🟠 **High** | 6–10 | Test **every sprint**. Run full regression for this module and check side effects in adjacent modules. |
-| 🟡 **Medium** | 3–5 | Include in **release-candidate** pass. Spot-check changed areas. |
-| 🟢 **Low** | < 3 | **Standard release cycle** coverage. No special urgency. |
+The top section shows the core output: human-readable bug scenarios grouped by risk level, listed from most to least urgent (Critical → High → Medium). Each scenario directly answers the question: *"What specific thing should I test?"*
+
+**Confidence levels** are based on how many times a similar bug has recurred in history:
+- **🟢 High** — 3 or more recurring bugs with similar descriptions (well-established recurring pattern)
+- **🟡 Medium** — 2 similar bugs (emerging pattern, include in testing)
+- **🔵 Low** — 1 occurrence (speculative, add to exploratory pass for Critical/High modules)
+
+**How scenarios are generated (the algorithm):**
+For each high-risk module, `predict_defects.py` runs these steps:
+1. Collects all bug Short Descriptions from the last 5 builds for that module
+2. Vectorises them using TF-IDF and clusters similar descriptions with `AgglomerativeClustering` (cosine distance threshold)
+3. Picks the most representative description from each cluster as the predicted scenario text
+4. Assigns confidence based on the cluster size (bugs in cluster → High/Medium/Low)
+5. When running with `--provider ollama` or `--provider claude`, an AI model receives the clusters and historical context to produce more specific, actionable scenario text grounded in real patterns
 
 ---
 
-### 📊 Headline Metrics (top row)
+### 📋 AI Risk Briefing — Next Build Focus Summary
 
-| Metric | What it tells you |
-|--------|------------------|
-| 🔴 Critical modules | Modules predicted to produce > 10 bugs next build |
-| 🟠 High-risk modules | Modules predicted to produce 6–10 bugs |
-| Total modules forecast | All modules with sufficient history for the model (≥ 20 data points) |
-| Model accuracy (MAE) | Mean absolute error vs the last known build — ±2 bugs is excellent, ±5 is acceptable |
+A collapsible plain-English executive summary generated by `predict_defects.py`. Lists the top-risk modules with:
+- Why they are at risk (which signals are currently elevated)
+- What specifically to test based on historical patterns
+
+Generated with Ollama or Claude when `--provider` is set; a heuristic text summary is produced even without AI.
+
+---
+
+### ⚠️ Severity Escalation Alerts
+
+Shown automatically for modules where bugs are getting **more severe** in recent builds.
+
+**How `severity_escalation` is calculated:**
+```
+severity_escalation = avg_severity(last build) − avg_severity(prior 3 builds)
+```
+Since severity is numbered 1 (Critical) → 4 (Minor), a **negative value** means severity is worsening toward S1. Modules with `severity_escalation < −0.3` appear here; a value of −0.8 or worse gets the 🚨 icon.
+
+This signal can detect instability **before** bug counts spike — a pre-emptive warning that regression testing should be intensified immediately.
+
+---
+
+### 🕒 Overdue for a Critical Bug
+
+Shown for modules that historically produced S1 (crash-level) bugs regularly, but have been quiet for 5–20 recent builds. These modules are **not** fixed — they may be accumulating risk silently.
+
+**How `builds_since_last_crit` is calculated:** For each module's training history, the feature records how many build slots have elapsed since the most recent row where `critical_count > 0`. If no critical bugs exist at all in history, the value equals the total length of that module's history (maximum caution). Modules quiet for >20 builds are excluded (likely genuinely resolved).
+
+---
+
+### 📋 Predicted Bug Categories — What Will Break?
+
+A stacked bar chart (one bar per module, stacked by category) showing which **types** of bugs are expected based on the category distribution of recent bugs.
+
+**The 6 QA categories** are assigned by keyword scoring on each bug's Short Description. Whichever category accumulates the most keyword hits wins:
+
+| Category | Example trigger keywords |
+|----------|------------------------|
+| Crash / Stability | crash, exception, fatal, force close, hang, freeze |
+| Feature not working as intended | not work, incorrect behavior, broken, regression |
+| UI / Display problem | layout, alignment, render, icon, overlap, truncat |
+| UX / Usability problem | confusing, navigation, slow, hard to find, unclear |
+| Translation / Localization | translation, missing string, language, zh-tw, locale |
+| Data / File / Sync issue | corrupt, import/export, sync, cannot save, wrong data |
+
+`historical_pct` = this category's share of bugs in recent builds.
+`expected_next_build` = `historical_pct × predicted_total` — how many bugs of this type are expected.
+
+---
+
+### 🔍 Predicted Bug Scenarios by Module
+
+Expandable per-module section showing every predicted scenario with confidence badge, supporting QA categories, and the real source bug descriptions it was derived from. Critical-risk modules auto-expand; others are collapsed by default.
 
 ---
 
 ### 🃏 Module Forecast Cards
 
-Each card for a Critical or High-risk module shows:
-- **Predicted bugs** — the model's next-build estimate
-- **Actual last build** — what actually happened (when available) — compare these to judge model quality
-- **Typical bug type** — the most common historical severity for this module (e.g. "crash/Critical (S1)"), so the team knows *what kind* of bugs to expect, not just how many
-- **Why high risk** — the leading signal driving this score. Examples:
-  - *"critical-bug momentum (last 3 builds)"* → the module has had critical bugs recently and historically they persist
-  - *"sustained high volume (last 5 builds)"* → the module has consistently produced many bugs over time
-  - *"sharp upward trend (last 3 builds)"* → bug count is accelerating — new code changes may be destabilising it
-- **What to test** — a plain-English instruction matched to the risk level
+One card per Critical or High-risk module (top 10). Each card contains:
+
+| Field | Explanation |
+|-------|-------------|
+| **Risk level** | Composite risk category (Critical/High/Medium/Low) |
+| **Bug categories expected** | Count of distinct QA categories predicted for this module next build |
+| **Actual last build** | Real observed bug count from the most recent build in training data — compare to the forecast for calibration |
+| **Severity trend** | `severity_escalation` — see Alerts section above |
+| **Builds since last critical** | `builds_since_last_crit` — see Overdue section above |
+| **Theme breadth (entropy)** | Shannon entropy of bug-theme distribution. Higher = bugs spread across many themes (broad instability). Lower = concentrated single failure mode. |
+| **Leading signal** | The single feature with the highest Pearson correlation to future bug count for this module |
+| **What types of bugs to expect** | Per-category breakdown from `_predictions_by_category.csv` showing historical % and expected count |
+| **Predicted bug scenarios** | Top 3 scenarios from `_predictions_by_scenario.csv` |
+| **AI risk briefing** | Narrative from Ollama/Claude when `--provider` is set |
+| **What to test** | Concise test instruction based on risk level |
 
 ---
 
-### 📈 Actual vs Predicted Comparison
+### 📡 Leading Indicators — What Predicts Future Bugs?
 
-The grouped bar chart compares the model's most-recent prediction against what actually happened.
-- Bars that are **close in height** = the model was accurate for that build
-- A **much taller actual bar** = the module had a surprise spike — review what changed in that build
-- A **much taller predicted bar** = the model over-estimated — may reflect a recent improvement in that module
+A horizontal bar chart ranking features by **Pearson correlation coefficient (r)** with future bug counts.
+
+**How to read the chart:**
+- **r close to +1 (red bar, right)** — when this signal goes up, more bugs follow in the next build
+- **r close to −1 (green bar, left)** — when this signal goes up, fewer bugs follow (protective signal)
+- **r near 0** — no consistent predictive relationship
+
+The correlations are computed across all (module, build) rows in the training dataset by comparing each feature column against the `target` (actual bug count in the next build).
+
+**Features ranked here include:**
+- `crit_1/3/5` — critical bug momentum over last 1/3/5 builds
+- `bugs_1/3/5` — total bug count momentum over last 1/3/5 builds
+- `sev_1/3/5` — severity-weighted momentum
+- `trend` — last build minus 3 builds ago (upward slope)
+- `severity_escalation` — worsening severity signal
+- `builds_since_last_crit` — how long since the last S1
+- `cluster_entropy_3/5` — bug-theme diversity index (when cluster data is loaded)
+- `top_cluster_velocity` — growth rate of the dominant bug theme
+- TF-IDF text features — keyword loadings from module descriptions
+- Risk features (when loaded) — impact, detectability, probability scores from `ai_risk_scorer.py`
 
 ---
 
-### 📡 Leading Indicators Chart
+### 🔧 Advanced / Model Diagnostics (collapsed by default)
 
-Shows which current bug signals are most strongly correlated (Pearson r) with future bug counts
-across all modules. Think of this as: "what should I be watching *now* to predict problems *next build*?"
-
-- **Positive (red) bar** → more of this signal now = more bugs next build. High positive = reliable early warning.
-- **Negative (green) bar** → more of this signal now = fewer bugs next build (e.g. a build that closed many bugs may be followed by a quieter one).
-- **Bar length** = strength of correlation. Only bars with |r| ≥ 0.3 are practically meaningful.
-
-The signals are labelled in plain English, not variable names.
+- **Predicted Bug Count bar chart** — raw predicted count per module coloured by risk level. Use the slider to control how many modules are shown.
+- **Actual vs Predicted** — side-by-side bars comparing the model's last-build forecast against the real observed count. Useful for building trust in the model's accuracy before acting on it.
+- **Module Signals Table** — sortable table of all numeric signals for every module.
+- **Full Predictions Table** — complete output of `_predictions.csv`.
 
 ---
 
-### ⚠️ Limitations and What to Watch For
+### 🛠️ How the ML Model Works
 
-- **Needs numeric Build#**: version strings (e.g. "16.3.5") are automatically dropped. If many rows are dropped, forecasts will be less accurate.
-- **Needs history**: modules with fewer than 20 build-module data points are excluded. Run predictions again after more build data has been captured.
-- **Counts, not severity**: a module producing 12 minor bugs scores higher than one that produced 3 critical bugs. Combine with Tab 7 (risk scores) for a complete picture.
-- **Model retrains each run**: re-run `predict_defects.py` weekly or after each major parse update to keep forecasts fresh.
+**Algorithm:** `GradientBoostingRegressor` (scikit-learn, 200 trees, max_depth=4, learning_rate=0.1, random_state=42). Trained to predict the bug count in the next build for each module.
+
+**Training validation:** 3-fold `TimeSeriesSplit` cross-validation (respects time ordering — no data leakage). The CV MAE (Mean Absolute Error) is printed at run time: it tells you how many bugs off the forecast is on average.
+
+**Feature matrix:** Built by `build_features()` in `predict_defects.py`. Each row is a (module, build) pair. Features are computed as rolling window statistics from the prior 1/3/5 builds. Requires at least **5 builds of history** per module; modules with less are excluded.
+
+**Risk level assignment:** Risk levels are **not directly from the model output**. They are assigned from a composite risk score that weights: predicted bug count, severity escalation trend, domain impact score (from `ai_risk_scorer.py` if loaded), and historical probability score.
+
+Thresholds: Critical > 90, High 70–90, Medium 50–69, Low < 50.
 
 ---
 
 ### 🛠️ Where Does This Data Come From?
 
 ```bash
-# Basic (no cluster features):
+# Basic run (heuristic scenarios, no AI needed):
 python scripts/predict_defects.py data/ecl_parsed.csv
 
-# v3.0 recommended (with cluster features + bug-type predictions):
+# With cluster features (enables entropy signals and better accuracy):
 python scripts/predict_defects.py data/ecl_parsed.csv \\
   --cluster-csv data/clusters/ecl_parsed_clustered.csv
+
+# Full AI-powered scenarios:
+python scripts/predict_defects.py data/ecl_parsed.csv \\
+  --cluster-csv data/clusters/ecl_parsed_clustered.csv \\
+  --provider ollama --model llama3.1
+
+# Also load I×P×D risk features:
+python scripts/predict_defects.py data/ecl_parsed.csv \\
+  --scored-csv data/risk_register_scored.csv
 ```
 
-v3.0 produces an additional output automatically when `--cluster-csv` is provided:
-- `predictions/ecl_parsed_predictions_by_cluster.csv` — per-module, per-theme predicted counts
+Output files saved to `data/predictions/`:
 
-Then in the sidebar: **Step 4** → set paths to the prediction CSV, focus summary, leading indicators CSV, and the new bug-type predictions CSV (`_by_cluster.csv`). All four files live under `data/predictions/` by default.
+| File | Contents |
+|------|---------|
+| `_predictions.csv` | Main forecast — predicted count, risk level, all signals |
+| `_predictions_by_category.csv` | Per-module per-category historical % and expected count |
+| `_predictions_by_scenario.csv` | Concrete bug scenario predictions with confidence |
+| `_predictions_by_cluster.csv` | Per-module per-cluster breakdown (requires `--cluster-csv`) |
+| `_predictions_importance.csv` | Feature importance ranking from the trained model |
+| `_predictions_leading_indicators.csv` | Pearson r correlation of each feature with future bugs |
+| `_predictions_focus_summary.txt` | Plain-English risk briefing text |
 
-Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 stay in sync.
+**Recommend re-running every Friday** alongside `cluster_bugs.py` so Tabs 8 and 9 stay in sync.
 """)
 
     if pred_df is None:
@@ -2355,34 +2635,84 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
     pred_df["predicted"] = pd.to_numeric(pred_df["predicted"], errors="coerce").fillna(0)
     pred_df = pred_df.sort_values("predicted", ascending=False).reset_index(drop=True)
 
+    FORECAST_COLORS = {
+        "Critical": "#ef4444",
+        "High":     "#f97316",
+        "Medium":   "#eab308",
+        "Low":      "#22c55e",
+    }
+    RISK_ORDER = ["Critical", "High", "Medium", "Low"]
+    RISK_ICONS   = {"Critical": "🔴", "High": "🟠", "Medium": "🟡", "Low": "🟢"}
+    RISK_ADVICE  = {
+        "Critical": "Test **every build**. Focus on crash scenarios, data loss, and any recently changed functionality.",
+        "High":     "Test **every sprint**. Run full regression for this module and check for side effects in related areas.",
+        "Medium":   "Include in **release-candidate** testing. Spot-check changed areas.",
+        "Low":      "Cover in the full **release cycle** pass. No special urgency.",
+    }
+    _CONF_BADGES = {"high": "🟢 High", "medium": "🟡 Medium", "low": "🔵 Low"}
+
     # ── Headline metrics ─────────────────────────────────────────────────
     rl_counts = pred_df["risk_level"].value_counts()
+    _scenario_count = len(pred_scenario_df) if pred_scenario_df is not None else 0
     pm1, pm2, pm3, pm4 = st.columns(4)
     pm1.metric("🔴 Critical modules",  int(rl_counts.get("Critical", 0)),
-               help="Predicted > 10 bugs next build")
+               help="Composite risk >90 (domain risk + predicted count + severity trend + momentum)")
     pm2.metric("🟠 High-risk modules", int(rl_counts.get("High", 0)),
-               help="Predicted 6–10 bugs next build")
-    pm3.metric("Total modules forecast", len(pred_df))
-    if "target" in pred_df.columns:
-        mae = abs(pred_df["predicted"] - pd.to_numeric(pred_df["target"], errors="coerce")).mean()
-        pm4.metric("Model accuracy (MAE)", f"±{mae:.1f} bugs",
-                   help="Mean absolute error on the most recent known build — lower is better")
-    else:
-        pm4.metric("Model accuracy (MAE)", "N/A")
+               help="Composite risk 70–90 (domain risk + predicted count + severity trend + momentum)")
+    pm3.metric("🎯 Predicted scenarios", _scenario_count,
+               help="Total concrete bug scenario predictions across all modules")
+    pm4.metric("Total modules forecast", len(pred_df))
 
-    # ── AI Focus Summary (from predict_defects.py focus summary file) ─────
-    if pred_summary_txt and pred_summary_txt.strip():
-        st.markdown("---")
-        st.subheader("📋 AI Risk Briefing — Next Build Focus Summary")
+    # ── "What to Test Next Build" — PRIMARY SECTION ──────────────────────
+    st.markdown("---")
+    st.subheader("🎯 What to Test Next Build")
+
+    if pred_scenario_df is not None and not pred_scenario_df.empty:
         st.caption(
-            "Plain-English summary generated by predict_defects.py. "
-            "Lists the highest-risk modules with why they are at risk and what to test."
+            "Concrete bug scenarios predicted for the next build, grouped by risk level. "
+            "Each scenario is grounded in recurring historical patterns."
         )
-        st.code(pred_summary_txt, language=None)
+        # Group scenarios by risk level
+        for _rl in ["Critical", "High", "Medium"]:
+            _rl_scenarios = pred_scenario_df[pred_scenario_df["risk_level"] == _rl]
+            if _rl_scenarios.empty:
+                continue
+            _rl_icon = RISK_ICONS.get(_rl, "⚪")
+            st.markdown(f"#### {_rl_icon} {_rl} Risk")
+            for _mod, _mod_sc in _rl_scenarios.groupby("module", sort=False):
+                st.markdown(f"**{_mod}**")
+                for _, _sc in _mod_sc.head(3).iterrows():
+                    _conf = _CONF_BADGES.get(str(_sc.get("confidence", "medium")), "🔵 Low")
+                    _text = str(_sc.get("scenario_text", ""))
+                    st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{_conf} — {_text}",
+                                unsafe_allow_html=True)
+            st.markdown("")
+    else:
+        # Fallback to AI Focus Summary if no scenarios
+        if pred_summary_txt and pred_summary_txt.strip():
+            st.caption(
+                "Scenario predictions not available. Showing AI Focus Summary instead. "
+                "Re-run predict_defects.py v5.0 to generate scenario predictions."
+            )
+            st.code(pred_summary_txt, language=None)
+        else:
+            st.info(
+                "No scenario predictions available. Run `predict_defects.py` v5.0 "
+                "to generate concrete bug scenario predictions."
+            )
+
+    # ── AI Focus Summary ─────────────────────────────────────────────────
+    if pred_summary_txt and pred_summary_txt.strip():
+        with st.expander("📋 AI Risk Briefing — Next Build Focus Summary", expanded=False):
+            st.caption(
+                "Plain-English summary generated by predict_defects.py. "
+                "Lists the highest-risk modules with why they are at risk and what to test."
+            )
+            st.code(pred_summary_txt, language=None)
 
     st.markdown("---")
 
-    # ── NEW v3.0 — Severity escalation alerts ─────────────────────────────
+    # ── Severity escalation alerts ───────────────────────────────────────
     if "severity_escalation" in pred_df.columns:
         _esc = pred_df[["module", "predicted", "risk_level", "severity_escalation"]].copy()
         _esc["severity_escalation"] = pd.to_numeric(_esc["severity_escalation"], errors="coerce")
@@ -2405,7 +2735,7 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
                 )
             st.markdown("---")
 
-    # ── NEW v3.0 — builds_since_last_crit summary ─────────────────────────
+    # ── Builds since last critical summary ────────────────────────────────
     if "builds_since_last_crit" in pred_df.columns:
         _bslc = pred_df[["module", "predicted", "risk_level", "builds_since_last_crit"]].copy()
         _bslc["builds_since_last_crit"] = pd.to_numeric(
@@ -2416,7 +2746,6 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
             (~_bslc["risk_level"].isin(["Low"]))
         ].sort_values("builds_since_last_crit").head(6)
         if not _overdue.empty:
-            # Expanded by default so users see it without scrolling
             with st.expander(
                 f"🕒 {len(_overdue)} module(s) overdue for a critical bug — had S1s historically, none recently",
                 expanded=True,
@@ -2432,119 +2761,20 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
                     )
             st.markdown("---")
 
-    # ── NEW v3.0 — Module signals summary table ───────────────────────────
-    # Shows severity_escalation, builds_since_last_crit, and entropy for all
-    # modules in one scannable table — not buried inside individual cards.
-    _sig_cols = [c for c in ["module", "predicted", "risk_level",
-                              "severity_escalation", "builds_since_last_crit",
-                              "dominant_bug_type", "leading_signal"]
-                 if c in pred_df.columns]
-    _have_new_signals = any(c in pred_df.columns
-                            for c in ["severity_escalation", "builds_since_last_crit"])
-    if _have_new_signals:
-        with st.expander("📊 Module signals table — v3.0 features across all modules",
-                         expanded=False):
-            st.caption(
-                "Full breakdown of every forecast signal. "
-                "**Severity escalation**: negative = bugs getting more severe toward S1. "
-                "**Builds since last critical**: small number = recently had a crash; large = possibly overdue."
-            )
-            _sig_df = pred_df[_sig_cols].copy()
-            # Join entropy if available
-            if _ent_source_df is not None and not _ent_source_df.empty:
-                _sig_df = _sig_df.merge(
-                    _ent_source_df[["module", "cluster_entropy"]], on="module", how="left")
-            _col_labels = {
-                "module": "Module",
-                "predicted": "Forecast",
-                "risk_level": "Risk",
-                "severity_escalation": "Sev. escalation",
-                "builds_since_last_crit": "Builds since S1",
-                "dominant_bug_type": "Typical bug type",
-                "leading_signal": "Leading signal",
-                "cluster_entropy": "Theme breadth",
-            }
-            _sig_df = _sig_df.rename(columns=_col_labels)
-            st.dataframe(_sig_df, hide_index=True, width='stretch')
-        st.markdown("---")
-
-    # ── Forecast bar chart ────────────────────────────────────────────────
-    st.subheader("📊 Predicted Bug Count — Next Build")
-    st.caption(
-        "Bar height = predicted number of new bugs. "
-        "Colour = risk level. Hover for current (actual) vs predicted."
-    )
-
-    FORECAST_COLORS = {
-        "Critical": "#ef4444",
-        "High":     "#f97316",
-        "Medium":   "#eab308",
-        "Low":      "#22c55e",
-    }
-    RISK_ORDER = ["Critical", "High", "Medium", "Low"]
-
-    # top_n_pred = st.slider("Show top N modules", min_value=5,
-    #                        max_value=min(40, len(pred_df)),
-    #                        value=min(20, len(pred_df)), key="pred_bar_n")
+    # ── Bug Categories stacked bar chart (promoted from old position) ─────
+    # Compute top_n_pred for charts
     _pred_n = len(pred_df)
     if _pred_n <= 1:
         top_n_pred = _pred_n
-        st.caption(f"Showing all {_pred_n} module(s) — not enough for a slider.")
     else:
-        _slider_min = min(1, _pred_n - 1)          # floor of 1, always < max
-        _slider_max = min(40, _pred_n)
-        _slider_val = min(20, _pred_n)
-        top_n_pred = st.slider(
-            "Show top N modules",
-            min_value=_slider_min,
-            max_value=_slider_max,
-            value=_slider_val,
-            key="pred_bar_n",
-        )
-    bar_pred = pred_df.head(top_n_pred).copy()
-    bar_pred["risk_level"] = pd.Categorical(
-        bar_pred["risk_level"].astype(str), categories=RISK_ORDER, ordered=True
-    )
-    bar_pred = bar_pred.sort_values(["risk_level", "predicted"], ascending=[True, False])
+        top_n_pred = min(20, _pred_n)
 
-    hover_extra = {}
-    if "target" in bar_pred.columns:
-        hover_extra["target"] = True
-    if "dominant_bug_type" in bar_pred.columns:
-        hover_extra["dominant_bug_type"] = True
-
-    fig_pred = px.bar(
-        bar_pred,
-        x="module",
-        y="predicted",
-        color="risk_level",
-        color_discrete_map=FORECAST_COLORS,
-        category_orders={"risk_level": RISK_ORDER},
-        hover_data={"predicted": ":.1f", "risk_level": True, **hover_extra},
-        labels={"module": "Module", "predicted": "Predicted bugs (next build)",
-                "risk_level": "Risk level", "target": "Actual (last build)",
-                "dominant_bug_type": "Typical bug type"},
-        text="predicted",
-    )
-    fig_pred.update_traces(texttemplate="%{text:.0f}", textposition="outside")
-    fig_pred.update_layout(
-        height=460,
-        xaxis_tickangle=-35,
-        showlegend=True,
-        legend_title_text="Risk level",
-        margin=dict(t=20, b=10),
-    )
-    st.plotly_chart(fig_pred, width='stretch')
-
-    # ── v4.0 — Bug Category Breakdown chart ──────────────────────────────
     if pred_category_df is not None and not pred_category_df.empty:
-        st.markdown("---")
         st.subheader("📋 Predicted Bug Categories — What Will Break?")
         st.caption(
             "Each bar shows which types of bugs are expected per module, based on "
             "recent bug descriptions. This tells you WHAT to test for, not just how many."
         )
-        # Filter to top modules and build stacked bar data
         _top_mods = pred_df.head(top_n_pred)["module"].tolist()
         _cat_chart = pred_category_df[pred_category_df["module"].isin(_top_mods)].copy()
         if not _cat_chart.empty:
@@ -2556,7 +2786,6 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
                 "Translation / Localization":      "#3b82f6",
                 "Data / File / Sync issue":        "#06b6d4",
             }
-            # Sort modules by predicted desc (same order as the risk chart)
             _mod_order = [m for m in _top_mods if m in _cat_chart["module"].values]
             _cat_chart["module"] = pd.Categorical(
                 _cat_chart["module"], categories=_mod_order, ordered=True)
@@ -2581,36 +2810,45 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
                 margin=dict(t=20, b=10),
             )
             st.plotly_chart(fig_cat, width='stretch')
+        st.markdown("---")
 
-    # ── Actual vs Predicted comparison ───────────────────────────────────
-    if "target" in pred_df.columns:
-        with st.expander("📈 Actual vs Predicted (last known build)"):
-            st.caption(
-                "Compares the model's prediction against what actually happened in the most recent build. "
-                "Bars close to the line = accurate; bars far above = module had a surprise spike."
-            )
-            avp = pred_df.head(top_n_pred)[["module", "target", "predicted", "risk_level"]].copy()
-            avp["target"]    = pd.to_numeric(avp["target"],    errors="coerce").fillna(0)
-            avp["predicted"] = pd.to_numeric(avp["predicted"], errors="coerce").fillna(0)
-            avp_melt = avp.melt(id_vars="module", value_vars=["target", "predicted"],
-                                var_name="Type", value_name="Bugs")
-            avp_melt["Type"] = avp_melt["Type"].map(
-                {"target": "Actual (last build)", "predicted": "Forecast (next build)"}
-            )
-            fig_avp = px.bar(
-                avp_melt, x="module", y="Bugs", color="Type", barmode="group",
-                color_discrete_map={
-                    "Actual (last build)":     "#6366f1",
-                    "Forecast (next build)":   "#f97316",
-                },
-                labels={"module": "Module", "Bugs": "Bug count"},
-            )
-            fig_avp.update_layout(height=380, xaxis_tickangle=-35,
-                                  legend_title_text="", margin=dict(t=10, b=10))
-            st.plotly_chart(fig_avp, width='stretch')
+    # ── Predicted Bug Scenarios by Module (NEW detail section) ────────────
+    if pred_scenario_df is not None and not pred_scenario_df.empty:
+        st.subheader("🔍 Predicted Bug Scenarios by Module")
+        st.caption(
+            "Expand each module to see all predicted scenarios with confidence levels, "
+            "supporting categories, and source bug examples."
+        )
+        _scenario_modules = pred_scenario_df["module"].unique()
+        for _sc_mod in _scenario_modules:
+            _sc_mod_data = pred_scenario_df[pred_scenario_df["module"] == _sc_mod]
+            _sc_rl = str(_sc_mod_data.iloc[0].get("risk_level", "Medium"))
+            _sc_icon = RISK_ICONS.get(_sc_rl, "⚪")
+            _sc_count = len(_sc_mod_data)
+            with st.expander(
+                f"{_sc_icon} **{_sc_mod}** — {_sc_rl} risk · {_sc_count} scenario(s)",
+                expanded=(_sc_rl == "Critical"),
+            ):
+                for _, _sc_row in _sc_mod_data.iterrows():
+                    _rank = int(_sc_row.get("scenario_rank", 0))
+                    _text = str(_sc_row.get("scenario_text", ""))
+                    _conf = str(_sc_row.get("confidence", "medium"))
+                    _conf_badge = _CONF_BADGES.get(_conf, "🔵 Low")
+                    _cats = str(_sc_row.get("supporting_categories", ""))
+                    _examples = str(_sc_row.get("source_bug_examples", ""))
+
+                    st.markdown(f"**#{_rank}** {_conf_badge} — {_text}")
+                    _detail_parts = []
+                    if _cats and _cats != "nan":
+                        _detail_parts.append(f"Categories: {_cats}")
+                    if _examples and _examples != "nan" and len(_examples) > 5:
+                        _detail_parts.append(f"Based on: _{_examples[:200]}_")
+                    if _detail_parts:
+                        st.caption(" · ".join(_detail_parts))
+                    st.markdown("")
+        st.markdown("---")
 
     # ── Module forecast cards ─────────────────────────────────────────────
-    st.markdown("---")
     st.subheader("🃏 Module Forecast Cards")
     st.caption(
         "One card per high-risk module. Written for anyone on the team — "
@@ -2620,14 +2858,6 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
     cards_df = pred_df[pred_df["risk_level"].isin(["Critical", "High"])].head(10)
     if cards_df.empty:
         cards_df = pred_df.head(5)
-
-    RISK_ICONS   = {"Critical": "🔴", "High": "🟠", "Medium": "🟡", "Low": "🟢"}
-    RISK_ADVICE  = {
-        "Critical": "Test **every build**. Focus on crash scenarios, data loss, and any recently changed functionality.",
-        "High":     "Test **every sprint**. Run full regression for this module and check for side effects in related areas.",
-        "Medium":   "Include in **release-candidate** testing. Spot-check changed areas.",
-        "Low":      "Cover in the full **release cycle** pass. No special urgency.",
-    }
 
     for _, row in cards_df.iterrows():
         mod       = str(row.get("module", "Unknown"))
@@ -2653,7 +2883,6 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
             # Row 1 — risk + context metrics
             fc1, fc2, fc3 = st.columns(3)
             fc1.metric("Risk level", rl)
-            # v4.0 — show how many bug categories expected instead of raw count
             if pred_category_df is not None and not pred_category_df.empty:
                 _mod_cats = pred_category_df[pred_category_df["module"] == mod]
                 fc2.metric("Bug categories expected", f"{len(_mod_cats)}",
@@ -2663,10 +2892,9 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
             if target_v is not None:
                 fc3.metric("Actual last build", f"{float(target_v):.0f}")
 
-            # Row 2 — new v3.0 signals
+            # Row 2 — v3.0 signals
             sev_esc   = row.get("severity_escalation", None)
             bslc      = row.get("builds_since_last_crit", None)
-            # Look up module entropy from _ent_source_df if available
             mod_ent   = None
             if _ent_source_df is not None and not _ent_source_df.empty:
                 _ent_row = _ent_source_df[_ent_source_df["module"] == mod]
@@ -2698,7 +2926,7 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
 
             st.markdown(f"**Leading signal:** _{lead_sig}_")
 
-            # v4.0 — per-category bug-type breakdown (preferred over clusters)
+            # Per-category bug-type breakdown
             _showed_categories = False
             if pred_category_df is not None and not pred_category_df.empty:
                 mod_cats = pred_category_df[pred_category_df["module"] == mod].head(6)
@@ -2729,7 +2957,18 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
                                 unsafe_allow_html=True,
                             )
 
-            # AI narrative — show if available and non-empty
+            # v5.0 — show top predicted scenarios in the card
+            if pred_scenario_df is not None and not pred_scenario_df.empty:
+                _card_scenarios = pred_scenario_df[pred_scenario_df["module"] == mod].head(3)
+                if not _card_scenarios.empty:
+                    st.markdown("**Predicted bug scenarios:**")
+                    for _, _cs in _card_scenarios.iterrows():
+                        _cs_conf = _CONF_BADGES.get(str(_cs.get("confidence", "medium")), "🔵 Low")
+                        _cs_text = str(_cs.get("scenario_text", ""))
+                        st.markdown(f"&nbsp;&nbsp;→ {_cs_conf} — {_cs_text}",
+                                    unsafe_allow_html=True)
+
+            # AI narrative
             _narrative = str(row.get("ai_narrative", "")).strip()
             if _narrative and _narrative not in ("", "nan"):
                 st.markdown("**AI risk briefing:**")
@@ -2738,8 +2977,6 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
             st.info(f"**What to test:** {RISK_ADVICE.get(rl, '')}")
 
     # ── Cross-tab cluster callout ─────────────────────────────────────────
-    # When cluster data is loaded, surface which of the high-risk modules also
-    # have growing themes in Tab 8 — connecting the two tabs visually.
     if cluster_sum_df is not None and not cluster_sum_df.empty and "cluster_trend" in cluster_sum_df.columns:
         _growing_mods = set()
         for _, _cr in cluster_sum_df[cluster_sum_df["cluster_trend"] == "growing"].iterrows():
@@ -2770,7 +3007,6 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
         li["abs_r"]     = li["pearson_r"].abs()
         li = li.sort_values("abs_r", ascending=False).head(12)
 
-        # Use label column if present, else feature name
         li["display_label"] = li.get("label", li.get("feature", li.index)).fillna(li.get("feature", ""))
 
         li["direction"] = li["pearson_r"].apply(
@@ -2811,8 +3047,116 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
             li_display.columns = ["Signal", "Correlation", "Direction", "Strength"]
             st.dataframe(li_display, hide_index=True, width='stretch')
 
-    # ── Raw predictions table ──────────────────────────────────────────────
-    with st.expander("📋 Full predictions table"):
+    # ── Advanced / Model Diagnostics (DEMOTED) ───────────────────────────
+    st.markdown("---")
+    with st.expander("🔧 Advanced / Model Diagnostics", expanded=False):
+        st.caption(
+            "Count-based model outputs and diagnostic tables. "
+            "These are useful for model validation but not the primary view."
+        )
+
+        # Predicted Bug Count bar chart
+        st.markdown("#### 📊 Predicted Bug Count — Next Build")
+        _pred_n = len(pred_df)
+        if _pred_n <= 1:
+            _adv_top_n = _pred_n
+        else:
+            _slider_min = min(1, _pred_n - 1)
+            _slider_max = min(40, _pred_n)
+            _slider_val = min(20, _pred_n)
+            _adv_top_n = st.slider(
+                "Show top N modules",
+                min_value=_slider_min,
+                max_value=_slider_max,
+                value=_slider_val,
+                key="pred_bar_n_adv",
+            )
+        bar_pred = pred_df.head(_adv_top_n).copy()
+        bar_pred["risk_level"] = pd.Categorical(
+            bar_pred["risk_level"].astype(str), categories=RISK_ORDER, ordered=True
+        )
+        bar_pred = bar_pred.sort_values(["risk_level", "predicted"], ascending=[True, False])
+
+        hover_extra = {}
+        if "target" in bar_pred.columns:
+            hover_extra["target"] = True
+        if "dominant_bug_type" in bar_pred.columns:
+            hover_extra["dominant_bug_type"] = True
+
+        fig_pred = px.bar(
+            bar_pred,
+            x="module",
+            y="predicted",
+            color="risk_level",
+            color_discrete_map=FORECAST_COLORS,
+            category_orders={"risk_level": RISK_ORDER},
+            hover_data={"predicted": ":.1f", "risk_level": True, **hover_extra},
+            labels={"module": "Module", "predicted": "Predicted bugs (next build)",
+                    "risk_level": "Risk level", "target": "Actual (last build)",
+                    "dominant_bug_type": "Typical bug type"},
+            text="predicted",
+        )
+        fig_pred.update_traces(texttemplate="%{text:.0f}", textposition="outside")
+        fig_pred.update_layout(
+            height=460,
+            xaxis_tickangle=-35,
+            showlegend=True,
+            legend_title_text="Risk level",
+            margin=dict(t=20, b=10),
+        )
+        st.plotly_chart(fig_pred, width='stretch')
+
+        # Actual vs Predicted comparison
+        if "target" in pred_df.columns:
+            st.markdown("#### 📈 Actual vs Predicted (last known build)")
+            avp = pred_df.head(_adv_top_n)[["module", "target", "predicted", "risk_level"]].copy()
+            avp["target"]    = pd.to_numeric(avp["target"],    errors="coerce").fillna(0)
+            avp["predicted"] = pd.to_numeric(avp["predicted"], errors="coerce").fillna(0)
+            avp_melt = avp.melt(id_vars="module", value_vars=["target", "predicted"],
+                                var_name="Type", value_name="Bugs")
+            avp_melt["Type"] = avp_melt["Type"].map(
+                {"target": "Actual (last build)", "predicted": "Forecast (next build)"}
+            )
+            fig_avp = px.bar(
+                avp_melt, x="module", y="Bugs", color="Type", barmode="group",
+                color_discrete_map={
+                    "Actual (last build)":     "#6366f1",
+                    "Forecast (next build)":   "#f97316",
+                },
+                labels={"module": "Module", "Bugs": "Bug count"},
+            )
+            fig_avp.update_layout(height=380, xaxis_tickangle=-35,
+                                  legend_title_text="", margin=dict(t=10, b=10))
+            st.plotly_chart(fig_avp, width='stretch')
+
+        # Module Signals Table
+        _sig_cols = [c for c in ["module", "predicted", "risk_level",
+                                  "severity_escalation", "builds_since_last_crit",
+                                  "dominant_bug_type", "leading_signal"]
+                     if c in pred_df.columns]
+        _have_new_signals = any(c in pred_df.columns
+                                for c in ["severity_escalation", "builds_since_last_crit"])
+        if _have_new_signals:
+            st.markdown("#### 📊 Module Signals Table")
+            _sig_df = pred_df[_sig_cols].copy()
+            if _ent_source_df is not None and not _ent_source_df.empty:
+                _sig_df = _sig_df.merge(
+                    _ent_source_df[["module", "cluster_entropy"]], on="module", how="left")
+            _col_labels = {
+                "module": "Module",
+                "predicted": "Forecast",
+                "risk_level": "Risk",
+                "severity_escalation": "Sev. escalation",
+                "builds_since_last_crit": "Builds since S1",
+                "dominant_bug_type": "Typical bug type",
+                "leading_signal": "Leading signal",
+                "cluster_entropy": "Theme breadth",
+            }
+            _sig_df = _sig_df.rename(columns=_col_labels)
+            st.dataframe(_sig_df, hide_index=True, width='stretch')
+
+        # Full predictions table
+        st.markdown("#### 📋 Full Predictions Table")
         _all_pred_cols = [c for c in [
             "module", "predicted", "target", "risk_level",
             "dominant_bug_type", "leading_signal",
@@ -2832,7 +3176,6 @@ Recommend re-running **every Friday** alongside clustering so Tab 8 and Tab 9 st
         disp_pred = disp_pred.rename(columns=_pred_col_labels)
         st.dataframe(disp_pred, hide_index=True, width='stretch')
 
-        # Also show the per-cluster breakdown table if loaded
         if pred_cluster_df is not None and not pred_cluster_df.empty:
             st.markdown("**Bug-type predictions by cluster:**")
             st.dataframe(

@@ -66,11 +66,7 @@ Thumbs.db
 **/risk_register_scored.csv
 **/risk_register.csv
 *.csv
-data/module_mappings/
-data/risk_register_versions/
-data/predictions/
-data/staging/
-data/clusters/
+data/**/
 data/**.txt
 data/**.md
 data/**.json

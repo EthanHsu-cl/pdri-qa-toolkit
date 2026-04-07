@@ -895,9 +895,12 @@ def versions_by_recency(df: pd.DataFrame, exclude_sparse: bool = True):
 def parse_ecl_export(
     input_path: str,
     output_path: str,
-    mapping_dir: str = "data/module_mappings",
+    mapping_dir: str | None = None,
     fuzzy_threshold: int = 85,
 ):
+    # Default mapping_dir: sibling of the output file's parent directory
+    if mapping_dir is None:
+        mapping_dir = str(Path(output_path).parent / "module_mappings")
     ext = Path(input_path).suffix.lower()
     if ext == ".json":
         with open(input_path, "r", encoding="utf-8") as _f:
@@ -1176,8 +1179,8 @@ def main():
     parser.add_argument("output", help="Output CSV file")
     parser.add_argument(
         "--mapping-dir",
-        default="data/module_mappings",
-        help="Directory for per-version mapping files (default: data/module_mappings)",
+        default=None,
+        help="Directory for per-version mapping files (default: <output_dir>/module_mappings)",
     )
     parser.add_argument(
         "--fuzzy-threshold",

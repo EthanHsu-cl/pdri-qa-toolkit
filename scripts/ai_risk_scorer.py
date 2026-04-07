@@ -22,9 +22,10 @@ import warnings
 warnings.filterwarnings("ignore", message="urllib3.*OpenSSL")
 warnings.filterwarnings("ignore", message="urllib3.*LibreSSL")
 
-import os, json, re, argparse, time, glob
+import os, json, re, argparse, time, glob, sys
 import pandas as pd, numpy as np
 import urllib.request
+from tqdm import tqdm
 
 
 IMPACT_OVERRIDES = {
@@ -148,9 +149,9 @@ def score_openai(row):
 
 
 def assign_quadrant(score):
-    if score >= 60: return "P1 - Critical"
-    if score >= 30: return "P2 - High"
-    if score >= 10: return "P3 - Medium"
+    if score > 90: return "P1 - Critical"
+    if score >= 70: return "P2 - High"
+    if score >= 50: return "P3 - Medium"
     return "P4 - Low"
 
 
@@ -215,6 +216,8 @@ def score_file(in_csv: str, out_csv: str, provider: str, model: str, verbose: bo
     print(f"  {'#':>4}  {'Module':<30}  {'I':>2} {'P':>2} {'D':>2}  {'Risk':>6}  {'Quadrant':<14}  Reasoning")
     print(f"  {chr(9472) * 78}")
 
+    pbar = tqdm(total=to_score, desc="Scoring modules", unit="mod",
+                file=sys.stderr, dynamic_ncols=True)
     for idx, row in df.iterrows():
         module_name = str(row.get("module", ""))
         if module_name in already_scored:
@@ -239,6 +242,9 @@ def score_file(in_csv: str, out_csv: str, provider: str, model: str, verbose: bo
         quadrant_inline = assign_quadrant(risk_inline)
         reason_display  = r[3][:55] + "..." if len(r[3]) > 55 else r[3]
 
+        pbar.update(1)
+        pbar.set_postfix_str(f"{module_name[:20]} → {quadrant_inline}")
+
         print(
             f"  [{done_so_far:>3}/{to_score}]  {module_name:<30}"
             f"  {r[0]:>2} {int(prob_val):>2} {r[1]:>2}"
@@ -251,6 +257,7 @@ def score_file(in_csv: str, out_csv: str, provider: str, model: str, verbose: bo
         if done_so_far > 0 and done_so_far % 10 == 0:
             df.to_csv(out_csv, index=False, encoding="utf-8-sig")
 
+    pbar.close()
     prob = df["probability_score_auto"] if "probability_score_auto" in df.columns else 3
     df["risk_score_final"] = df["impact_score"].astype(float) * prob * df["detectability_score"].astype(float)
     df["quadrant"] = df["risk_score_final"].apply(assign_quadrant)

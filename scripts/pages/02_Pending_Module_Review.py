@@ -85,6 +85,70 @@ st.caption(
     "to add them to the permanent mapping store."
 )
 
+with st.expander("📖 What this page does — full guide", expanded=False):
+    st.markdown("""
+## 🧩 Pending Module Review — Complete Guide
+
+When `parse_ecl_export.py` encounters a module name in the ECL export that does not exactly match
+any known canonical module name, it runs a **fuzzy matcher** to find the closest known name and
+saves the suggestion as a *pending* mapping. This page is where you review, edit, and approve those
+suggestions before they become permanent.
+
+---
+
+### Why Module Name Normalisation Matters
+
+The ECL export contains raw module names typed by testers — often with typos, abbreviations,
+mixed capitalisation, or inconsistent spacing (e.g. `HQ Auido Denoise`, `AI story telling`,
+`Export_video`, `ExportVideo`). If left unresolved, these become separate rows in every report,
+splitting a module's bug count across multiple spellings and making it appear less risky than it is.
+
+Once a mapping is promoted, every future run of `parse_ecl_export.py` will automatically
+normalise that raw name to the canonical name — keeping all analysis consistent.
+
+---
+
+### 📋 The Editable Table
+
+Each row in the table represents one unconfirmed fuzzy match:
+
+| Column | Meaning |
+|--------|---------|
+| **Version** | The ECL version in which this raw module name first appeared |
+| **Raw Module** | The exact module name string as it appeared in ECL |
+| **Suggested Canonical** | The closest match found by `parse_ecl_export.py`'s fuzzy matcher |
+
+**You can edit the Suggested Canonical column directly** before promoting. If the suggestion is wrong, type the correct canonical name. If the raw name is genuinely a new module not yet in the known list, type the new canonical name and then add it to `parse_ecl_export.py`'s module list afterwards.
+
+---
+
+### ✅ Promoting Mappings
+
+1. **Select rows** to promote using the multiselect widget, the **Select ALL** button, or the **Bulk add by major** picker (adds all rows belonging to a given major version, e.g. all `16.x` entries).
+2. Click **✅ Promote selected to permanent**.
+3. Promoted mappings are written to `data/module_mappings/permanent/mappings_global.json` — the global lookup used by `parse_ecl_export.py`.
+4. The promoted rows are removed from the pending file for that version, so they will not appear here again.
+5. Re-run `parse_ecl_export.py` on the full ECL export to apply the new mappings retroactively to all historical bugs.
+
+---
+
+### 📁 File Locations
+
+| File | Purpose |
+|------|---------|
+| `data/module_mappings/versions/<version>_pending.json` | Unreviewed fuzzy matches per ECL version |
+| `data/module_mappings/versions/<version>_confirmed.json` | Confirmed mappings per version (written at promote time) |
+| `data/module_mappings/permanent/mappings_global.json` | Master lookup used by `parse_ecl_export.py` on every run |
+
+---
+
+### When to Run This
+
+- **After every new ECL export** parsed by `parse_ecl_export.py`. New builds frequently introduce new or misspelled module names.
+- **Before running risk scoring** — accurate module names are required for correct I×P×D aggregation.
+- Aim to clear the pending list to zero before each release review so risk scores are based on fully normalised data.
+""")
+
 # ---------------------------------------------------------------------
 # Editable table
 # ---------------------------------------------------------------------

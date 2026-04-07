@@ -283,7 +283,7 @@ def tag_existing_tests(df: pd.DataFrame, test_dir: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_summary(df: pd.DataFrame,
-                     path: str = "data/quadrant_summary.md",
+                     path: str = "quadrant_summary.md",
                      cluster_df: "pd.DataFrame | None" = None) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     lines = [
@@ -341,7 +341,7 @@ def generate_summary(df: pd.DataFrame,
 
 def generate_cluster_test_plan(df: pd.DataFrame,
                                 cluster_df: pd.DataFrame,
-                                path: str = "data/cluster_test_plan.md") -> None:
+                                path: str = "cluster_test_plan.md") -> None:
     """Write a plain-English test plan driven by the per-cluster bug-type forecast.
 
     For each P1/P2 module, lists:
@@ -478,12 +478,20 @@ Examples:
                         "Enables per-theme test methods and the cluster test plan.")
     p.add_argument("--cluster-plan", action="store_true",
                    help="Write data/cluster_test_plan.md (requires --cluster-predictions)")
-    p.add_argument("--summary-path", default="data/quadrant_summary.md",
-                   help="Output path for --summary (default: data/quadrant_summary.md)")
-    p.add_argument("--plan-path", default="data/cluster_test_plan.md",
-                   help="Output path for --cluster-plan (default: data/cluster_test_plan.md)")
+    p.add_argument("--summary-path", default=None,
+                   help="Output path for --summary (default: <input_dir>/quadrant_summary.md)")
+    p.add_argument("--plan-path", default=None,
+                   help="Output path for --cluster-plan (default: <input_dir>/cluster_test_plan.md)")
 
     a = p.parse_args()
+
+    # Derive output paths from input CSV's directory when not explicitly set
+    input_dir = str(Path(a.input_csv).parent)
+    if a.summary_path is None:
+        a.summary_path = os.path.join(input_dir, "quadrant_summary.md")
+    if a.plan_path is None:
+        a.plan_path = os.path.join(input_dir, "cluster_test_plan.md")
+
     df = pd.read_csv(a.input_csv)
     print(f"Loaded {len(df)} modules from {a.input_csv}")
 

@@ -1,36 +1,29 @@
 #!/usr/bin/env python3
-"""PDR-I Defect Prediction v4.0
+"""PDR-I Defect Prediction v5.0
 
-Changes from v3.0
+Changes from v4.0
 ─────────────────
-Change 15 — QA category classification (always on, no extra CSV needed)
-• BUG_CATEGORIES dict maps six QA-meaningful category names to keyword lists.
-• classify_bug_category(text) assigns each bug description to a category.
-• predict_category_breakdown() computes per-module category distributions from
-  the last N builds and scales them by the ML-model total to produce expected
-  counts per category for the next build.
-  Output: data/predictions/<stem>_predictions_by_category.csv with columns:
-      module, category, historical_count, historical_pct, expected_next_build
+Change 18 — Scenario-based bug forecasting
+• NEW generate_bug_scenarios() orchestrator produces concrete, testable bug
+  scenario predictions per module (e.g. "Crash when importing large .mov files
+  on macOS Sonoma") instead of just counts.
+• _extract_description_patterns() — heuristic (non-AI) scenario extractor that
+  clusters recent bug descriptions with AgglomerativeClustering and picks
+  representative descriptions as predicted scenarios.
+• _generate_scenarios_ai_ollama() / _generate_scenarios_ai_claude() — AI-powered
+  scenario generators that prompt the model for 3-5 concrete bug scenarios per
+  module, grounded in historical patterns.
+• Output: data/predictions/<stem>_predictions_by_scenario.csv with columns:
+      module, risk_level, predicted_build, scenario_rank, scenario_text,
+      confidence, source_bug_examples, supporting_categories, leading_signal
+• generate_focus_summary() now appends top scenario predictions per module.
 
-Change 16 — AI narrative re-focused on "what" not "how many"
-• generate_ai_narrative() and generate_ai_narrative_ollama() now receive the
-  category_forecast dict (from predict_category_breakdown) instead of the raw
-  predicted count as the headline.
-• The prompt explicitly asks the AI to describe WHAT types of bugs to expect and
-  which flows to prioritise — NOT to state or re-derive a total count.
-• This eliminates the mismatch between the AI Risk Briefing text and the
-  Predicted Bug Count chart (which always shows the ML model's prediction).
-
-Change 17 — Focus summary shows category breakdown
-• generate_focus_summary() uses category_preds_df for per-module breakdowns.
-• Each module entry now lists its top expected bug categories instead of a
-  raw count.
-
-All other behaviour is unchanged from v3.0.
+All v4.0 behaviour is unchanged.
 
 Output paths:
   data/predictions/<stem>_predictions.csv
-  data/predictions/<stem>_predictions_by_category.csv  ← NEW (always)
+  data/predictions/<stem>_predictions_by_category.csv  (always)
+  data/predictions/<stem>_predictions_by_scenario.csv  ← NEW (always)
   data/predictions/<stem>_predictions_by_cluster.csv   (when --cluster-csv given)
   data/predictions/<stem>_predictions_importance.csv
   data/predictions/<stem>_predictions_leading_indicators.csv
@@ -45,15 +38,19 @@ Usage:
   python predict_defects.py <input_csv> --scored-csv <path>
 """
 import os
+import re
 import sys
 import json
 import urllib.request
 import warnings
 import pandas as pd
 import numpy as np
+from tqdm import tqdm
 from pathlib import Path
+from sklearn.cluster import AgglomerativeClustering
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_distances
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
 warnings.filterwarnings("ignore")
 
@@ -63,40 +60,40 @@ warnings.filterwarnings("ignore")
 
 PREDICTION_GUIDE = """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║           PDR-I DEFECT PREDICTION v4.0 — HOW TO READ THIS OUTPUT           ║
+║           PDR-I DEFECT PREDICTION v5.0 — HOW TO READ THIS OUTPUT           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                             ║
 ║  WHAT THIS TOOL PREDICTS                                                    ║
 ║  ───────────────────────                                                    ║
 ║  For each module, the model predicts:                                       ║
 ║   1. A risk level (Low / Medium / High / Critical) for the NEXT build.     ║
-║   2. WHAT TYPES of bugs are expected (by QA category), based on recent     ║
-║      bug descriptions — not just "how many" but "what kind."               ║
+║   2. WHAT TYPES of bugs are expected (by QA category).                     ║
+║   3. CONCRETE BUG SCENARIOS — specific, testable predictions like real     ║
+║      bug titles, grounded in recurring historical patterns.                 ║
 ║                                                                             ║
-║  QA BUG CATEGORIES (auto-classified from descriptions)                     ║
-║  ────────────────────────────────────────────────────                       ║
-║  • Crash / Stability              • Feature not working as intended        ║
-║  • UI / Display problem           • UX / Usability problem                 ║
-║  • Translation / Localization     • Data / File / Sync issue               ║
-║                                                                             ║
-║  CATEGORY PREDICTION OUTPUT (_predictions_by_category.csv)                 ║
+║  SCENARIO PREDICTION OUTPUT (_predictions_by_scenario.csv)                 ║
 ║  ─────────────────────────────────────────────────────────                  ║
-║  module, category          Which bug category is expected                   ║
-║  historical_count          How many recent bugs fell in this category       ║
-║  historical_pct            Fraction of recent bugs in this category         ║
-║  expected_next_build       Scaled count for next build                      ║
+║  module              Which module this scenario applies to                   ║
+║  scenario_text       A concrete, testable bug prediction                    ║
+║  confidence          high (3+ recurring bugs) / medium (2) / low (1)       ║
+║  source_bug_examples Real bug descriptions this scenario is based on        ║
+║  supporting_categories  QA categories that support this scenario            ║
 ║                                                                             ║
 ║  HOW TO ACT ON IT                                                           ║
 ║  ────────────────                                                           ║
-║  Critical/High modules → add to mandatory test suite for the next build.  ║
-║  Read '_by_category.csv' to know WHAT TYPES of bugs to test for.           ║
-║  Read 'ai_narrative' for a plain-English explanation of what to expect.    ║
+║  Critical/High modules → add predicted scenarios to your test plan.        ║
+║  Read '_by_scenario.csv' for WHAT SPECIFIC BUGS to test for.               ║
+║  Read '_by_category.csv' for the category-level distribution.              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
 TFIDF_TOP_N  = 40
 TFIDF_PREFIX = "tfidf_"
 OLLAMA_BASE  = "http://localhost:11434"
+
+SCENARIO_TOP_MODULES    = 10
+SCENARIOS_PER_MODULE    = 5
+SCENARIO_HISTORY_BUILDS = 5
 
 _FEATURE_LABELS = {
     "crit_1":  "critical-bug momentum (last build)",
@@ -810,6 +807,428 @@ def _sample_descriptions(orig_df, module, mod_col="parsed_module",
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Change 18 — Scenario generation pipeline (v5.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_description_patterns(
+    orig_df: pd.DataFrame,
+    module: str,
+    mod_col: str = "parsed_module",
+    text_col: str = "parsed_description",
+    build_col: str = "Build#",
+    history_builds: int = SCENARIO_HISTORY_BUILDS,
+    top_n: int = SCENARIOS_PER_MODULE,
+) -> list:
+    """Heuristic (non-AI) scenario extractor.
+
+    Clusters recent bug descriptions for a module using AgglomerativeClustering
+    on TF-IDF cosine distances, then picks the description closest to each
+    cluster centroid as a representative scenario.
+
+    Returns list of dicts: {scenario_text, confidence, source_count, source_examples}
+    """
+    if text_col not in orig_df.columns or mod_col not in orig_df.columns:
+        return []
+
+    working = orig_df.copy()
+    working[build_col] = pd.to_numeric(working[build_col], errors="coerce")
+    working = working.dropna(subset=[build_col, mod_col])
+    working[build_col] = working[build_col].astype(int)
+
+    mod_data = working[working[mod_col] == module]
+    if len(mod_data) < 2:
+        return []
+
+    recent_builds = sorted(mod_data[build_col].unique())[-history_builds:]
+    recent = mod_data[mod_data[build_col].isin(recent_builds)]
+
+    descriptions = recent[text_col].dropna().astype(str).tolist()
+    # Deduplicate while preserving order
+    seen = set()
+    unique_descs = []
+    for d in descriptions:
+        d_stripped = d.strip()
+        if d_stripped and len(d_stripped) > 10 and d_stripped not in seen:
+            seen.add(d_stripped)
+            unique_descs.append(d_stripped)
+
+    if len(unique_descs) < 2:
+        if unique_descs:
+            return [{
+                "scenario_text": unique_descs[0],
+                "confidence": "low",
+                "source_count": 1,
+                "source_examples": unique_descs[0],
+            }]
+        return []
+
+    # Build TF-IDF matrix
+    try:
+        vec = TfidfVectorizer(
+            max_features=100, stop_words="english",
+            ngram_range=(1, 2), min_df=1, max_df=0.95, sublinear_tf=True,
+        )
+        X = vec.fit_transform(unique_descs)
+    except ValueError:
+        return [{
+            "scenario_text": unique_descs[0],
+            "confidence": "low",
+            "source_count": 1,
+            "source_examples": unique_descs[0],
+        }]
+
+    # Cosine distance matrix
+    dist_matrix = cosine_distances(X)
+
+    # Cluster
+    n_samples = len(unique_descs)
+    if n_samples <= 2:
+        # Too few for clustering — return as-is
+        results = []
+        for d in unique_descs[:top_n]:
+            results.append({
+                "scenario_text": d,
+                "confidence": "low",
+                "source_count": 1,
+                "source_examples": d,
+            })
+        return results
+
+    try:
+        clustering = AgglomerativeClustering(
+            n_clusters=None,
+            distance_threshold=0.7,
+            metric="precomputed",
+            linkage="average",
+        )
+        labels = clustering.fit_predict(dist_matrix)
+    except Exception:
+        return [{
+            "scenario_text": unique_descs[0],
+            "confidence": "low",
+            "source_count": 1,
+            "source_examples": unique_descs[0],
+        }]
+
+    # Group descriptions by cluster, pick representative (closest to centroid)
+    from collections import defaultdict
+    clusters: dict = defaultdict(list)
+    for idx, label in enumerate(labels):
+        clusters[label].append(idx)
+
+    # Sort clusters by size descending
+    sorted_clusters = sorted(clusters.items(), key=lambda x: -len(x[1]))
+
+    results = []
+    for _, member_indices in sorted_clusters[:top_n]:
+        member_descs = [unique_descs[i] for i in member_indices]
+        cluster_size = len(member_indices)
+
+        # Pick description closest to cluster centroid
+        if cluster_size == 1:
+            representative = member_descs[0]
+        else:
+            sub_dist = dist_matrix[np.ix_(member_indices, member_indices)]
+            avg_dist = sub_dist.mean(axis=1)
+            best_local_idx = int(np.argmin(avg_dist))
+            representative = member_descs[best_local_idx]
+
+        # Confidence based on cluster size
+        if cluster_size >= 3:
+            confidence = "high"
+        elif cluster_size == 2:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        # Source examples: up to 3 other descriptions from the cluster
+        examples = [d for d in member_descs if d != representative][:3]
+        example_str = " | ".join(examples) if examples else representative
+
+        results.append({
+            "scenario_text": representative,
+            "confidence": confidence,
+            "source_count": cluster_size,
+            "source_examples": example_str,
+        })
+
+    return results
+
+
+def _generate_scenarios_ai_ollama(
+    module: str,
+    risk_level: str,
+    descriptions: list,
+    category_distribution: "dict | None" = None,
+    cluster_labels: "list | None" = None,
+    leading_signal: str = "",
+    model: str = "llama3.1",
+) -> list:
+    """AI scenario generator using Ollama. Returns list of scenario dicts."""
+    desc_block = "\n".join(f" - {d}" for d in descriptions[:15]) if descriptions \
+        else " (no description samples available)"
+
+    cat_block = ""
+    if category_distribution:
+        lines = [f"  • {cat} ({pct*100:.0f}%)" for cat, pct in list(category_distribution.items())[:6]]
+        cat_block = "\nCategory distribution:\n" + "\n".join(lines)
+
+    cluster_block = ""
+    if cluster_labels:
+        cluster_block = "\nBug theme clusters: " + ", ".join(cluster_labels[:5])
+
+    prompt = (
+        f"You are a QA lead predicting specific bugs for the next build.\n\n"
+        f"Module: {module}\n"
+        f"Risk level: {risk_level}\n"
+        f"Strongest predictive signal: {leading_signal}"
+        f"{cat_block}\n{cluster_block}\n\n"
+        f"Recent bug descriptions for this module:\n{desc_block}\n\n"
+        f"Predict 3-5 specific bug scenarios likely to occur next build.\n"
+        f"Each must be a concrete, testable statement like real bug titles.\n"
+        f"Do NOT write vague summaries. Do NOT mention counts.\n"
+        f'Return ONLY a JSON array: [{{"scenario": "...", "confidence": "high|medium|low", "based_on": "..."}}]'
+    )
+
+    payload = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0.3, "num_predict": 800},
+    }).encode()
+    req = urllib.request.Request(
+        f"{OLLAMA_BASE}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            raw = json.loads(resp.read().decode())
+            text = raw.get("response", "").strip()
+            # Try parsing as JSON directly
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    return parsed
+                # Some models wrap in a dict
+                if isinstance(parsed, dict):
+                    for key in ("scenarios", "predictions", "bugs", "results"):
+                        if key in parsed and isinstance(parsed[key], list):
+                            return parsed[key]
+            except json.JSONDecodeError:
+                pass
+            # Fallback: extract JSON array from text
+            match = re.search(r'\[.*\]', text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group())
+                except json.JSONDecodeError:
+                    pass
+    except Exception:
+        pass
+    return []
+
+
+def _generate_scenarios_ai_claude(
+    module: str,
+    risk_level: str,
+    descriptions: list,
+    category_distribution: "dict | None" = None,
+    cluster_labels: "list | None" = None,
+    leading_signal: str = "",
+    api_key: str = "",
+) -> list:
+    """AI scenario generator using Claude API. Returns list of scenario dicts."""
+    desc_block = "\n".join(f" - {d}" for d in descriptions[:15]) if descriptions \
+        else " (no description samples available)"
+
+    cat_block = ""
+    if category_distribution:
+        lines = [f"  • {cat} ({pct*100:.0f}%)" for cat, pct in list(category_distribution.items())[:6]]
+        cat_block = "\nCategory distribution:\n" + "\n".join(lines)
+
+    cluster_block = ""
+    if cluster_labels:
+        cluster_block = "\nBug theme clusters: " + ", ".join(cluster_labels[:5])
+
+    prompt = (
+        f"You are a QA lead predicting specific bugs for the next build.\n\n"
+        f"Module: {module}\n"
+        f"Risk level: {risk_level}\n"
+        f"Strongest predictive signal: {leading_signal}"
+        f"{cat_block}\n{cluster_block}\n\n"
+        f"Recent bug descriptions for this module:\n{desc_block}\n\n"
+        f"Predict 3-5 specific bug scenarios likely to occur next build.\n"
+        f"Each must be a concrete, testable statement like real bug titles.\n"
+        f"Do NOT write vague summaries. Do NOT mention counts.\n"
+        f'Return ONLY a JSON array: [{{"scenario": "...", "confidence": "high|medium|low", "based_on": "..."}}]'
+    )
+
+    payload = json.dumps({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 800,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+            text = data["content"][0]["text"].strip()
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+            match = re.search(r'\[.*\]', text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group())
+                except json.JSONDecodeError:
+                    pass
+    except Exception:
+        pass
+    return []
+
+
+def generate_bug_scenarios(
+    preds: pd.DataFrame,
+    orig_df: pd.DataFrame,
+    category_preds_df: "pd.DataFrame | None",
+    cluster_preds_df: "pd.DataFrame | None",
+    provider: str = "none",
+    model: str = "llama3.1",
+    api_key: str = "",
+    mod_col: str = "parsed_module",
+    text_col: str = "parsed_description",
+    build_col: str = "Build#",
+) -> "pd.DataFrame | None":
+    """Orchestrate scenario generation for the top risk-ranked modules.
+
+    For each module: gather context, call AI or heuristic scenario generator,
+    build a DataFrame of predicted bug scenarios.
+    """
+    # Select top modules by risk
+    risk_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+    ranked = preds.copy()
+    ranked["_risk_rank"] = ranked["risk_level"].astype(str).map(risk_order).fillna(3).astype(int)
+    ranked = ranked.sort_values(["_risk_rank", "predicted"], ascending=[True, False])
+    top_modules = ranked.head(SCENARIO_TOP_MODULES)
+
+    # Determine predicted build number
+    if build_col in orig_df.columns:
+        build_nums = pd.to_numeric(orig_df[build_col], errors="coerce").dropna()
+        predicted_build = int(build_nums.max()) + 1 if len(build_nums) > 0 else 0
+    else:
+        predicted_build = 0
+
+    all_rows = []
+
+    for _, mod_row in tqdm(top_modules.iterrows(), total=len(top_modules),
+                           desc="Generating scenarios", unit="mod",
+                           file=sys.stderr, dynamic_ncols=True):
+        mod = mod_row["module"]
+        risk_level = str(mod_row.get("risk_level", "Medium"))
+        leading_signal = str(mod_row.get("leading_signal", ""))
+
+        # Gather descriptions
+        descriptions = _sample_descriptions(orig_df, mod, mod_col=mod_col,
+                                            text_col=text_col, n=15)
+
+        # Category distribution
+        category_distribution = None
+        if category_preds_df is not None and not category_preds_df.empty:
+            mod_cats = category_preds_df[category_preds_df["module"] == mod].head(6)
+            if not mod_cats.empty:
+                category_distribution = dict(
+                    zip(mod_cats["category"], mod_cats["historical_pct"]))
+
+        # Cluster labels
+        cluster_labels = None
+        if cluster_preds_df is not None and not cluster_preds_df.empty:
+            mod_cl = cluster_preds_df[cluster_preds_df["module"] == mod].head(5)
+            if not mod_cl.empty and "cluster_label" in mod_cl.columns:
+                cluster_labels = mod_cl["cluster_label"].tolist()
+
+        # Supporting categories string
+        supporting_cats = ""
+        if category_distribution:
+            supporting_cats = ", ".join(list(category_distribution.keys())[:3])
+
+        # Try AI scenario generation
+        scenarios = []
+        if provider == "ollama":
+            scenarios = _generate_scenarios_ai_ollama(
+                module=mod, risk_level=risk_level,
+                descriptions=descriptions,
+                category_distribution=category_distribution,
+                cluster_labels=cluster_labels,
+                leading_signal=leading_signal,
+                model=model,
+            )
+        elif provider == "claude" and api_key:
+            scenarios = _generate_scenarios_ai_claude(
+                module=mod, risk_level=risk_level,
+                descriptions=descriptions,
+                category_distribution=category_distribution,
+                cluster_labels=cluster_labels,
+                leading_signal=leading_signal,
+                api_key=api_key,
+            )
+
+        # Fallback to heuristic if AI returned nothing or provider is "none"
+        if not scenarios:
+            heuristic = _extract_description_patterns(
+                orig_df, mod, mod_col=mod_col, text_col=text_col,
+                build_col=build_col,
+            )
+            for i, h in enumerate(heuristic):
+                all_rows.append({
+                    "module": mod,
+                    "risk_level": risk_level,
+                    "predicted_build": predicted_build,
+                    "scenario_rank": i + 1,
+                    "scenario_text": h["scenario_text"],
+                    "confidence": h["confidence"],
+                    "source_bug_examples": h["source_examples"],
+                    "supporting_categories": supporting_cats,
+                    "leading_signal": leading_signal,
+                })
+        else:
+            for i, s in enumerate(scenarios[:SCENARIOS_PER_MODULE]):
+                scenario_text = s.get("scenario", s.get("scenario_text", ""))
+                confidence = s.get("confidence", "medium")
+                if confidence not in ("high", "medium", "low"):
+                    confidence = "medium"
+                based_on = s.get("based_on", "")
+                all_rows.append({
+                    "module": mod,
+                    "risk_level": risk_level,
+                    "predicted_build": predicted_build,
+                    "scenario_rank": i + 1,
+                    "scenario_text": scenario_text,
+                    "confidence": confidence,
+                    "source_bug_examples": based_on,
+                    "supporting_categories": supporting_cats,
+                    "leading_signal": leading_signal,
+                })
+
+    if not all_rows:
+        return None
+
+    return pd.DataFrame(all_rows)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # AI narrative — Claude  (updated for v3.0 cluster_forecast param)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -947,7 +1366,8 @@ def generate_focus_summary(preds, leading, orig_df,
                             mod_col="parsed_module", top_n=8,
                             api_key="", provider="none", model="llama3.1",
                             cluster_preds_df: "pd.DataFrame | None" = None,
-                            category_preds_df: "pd.DataFrame | None" = None) -> str:
+                            category_preds_df: "pd.DataFrame | None" = None,
+                            scenario_df: "pd.DataFrame | None" = None) -> str:
     lines = [
         "=" * 78,
         " PDR-I DEFECT PREDICTION — FOCUS SUMMARY FOR NEXT BUILD",
@@ -965,7 +1385,9 @@ def generate_focus_summary(preds, leading, orig_df,
     if high_risk.empty:
         high_risk = preds.head(min(top_n, len(preds)))
 
-    for _, row in high_risk.iterrows():
+    for _, row in tqdm(high_risk.iterrows(), total=len(high_risk),
+                       desc="Building focus summary", unit="mod",
+                       file=sys.stderr, dynamic_ncols=True):
         mod   = row["module"]
         pred  = row["predicted"]
         rl    = str(row["risk_level"])
@@ -1023,6 +1445,16 @@ def generate_focus_summary(preds, leading, orig_df,
             lines.append(f"     Expected bug themes:")
             for lbl, cnt in list(cluster_forecast.items())[:4]:
                 lines.append(f"       • {lbl}")
+
+        # v5.0 — append top predicted scenarios
+        if scenario_df is not None and not scenario_df.empty:
+            mod_scenarios = scenario_df[scenario_df["module"] == mod].head(3)
+            if not mod_scenarios.empty:
+                lines.append(f"     Predicted bug scenarios:")
+                for _, sc in mod_scenarios.iterrows():
+                    conf = str(sc.get("confidence", ""))
+                    text = str(sc.get("scenario_text", ""))
+                    lines.append(f"       → [{conf}] {text}")
 
         if provider == "ollama":
             descriptions = _sample_descriptions(orig_df, mod, mod_col=mod_col)
@@ -1169,20 +1601,81 @@ def main():
     model_obj, preds, imp, leading = train_predict(fdf, orig_df)
 
     preds = preds.sort_values("predicted", ascending=False)
+
+    # ── Composite risk scoring ────────────────────────────────────────────
+    # Pure count-based bins are unreliable with short data windows (most
+    # modules predict 1–3 bugs). Instead, we compute a 0–100 composite risk
+    # score from four normalised signals, then apply thresholds aligned with
+    # the risk register tiers (Critical ≥70, High ≥45, Medium ≥25).
+    #
+    # Weights (domain risk is the strongest signal):
+    #   50% — risk_score_final   (I×P×D from AI/heuristic scorer, 0–125)
+    #   20% — predicted count    (ML forecast, normalised to dataset range)
+    #   20% — severity_escalation (negative = worsening toward S1)
+    #   10% — recent trend / momentum
+
+    _rs = pd.to_numeric(preds.get("risk_score_final", 0), errors="coerce").fillna(0.0)
+    _pred = pd.to_numeric(preds["predicted"], errors="coerce").fillna(0.0)
+    _sev = pd.to_numeric(preds.get("severity_escalation", 0), errors="coerce").fillna(0.0)
+    _trend = pd.to_numeric(preds.get("trend", 0), errors="coerce").fillna(0.0)
+
+    # Normalise each signal to 0–1
+    # risk_score_final: normalise to the dataset's actual max (not theoretical 125)
+    # so the highest-risk module in this product maps to 1.0
+    rs_max = max(_rs.max(), 1.0)
+    norm_rs = (_rs / rs_max).clip(0, 1)
+
+    # predicted count: normalise to dataset max (floor at 1 to avoid /0)
+    pred_max = max(_pred.max(), 1.0)
+    norm_pred = (_pred / pred_max).clip(0, 1)
+
+    # severity_escalation: negative = worsening toward S1 = higher risk.
+    # Positive/zero escalation (improving or stable) should not reduce risk.
+    # Map negative values to 0–1 range: -1→1.0 (worst), 0→0.0 (neutral).
+    norm_sev = (-_sev).clip(0, 1)  # only negative escalation counts
+
+    # trend: positive = growing bugs = higher risk. Negative trend should not
+    # *reduce* risk (a declining count doesn't make a high-impact module safe).
+    # Clamp negative trends to 0 so trend can only increase composite risk.
+    trend_max = max(_trend.max(), 1.0)  # use positive max only
+    norm_trend = (_trend.clip(0, None) / trend_max).clip(0, 1)
+
+    raw_composite = (
+        0.50 * norm_rs +
+        0.20 * norm_pred +
+        0.20 * norm_sev +
+        0.10 * norm_trend
+    )
+
+    # Use percentile rank so composite_risk spans the full 0–100 range
+    # regardless of dataset size or outliers. Each module's score reflects
+    # its relative position: 95 = riskier than 95% of modules.
+    preds["composite_risk"] = raw_composite.rank(pct=True).mul(100).round(2)
+
+    # Fixed thresholds aligned with the risk register tiers.
     preds["risk_level"] = pd.cut(
-        preds["predicted"],
-        bins=[-1, 2, 5, 10, float("inf")],
+        preds["composite_risk"],
+        bins=[-1, 50, 70, 90, float("inf")],
         labels=["Low", "Medium", "High", "Critical"],
     )
+
+    # Log the breakdown
+    rl_counts = preds["risk_level"].value_counts()
+    print(f"\n  Composite risk scoring (50% domain risk, 20% predicted count, 20% severity trend, 10% momentum):")
+    print(f"    Thresholds — Critical >90 | High 70–90 | Medium 50–70 | Low <50")
+    for lvl in ["Critical", "High", "Medium", "Low"]:
+        print(f"    {lvl}: {rl_counts.get(lvl, 0)} module(s)")
 
     print("\n" + "─" * 78)
     print(" PREDICTED BUG COUNT — next build estimate per module")
     print(" target = actual bugs in most recent build | predicted = next build forecast")
-    print(" risk_level thresholds: Low <3 | Medium 3-5 | High 6-10 | Critical >10")
+    print(" composite_risk: 50% domain risk + 20% count + 20% severity trend + 10% momentum")
+    print(f" risk_level: Critical >90 | High 70–90 | Medium 50–70 | Low <50")
     print("─" * 78)
-    display_cols = ["module", "target", "predicted", "risk_level",
+    display_cols = ["module", "target", "predicted", "composite_risk", "risk_level",
                     "dominant_bug_type", "leading_signal"]
     display_cols = [c for c in display_cols if c in preds.columns]
+    preds = preds.sort_values("composite_risk", ascending=False)
     print(preds[display_cols].head(20).to_string(index=False))
 
     # ── Bug-type prediction (Change 13 — cluster-based) ──────────────────────
@@ -1211,6 +1704,20 @@ def main():
         print(f"  Category predictions saved → {by_category_path}")
         print(f"  ({len(category_preds_df)} module×category rows)")
 
+    # ── Change 18 — Bug scenario predictions (always runs) ──────────────────
+    print("\nGenerating bug scenario predictions ...")
+    scenario_df = generate_bug_scenarios(
+        preds, orig_df, category_preds_df, cluster_preds_df,
+        provider=provider, model=model, api_key=api_key,
+    )
+    if scenario_df is not None:
+        scenario_path = str(out_stem) + "_predictions_by_scenario.csv"
+        scenario_df.to_csv(scenario_path, index=False, encoding="utf-8-sig")
+        print(f"  Scenario predictions saved → {scenario_path}")
+        print(f"  ({len(scenario_df)} scenario rows across {scenario_df['module'].nunique()} modules)")
+    else:
+        print("  NOTE: No scenario predictions could be generated.")
+
     # ── Focus summary ─────────────────────────────────────────────────────────
     use_ai = provider in ("claude", "ollama")
     print(f"\nGenerating focus summary (provider={provider})...")
@@ -1220,6 +1727,7 @@ def main():
         provider=provider, model=model,
         cluster_preds_df=cluster_preds_df,
         category_preds_df=category_preds_df,
+        scenario_df=scenario_df,
     )
     print("\n" + summary_text)
 
@@ -1230,7 +1738,8 @@ def main():
             preds[preds["risk_level"].isin(["Critical", "High"])]
             .head(8)["module"].tolist()
         )
-        for mod in high_risk_mods:
+        for mod in tqdm(high_risk_mods, desc="Generating narratives", unit="mod",
+                        file=sys.stderr, dynamic_ncols=True):
             row = preds[preds["module"] == mod].iloc[0]
             descriptions = _sample_descriptions(orig_df, mod)
 
@@ -1287,6 +1796,8 @@ def main():
     print(f"  {out}              ← main predictions (includes ai_narrative)")
     if category_preds_df is not None:
         print(f"  {out_stem}_predictions_by_category.csv ← expected bug categories per module")
+    if scenario_df is not None:
+        print(f"  {out_stem}_predictions_by_scenario.csv ← concrete bug scenario predictions")
     if cluster_preds_df is not None:
         print(f"  {out_stem}_predictions_by_cluster.csv  ← bug-type forecast per cluster")
     print(f"  {imp_path}         ← model feature importances")
