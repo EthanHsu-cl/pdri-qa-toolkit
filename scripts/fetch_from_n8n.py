@@ -3,14 +3,26 @@
 
 Usage:
     python scripts/fetch_from_n8n.py
+    python scripts/fetch_from_n8n.py --product pdri --duration 1
+    python scripts/fetch_from_n8n.py --product phdi --duration 36
     python scripts/fetch_from_n8n.py --output data/ecl_raw.json
-    python scripts/fetch_from_n8n.py --webhook-url https://your-n8n-host/webhook/82746bb5-e140-4720-98a3-d1965900274d
+    python scripts/fetch_from_n8n.py --webhook-url https://your-n8n-host/webhook/...
+
+Supported product slugs:
+    pdri  → PowerDirector Mobile for iOS
+    pdra  → PowerDirector Mobile for Android
+    phdi  → PhotoDirector Mobile for iOS
+    phda  → PhotoDirector Mobile for Android
+
+When --product is given, the output path defaults to
+data/products/<slug>/ecl_raw.json (and parsed CSV to data/products/<slug>/ecl_parsed.csv).
+Pass explicit --output / --parsed-output to override.
 
 Then feed the output directly into the parser:
-    python scripts/parse_ecl_export.py data/ecl_raw.json data/ecl_parsed.csv
+    python scripts/parse_ecl_export.py data/products/pdri/ecl_raw.json data/products/pdri/ecl_parsed.csv
 
 Or run both steps in one go:
-    python scripts/fetch_from_n8n.py --then-parse
+    python scripts/fetch_from_n8n.py --product pdri --duration 1 --then-parse
 """
 
 import argparse
@@ -25,15 +37,28 @@ import pandas as pd
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
+# v4 workflow: accepts body.product_name and body.duration_months;
+# falls back to PDRi / 36 months when neither is supplied.
 DEFAULT_WEBHOOK_URL = (
-    "https://ecl-agent.cyberlink.com/webhook/82746bb5-e140-4720-98a3-d1965900274d-v3"
+    "https://ecl-agent.cyberlink.com/webhook/82746bb5-e140-4720-98a3-d1965900274d-v4"
 )
+
+# Map short slug → eBug ProductName value used in the n8n query.
+PRODUCT_SLUGS: dict[str, str] = {
+    "pdri": "PowerDirector Mobile for iOS",
+    "pdra": "PowerDirector Mobile for Android",
+    "phdi": "PhotoDirector Mobile for iOS",
+    "phda": "PhotoDirector Mobile for Android",
+}
+
+DEFAULT_PRODUCT  = "pdri"
+DEFAULT_DURATION = 0      # 0 = let the n8n workflow use its own default (36 months)
+
+# Legacy flat-file defaults kept for callers that don't pass --product.
 DEFAULT_OUTPUT   = "data/ecl_raw.json"
 DEFAULT_PARSED   = "data/ecl_parsed.csv"
 
-# The n8n workflow reads body.product_name but the query condition is
-# hard-coded inside the workflow, so an empty string fetches all products.
-DEFAULT_PAYLOAD = {"product_name": "PowerDirector Mobile for iOS"}
+DEFAULT_PAYLOAD = {"product_name": PRODUCT_SLUGS[DEFAULT_PRODUCT]}
 
 # Fields that must be present for the parser to work correctly.
 # Build# and Close Build# are nice-to-have; Short Description is critical.
@@ -241,14 +266,35 @@ def main():
         help=f"n8n webhook POST URL (default: {DEFAULT_WEBHOOK_URL})",
     )
     parser.add_argument(
+        "--product",
+        default=DEFAULT_PRODUCT,
+        metavar="SLUG",
+        help=(
+            f"Product slug to fetch: {', '.join(PRODUCT_SLUGS)}. "
+            f"Also accepts the full ProductName string. "
+            f"When set, output paths default to data/products/<slug>/. "
+            f"(default: {DEFAULT_PRODUCT})"
+        ),
+    )
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=DEFAULT_DURATION,
+        metavar="MONTHS",
+        help=(
+            "Date range in months to fetch (e.g. 1 for last month, 36 for 3 years). "
+            "0 = use the n8n workflow's own default. (default: 0)"
+        ),
+    )
+    parser.add_argument(
         "--output", "-o",
-        default=DEFAULT_OUTPUT,
-        help=f"Output JSON file path (default: {DEFAULT_OUTPUT})",
+        default=None,
+        help="Output JSON file path. Defaults to data/products/<slug>/ecl_raw.json",
     )
     parser.add_argument(
         "--parsed-output",
-        default=DEFAULT_PARSED,
-        help=f"Parsed CSV path used by --then-parse (default: {DEFAULT_PARSED})",
+        default=None,
+        help="Parsed CSV path used by --then-parse. Defaults to data/products/<slug>/ecl_parsed.csv",
     )
     parser.add_argument(
         "--timeout",
@@ -261,7 +307,6 @@ def main():
         action="store_true",
         help="After saving, immediately run parse_ecl_export.py on the result",
     )
-    # Change 5 — scope control
     parser.add_argument(
         "--scope",
         choices=["auto", "latest", "all"],
@@ -274,17 +319,43 @@ def main():
     )
     args = parser.parse_args()
 
+    # Resolve product slug → full name
+    slug = args.product.lower().strip()
+    if slug in PRODUCT_SLUGS:
+        product_name = PRODUCT_SLUGS[slug]
+    elif args.product in PRODUCT_SLUGS.values():
+        # Full name passed directly — find the slug
+        product_name = args.product
+        slug = next(k for k, v in PRODUCT_SLUGS.items() if v == product_name)
+    else:
+        print(f"⚠️  Unknown product '{args.product}'. Known slugs: {', '.join(PRODUCT_SLUGS)}")
+        print(f"   Treating it as a full ProductName and using slug 'custom'.")
+        product_name = args.product
+        slug = "custom"
+
+    # Derive output paths from product slug if not explicitly overridden
+    product_dir = f"data/products/{slug}"
+    output_path  = args.output        or f"{product_dir}/ecl_raw.json"
+    parsed_path  = args.parsed_output or f"{product_dir}/ecl_parsed.csv"
+
     scope = resolve_scope(args)
     start_time = datetime.now()
-    print(f"Fetching eBugs — {start_time.strftime('%Y-%m-%d %H:%M:%S')}  [scope={scope}]")
+    print(
+        f"Fetching eBugs — {start_time.strftime('%Y-%m-%d %H:%M:%S')}  "
+        f"[product={slug} ({product_name})  scope={scope}  "
+        f"duration={'workflow default' if args.duration == 0 else f'{args.duration}m'}]"
+    )
 
-    # Build the payload; when scope=latest, resolve the actual version string
-    # from the catalogue so the n8n workflow knows exactly which version to
-    # fetch rather than guessing by string sort order.
-    payload = dict(DEFAULT_PAYLOAD)
-    payload["scope"] = scope
+    # Build the payload for the v4 workflow
+    payload: dict = {
+        "product_name": product_name,
+        "scope": scope,
+    }
+    if args.duration and args.duration > 0:
+        payload["duration_months"] = args.duration
+
     if scope == "latest":
-        latest_ver = get_latest_version(args.output)
+        latest_ver = get_latest_version(output_path)
         if latest_ver:
             payload["latest_version"] = latest_ver
             print(f"  Sending latest_version={latest_ver!r} in webhook payload")
@@ -300,19 +371,19 @@ def main():
     if not ok:
         sys.exit(1)
 
-    summary = save_json(records, args.output)
+    summary = save_json(records, output_path)
 
     elapsed = (datetime.now() - start_time).total_seconds()
     print(f"⏱  Fetch+save completed in {elapsed:.1f}s  (scope={scope})")
 
     if args.then_parse:
-        print(f"\nRunning parser → {args.parsed_output}")
+        print(f"\nRunning parser → {parsed_path}")
         result = subprocess.run(
             [
                 sys.executable,
                 "scripts/parse_ecl_export.py",
-                args.output,
-                args.parsed_output,
+                output_path,
+                parsed_path,
             ],
             check=False,
         )
@@ -322,7 +393,7 @@ def main():
     else:
         print(
             f"\nNext step:\n"
-            f"  python scripts/parse_ecl_export.py {args.output} {args.parsed_output}\n"
+            f"  python scripts/parse_ecl_export.py {output_path} {parsed_path}\n"
             f"\nOr re-run with --then-parse to do both in one command."
         )
 

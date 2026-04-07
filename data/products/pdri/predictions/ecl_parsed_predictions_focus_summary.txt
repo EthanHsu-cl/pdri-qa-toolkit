@@ -1,0 +1,17 @@
+==============================================================================
+ PDR-I DEFECT PREDICTION — FOCUS SUMMARY FOR NEXT BUILD
+==============================================================================
+
+ Modules ranked by risk level. Category breakdown shows WHAT bugs to expect.
+
+  ──────────────────────────────────────────────────────────────────────────
+  📍 Timeline  [Critical risk]
+     Leading signal : recent bug-count momentum (last 5 builds)
+     Expected bug categories (from recent history):
+       • Feature not working as intended (42%)
+       • UI / Display problem (25%)
+       • Data / File / Sync issue (17%)
+       • UX / Usability problem (8%)
+  [Ollama narrative unavailable: <urlopen error [Errno 61] Connection refused>]
+
+==============================================================================

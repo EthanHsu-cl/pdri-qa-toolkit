@@ -98,8 +98,8 @@ import plotly.express as px
 from pathlib import Path
 
 
-st.set_page_config(page_title="PDR-I QA Dashboard", layout="wide", page_icon="🔥")
-st.sidebar.title("🔥 PDR-I QA Dashboard v2.21")
+st.set_page_config(page_title="Mobile QA Dashboard", layout="wide", page_icon="📱")
+st.sidebar.title("📱 Mobile QA Dashboard")
 
 
 # ---------------------------------------------------------------------
@@ -142,6 +142,29 @@ INACTIVE_STATUSES = {
     "wont fix", "won't fix", "propose wont fix", "qa propose wont fix",
     "not reproducible", "notreproducible", "not a bug",
     "new feature", "external issue", "hqqa close", "fae close",
+}
+
+PRODUCT_CONFIG: dict[str, dict] = {
+    "pdri": {
+        "label": "PowerDirector iOS (PDR-i)",
+        "full_name": "PowerDirector Mobile for iOS",
+        "data_dir": "data/products/pdri",
+    },
+    "pdra": {
+        "label": "PowerDirector Android (PDR-a)",
+        "full_name": "PowerDirector Mobile for Android",
+        "data_dir": "data/products/pdra",
+    },
+    "phdi": {
+        "label": "PhotoDirector iOS (PHD-i)",
+        "full_name": "PhotoDirector Mobile for iOS",
+        "data_dir": "data/products/phdi",
+    },
+    "phda": {
+        "label": "PhotoDirector Android (PHD-a)",
+        "full_name": "PhotoDirector Mobile for Android",
+        "data_dir": "data/products/phda",
+    },
 }
 
 TAB_NAMES = [
@@ -236,6 +259,35 @@ if "tm_selected_category" not in st.session_state:
 
 
 # ---------------------------------------------------------------------
+# Sidebar – Product selector  (above Navigation)
+# ---------------------------------------------------------------------
+
+st.sidebar.subheader("📦 Product")
+_selected_product = st.sidebar.selectbox(
+    "Select product",
+    options=list(PRODUCT_CONFIG.keys()),
+    format_func=lambda k: PRODUCT_CONFIG[k]["label"],
+    key="selected_product",
+    label_visibility="collapsed",
+)
+_product_data_dir = PRODUCT_CONFIG[_selected_product]["data_dir"]
+
+# When the product changes, clear all cached file-path widget values so that
+# the text_input widgets reinitialise to the new product's default paths.
+# (Streamlit only uses the `value=` argument on first render; once a key
+# exists in session_state the value is ignored, so we must delete the keys.)
+_FILE_PATH_KEYS = [
+    "fp_bugs", "fp_risk",
+    "fp_cluster", "fp_cluster_sum", "fp_cluster_ent",
+    "fp_pred", "fp_pred_sum", "fp_pred_li",
+    "fp_pred_cluster", "fp_pred_category", "fp_pred_scenario",
+]
+if st.session_state.get("_active_product") != _selected_product:
+    for _k in _FILE_PATH_KEYS:
+        st.session_state.pop(_k, None)
+    st.session_state["_active_product"] = _selected_product
+
+# ---------------------------------------------------------------------
 # Sidebar – Navigation
 # ---------------------------------------------------------------------
 
@@ -260,19 +312,19 @@ active_tab = st.sidebar.radio(
 
 # Probe all default paths up front so the expander label can show a
 # meaningful status badge even before the user opens it.
-_bugs_default         = "data/ecl_parsed.csv"
-_risk_default         = "data/risk_register_scored_all.csv"
-_cluster_default      = "data/clusters/ecl_parsed_clustered.csv"
-_cluster_sum_default  = "data/clusters/ecl_parsed_cluster_summary.csv"
-_cluster_ent_default  = "data/clusters/ecl_parsed_module_entropy.csv"      # v3.0 NEW
-_cluster_s12_default  = "data/clusters/ecl_parsed_cluster_summary_s12.csv" # v3.0 NEW
-_cluster_s34_default  = "data/clusters/ecl_parsed_cluster_summary_s34.csv" # v3.0 NEW
-_pred_default         = "data/predictions/ecl_parsed_predictions.csv"
-_pred_sum_def         = "data/predictions/ecl_parsed_predictions_focus_summary.txt"
-_pred_li_def          = "data/predictions/ecl_parsed_predictions_leading_indicators.csv"
-_pred_cluster_def     = "data/predictions/ecl_parsed_predictions_by_cluster.csv" # v3.0 NEW
-_pred_category_def    = "data/predictions/ecl_parsed_predictions_by_category.csv" # v4.0 NEW
-_pred_scenario_def    = "data/predictions/ecl_parsed_predictions_by_scenario.csv" # v5.0 NEW
+_bugs_default         = f"{_product_data_dir}/ecl_parsed.csv"
+_risk_default         = f"{_product_data_dir}/risk_register_scored_all.csv"
+_cluster_default      = f"{_product_data_dir}/clusters/ecl_parsed_clustered.csv"
+_cluster_sum_default  = f"{_product_data_dir}/clusters/ecl_parsed_cluster_summary.csv"
+_cluster_ent_default  = f"{_product_data_dir}/clusters/ecl_parsed_module_entropy.csv"      # v3.0 NEW
+_cluster_s12_default  = f"{_product_data_dir}/clusters/ecl_parsed_cluster_summary_s12.csv" # v3.0 NEW
+_cluster_s34_default  = f"{_product_data_dir}/clusters/ecl_parsed_cluster_summary_s34.csv" # v3.0 NEW
+_pred_default         = f"{_product_data_dir}/predictions/ecl_parsed_predictions.csv"
+_pred_sum_def         = f"{_product_data_dir}/predictions/ecl_parsed_predictions_focus_summary.txt"
+_pred_li_def          = f"{_product_data_dir}/predictions/ecl_parsed_predictions_leading_indicators.csv"
+_pred_cluster_def     = f"{_product_data_dir}/predictions/ecl_parsed_predictions_by_cluster.csv" # v3.0 NEW
+_pred_category_def    = f"{_product_data_dir}/predictions/ecl_parsed_predictions_by_category.csv" # v4.0 NEW
+_pred_scenario_def    = f"{_product_data_dir}/predictions/ecl_parsed_predictions_by_scenario.csv" # v5.0 NEW
 
 _bugs_probe    = Path(_bugs_default).exists()
 _risk_probe    = Path(_risk_default).exists()
