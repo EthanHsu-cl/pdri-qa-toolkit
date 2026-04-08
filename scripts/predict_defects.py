@@ -1605,8 +1605,9 @@ def main():
     # ── Composite risk scoring ────────────────────────────────────────────
     # Pure count-based bins are unreliable with short data windows (most
     # modules predict 1–3 bugs). Instead, we compute a 0–100 composite risk
-    # score from four normalised signals, then apply thresholds aligned with
-    # the risk register tiers (Critical ≥70, High ≥45, Medium ≥25).
+    # score from four normalised signals (each 0–1, then scaled to 0–100).
+    # Absolute thresholds mean most modules can be "Low" when the product
+    # is healthy — only genuinely risky modules reach "Critical".
     #
     # Weights (domain risk is the strongest signal):
     #   50% — risk_score_final   (I×P×D from AI/heuristic scorer, 0–125)
@@ -1647,22 +1648,26 @@ def main():
         0.10 * norm_trend
     )
 
-    # Use percentile rank so composite_risk spans the full 0–100 range
-    # regardless of dataset size or outliers. Each module's score reflects
-    # its relative position: 95 = riskier than 95% of modules.
-    preds["composite_risk"] = raw_composite.rank(pct=True).mul(100).round(2)
+    # Use the raw composite score (0–1 range) scaled to 0–100 so that risk
+    # levels reflect *absolute* risk magnitude, not just relative position.
+    # With percentile ranking the top 10% are always "Critical" even when
+    # every module has trivial risk.  Absolute scoring means most modules
+    # can be "Low" when the product is healthy, and only genuinely risky
+    # modules reach "Critical".
+    preds["composite_risk"] = (raw_composite * 100).round(2)
 
-    # Fixed thresholds aligned with the risk register tiers.
+    # Absolute thresholds — calibrated to the 0–100 scale where 100 means
+    # the module tops every risk signal simultaneously.
     preds["risk_level"] = pd.cut(
         preds["composite_risk"],
-        bins=[-1, 50, 70, 90, float("inf")],
+        bins=[-1, 25, 50, 75, float("inf")],
         labels=["Low", "Medium", "High", "Critical"],
     )
 
     # Log the breakdown
     rl_counts = preds["risk_level"].value_counts()
     print(f"\n  Composite risk scoring (50% domain risk, 20% predicted count, 20% severity trend, 10% momentum):")
-    print(f"    Thresholds — Critical >90 | High 70–90 | Medium 50–70 | Low <50")
+    print(f"    Thresholds — Critical >75 | High 50–75 | Medium 25–50 | Low <25")
     for lvl in ["Critical", "High", "Medium", "Low"]:
         print(f"    {lvl}: {rl_counts.get(lvl, 0)} module(s)")
 
@@ -1670,7 +1675,7 @@ def main():
     print(" PREDICTED BUG COUNT — next build estimate per module")
     print(" target = actual bugs in most recent build | predicted = next build forecast")
     print(" composite_risk: 50% domain risk + 20% count + 20% severity trend + 10% momentum")
-    print(f" risk_level: Critical >90 | High 70–90 | Medium 50–70 | Low <50")
+    print(f" risk_level: Critical >75 | High 50–75 | Medium 25–50 | Low <25")
     print("─" * 78)
     display_cols = ["module", "target", "predicted", "composite_risk", "risk_level",
                     "dominant_bug_type", "leading_signal"]

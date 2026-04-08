@@ -44,6 +44,7 @@ PRODUCT_MAP = {
     "pdr":    "PowerDirector",
     "phd":    "PhotoDirector",
     "promeo": "Promeo",
+    "vvg":    "Vivid Glam (iOS)",
 }
 
 DEFAULT_PRODUCT = "pdri"

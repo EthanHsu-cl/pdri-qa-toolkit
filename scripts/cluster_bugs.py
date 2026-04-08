@@ -227,7 +227,8 @@ def _ollama_label_cluster(samples: "list[str]", model: str = "gemma4") -> str:
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             raw = json.loads(resp.read().decode()).get("response", "").strip()
-            label = raw.splitlines()[0].strip().strip('"\'')
+            lines = raw.splitlines()
+            label = lines[0].strip().strip('"\'') if lines else ""
             return label if label else "unlabelled"
     except Exception as e:
         print(f"  [label] Ollama error: {e}", file=sys.stderr)
@@ -590,7 +591,7 @@ def summarize(df: pd.DataFrame,
 
     n_c  = df["cluster_id"].nunique() - (1 if -1 in df["cluster_id"].values else 0)
     n_in = (df["cluster_id"] != -1).sum()
-    src  = df["embed_source"].iloc[0] if "embed_source" in df.columns else "tfidf"
+    src  = df["embed_source"].iloc[0] if ("embed_source" in df.columns and not df.empty) else "tfidf"
     print(f"Clusters: {n_c}, In clusters: {n_in}/{len(df)}, Embed source: {src}")
 
     display_cols = ["cluster_label", "count", "avg_sev",

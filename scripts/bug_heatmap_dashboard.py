@@ -116,12 +116,12 @@ PRODUCT_MAP = {
     "phda":   "PhotoDirector Mobile (Android)",
     "pdr":    "PowerDirector",
     "phd":    "PhotoDirector",
-    "vvg":    "Vivid Glam",
+    "vvg":    "Vivid Glam (iOS)",
     "promeo": "Promeo",
 }
 
 _products_dir = Path("data/products")
-_PRODUCT_ORDER = ["pdri", "pdra", "phdi", "phda", "pdr", "vvg", "promeo"]
+_PRODUCT_ORDER = ["pdri", "pdra", "phdi", "phda", "pdr", "phd", "vvg", "promeo"]
 _available_products = []
 if _products_dir.exists():
     _existing_slugs = {d.name for d in _products_dir.iterdir() if d.is_dir() and (d / "ecl_parsed.csv").exists()}
@@ -2470,8 +2470,8 @@ This tab shows you **what is likely to break in the next build** and **what conc
 
 | Metric | What it means |
 |--------|--------------|
-| **🔴 Critical modules** | Modules with composite risk score > 90 — must be tested every build |
-| **🟠 High-risk modules** | Modules with composite risk score 70–90 — test every sprint |
+| **🔴 Critical modules** | Modules with composite risk score > 75 — must be tested every build |
+| **🟠 High-risk modules** | Modules with composite risk score 50–75 — test every sprint |
 | **🎯 Predicted scenarios** | Total count of concrete, testable bug scenario predictions across all modules |
 | **Total modules forecast** | Number of modules for which the model generated a prediction |
 
@@ -2618,7 +2618,7 @@ The correlations are computed across all (module, build) rows in the training da
 
 **Risk level assignment:** Risk levels are **not directly from the model output**. They are assigned from a composite risk score that weights: predicted bug count, severity escalation trend, domain impact score (from `ai_risk_scorer.py` if loaded), and historical probability score.
 
-Thresholds: Critical > 90, High 70–90, Medium 50–69, Low < 50.
+Thresholds: Critical > 75, High 50–75, Medium 25–50, Low < 25. Scores reflect absolute risk magnitude (not relative rank), so most modules can be "Low" when the product is healthy.
 
 ---
 
@@ -2701,16 +2701,18 @@ Output files saved to `data/predictions/`:
         "Medium":   "Include in **release-candidate** testing. Spot-check changed areas.",
         "Low":      "Cover in the full **release cycle** pass. No special urgency.",
     }
-    _CONF_BADGES = {"high": "🟢 High", "medium": "🟡 Medium", "low": "🔵 Low"}
+    # Confidence badges use arrows (not colored circles) to avoid conflicting
+    # with RISK_ICONS, which already uses 🟢/🟡 for Low/Medium risk.
+    _CONF_BADGES = {"high": "⬆️ High conf.", "medium": "↔️ Med. conf.", "low": "⬇️ Low conf."}
 
     # ── Headline metrics ─────────────────────────────────────────────────
     rl_counts = pred_df["risk_level"].value_counts()
     _scenario_count = len(pred_scenario_df) if pred_scenario_df is not None else 0
     pm1, pm2, pm3, pm4 = st.columns(4)
     pm1.metric("🔴 Critical modules",  int(rl_counts.get("Critical", 0)),
-               help="Composite risk >90 (domain risk + predicted count + severity trend + momentum)")
+               help="Composite risk >75 (domain risk + predicted count + severity trend + momentum)")
     pm2.metric("🟠 High-risk modules", int(rl_counts.get("High", 0)),
-               help="Composite risk 70–90 (domain risk + predicted count + severity trend + momentum)")
+               help="Composite risk 50–75 (domain risk + predicted count + severity trend + momentum)")
     pm3.metric("🎯 Predicted scenarios", _scenario_count,
                help="Total concrete bug scenario predictions across all modules")
     pm4.metric("Total modules forecast", len(pred_df))
@@ -2722,7 +2724,9 @@ Output files saved to `data/predictions/`:
     if pred_scenario_df is not None and not pred_scenario_df.empty:
         st.caption(
             "Concrete bug scenarios predicted for the next build, grouped by risk level. "
-            "Each scenario is grounded in recurring historical patterns."
+            "Each scenario is grounded in recurring historical patterns. "
+            "Only modules with enough historical data to generate specific scenarios are shown here — "
+            "see the **AI Risk Briefing** below for a full ranked list of all forecast modules."
         )
         # Group scenarios by risk level
         for _rl in ["Critical", "High", "Medium"]:
@@ -2734,7 +2738,7 @@ Output files saved to `data/predictions/`:
             for _mod, _mod_sc in _rl_scenarios.groupby("module", sort=False):
                 st.markdown(f"**{_mod}**")
                 for _, _sc in _mod_sc.head(3).iterrows():
-                    _conf = _CONF_BADGES.get(str(_sc.get("confidence", "medium")), "🔵 Low")
+                    _conf = _CONF_BADGES.get(str(_sc.get("confidence", "medium")), "⬇️ Low conf.")
                     _text = str(_sc.get("scenario_text", ""))
                     st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{_conf} — {_text}",
                                 unsafe_allow_html=True)
@@ -2885,7 +2889,7 @@ Output files saved to `data/predictions/`:
                     _rank = int(_sc_row.get("scenario_rank", 0))
                     _text = str(_sc_row.get("scenario_text", ""))
                     _conf = str(_sc_row.get("confidence", "medium"))
-                    _conf_badge = _CONF_BADGES.get(_conf, "🔵 Low")
+                    _conf_badge = _CONF_BADGES.get(_conf, "⬇️ Low conf.")
                     _cats = str(_sc_row.get("supporting_categories", ""))
                     _examples = str(_sc_row.get("source_bug_examples", ""))
 
@@ -3015,7 +3019,7 @@ Output files saved to `data/predictions/`:
                 if not _card_scenarios.empty:
                     st.markdown("**Predicted bug scenarios:**")
                     for _, _cs in _card_scenarios.iterrows():
-                        _cs_conf = _CONF_BADGES.get(str(_cs.get("confidence", "medium")), "🔵 Low")
+                        _cs_conf = _CONF_BADGES.get(str(_cs.get("confidence", "medium")), "⬇️ Low conf.")
                         _cs_text = str(_cs.get("scenario_text", ""))
                         st.markdown(f"&nbsp;&nbsp;→ {_cs_conf} — {_cs_text}",
                                     unsafe_allow_html=True)

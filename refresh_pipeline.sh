@@ -50,7 +50,7 @@ export PYTHONUNBUFFERED=1   # force Python to flush stdout line-by-line when pip
 # ── Product Schedule ─────────────────────────────────────────────────────────
 # Format: "slug:duration_months slug:duration_months ..."
 WEEKDAY_PRODUCTS="pdri:1 phdi:1"
-WEEKEND_PRODUCTS="pdri:36 phdi:36 pdra:36 phda:36 pdr:36 phd:36 promeo:36"
+WEEKEND_PRODUCTS="pdri:36 phdi:36 pdra:36 phda:36 pdr:36 phd:36 promeo:36 vvg:36"
 
 # ── Flags ─────────────────────────────────────────────────────────────────────
 DRY_RUN=false

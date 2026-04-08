@@ -5,6 +5,18 @@
 
 ***
 
+## What Changed in v3.1
+
+### Multi-Product: Vivid Glam (iOS) added (`vvg`)
+
+| File | Change |
+|------|--------|
+| `scripts/fetch_from_n8n.py` | Added `"vvg": "Vivid Glam (iOS)"` to `PRODUCT_MAP`. The `--product vvg` flag is now a valid choice and the webhook payload will send `product_name = "Vivid Glam (iOS)"` to the n8n workflow. |
+| `scripts/bug_heatmap_dashboard.py` | `vvg` was already present in `PRODUCT_MAP`. Updated `_PRODUCT_ORDER` to insert `"phd"` between `"pdr"` and `"vvg"`, so the product selector order is: `pdri → pdra → phdi → phda → pdr → phd → vvg → promeo`. |
+| `refresh_pipeline.sh` | Added `vvg:36` to `WEEKEND_PRODUCTS`. Vivid Glam (iOS) will now run in the weekend full-refresh schedule (36-month data window) alongside all other products. It is not included in the weekday schedule (`WEEKDAY_PRODUCTS`). To run it on demand: `./refresh_pipeline.sh --products vvg`. |
+
+***
+
 ## What Changed in v3.0
 
 ### `cluster_bugs.py` → v3.0
