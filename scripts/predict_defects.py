@@ -48,7 +48,8 @@ import numpy as np
 from tqdm import tqdm
 from pathlib import Path
 from sklearn.cluster import AgglomerativeClustering
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_distances
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
@@ -113,6 +114,11 @@ _FEATURE_LABELS = {
     "cluster_entropy_2":       "bug-theme diversity index (last 2 builds)",
     "cluster_entropy_3":       "bug-theme diversity index (last 3 builds)",
     "top_cluster_velocity":    "fastest-growing bug theme velocity",
+    # Change 19 — new features
+    "crit_ratio":             "proportion of critical bugs (S1 / total)",
+    "new_module":             "new module (first appeared in recent builds)",
+    "cross_module_spike":     "correlated spike — related modules also spiking",
+    "total_historical_bugs":  "total historical bug count (module maturity)",
     # existing optional features
     "repro_rate":             "high reproduce rate (consistently reproducible bugs)",
     "impact_score":           "domain impact score (I×P×D scorer)",
@@ -243,19 +249,53 @@ def load_risk_features(scored_csv: str) -> "pd.DataFrame | None":
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TF-IDF text features  (unchanged from v2.6)
+# TF-IDF text features  (updated v6.0 — rolling version window)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_tfidf_features(orig_df: pd.DataFrame,
                           mod_col: str = "parsed_module",
                           text_col: str = "parsed_description",
-                          top_n: int = TFIDF_TOP_N) -> "pd.DataFrame | None":
+                          version_col: str = "parsed_version",
+                          top_n: int = TFIDF_TOP_N,
+                          version_window: int = 3) -> "pd.DataFrame | None":
+    """Build TF-IDF text features using only the last `version_window` versions.
+
+    Each version spans 1-2 months, so 3 versions ≈ 3-6 months of recent bug
+    descriptions.  This makes the text signal temporal: it captures what a
+    module's bugs *currently* look like rather than aggregating all-time history.
+    Falls back to all-time aggregation if version data is absent.
+    """
     if text_col not in orig_df.columns or mod_col not in orig_df.columns:
         print(f"  NOTE: '{text_col}' column not found — skipping text features.")
         return None
 
+    working = orig_df.copy()
+
+    # Filter to recent versions if version column exists.
+    # Sort by semantic version number (numeric tuple), filtering out
+    # versions with <10 bugs to exclude typos/outliers (e.g. "152.0").
+    if version_col in working.columns:
+        ver_bug_counts = working[version_col].value_counts()
+        valid_versions = ver_bug_counts[ver_bug_counts >= 10].index.tolist()
+
+        def _version_key(v):
+            try:
+                return tuple(int(p) for p in str(v).split("."))
+            except (ValueError, TypeError):
+                return (0,)
+
+        sorted_versions = sorted(valid_versions, key=_version_key)
+        recent_versions = sorted_versions[-version_window:]
+        before = len(working)
+        working = working[working[version_col].isin(recent_versions)]
+        print(f"  TF-IDF: windowed to last {version_window} versions "
+              f"({', '.join(str(v) for v in recent_versions)}) — "
+              f"{len(working)}/{before} bugs retained.")
+    else:
+        print(f"  TF-IDF: '{version_col}' not found — using all-time descriptions.")
+
     mod_docs = (
-        orig_df[[mod_col, text_col]]
+        working[[mod_col, text_col]]
         .dropna(subset=[mod_col, text_col])
         .groupby(mod_col)[text_col]
         .apply(lambda texts: " ".join(str(t) for t in texts if len(str(t)) > 5))
@@ -449,9 +489,40 @@ def build_features(df, build_col="Build#", mod_col="parsed_module",
             crit_rows = crit_hist.index[crit_hist > 0].tolist()
             r["builds_since_last_crit"] = int(i - crit_rows[-1] - 1) if crit_rows else i
 
+            # Change 19 — crit_ratio: proportion of S1 bugs in last 3 builds
+            w3 = md.loc[max(0, i - 3):i - 1]
+            total_w3 = w3["bug_count"].sum()
+            r["crit_ratio"] = round(float(w3["crit"].sum() / max(total_w3, 1)), 3)
+
+            # Change 19 — new_module: 1 if module first appeared in the
+            # most recent 20% of builds (i.e. a newly-added feature)
+            r["new_module"] = 1 if len(md) <= max(5, int(len(agg[build_col].unique()) * 0.2)) else 0
+
+            # Change 19 — total_historical_bugs (module maturity / size)
+            r["total_historical_bugs"] = int(md.loc[:i - 1, "bug_count"].sum())
+
             rows.append(r)
 
     fdf = pd.DataFrame(rows)
+
+    # Change 19 — cross_module_spike: for each (module, build), compute
+    # how many OTHER modules also spiked in that build.  A "spike" is a
+    # build where bug_count > module's rolling 3-build mean.
+    if not fdf.empty:
+        # Pre-compute per-module rolling mean bug count
+        fdf = fdf.sort_values(["module", "build"])
+        fdf["_rolling_mean"] = (
+            fdf.groupby("module")["target"]
+            .transform(lambda s: s.rolling(3, min_periods=1).mean().shift(1))
+        )
+        fdf["_is_spike"] = (fdf["target"] > fdf["_rolling_mean"]).astype(int)
+        # Count how many modules spiked per build (excluding self)
+        spikes_per_build = fdf.groupby("build")["_is_spike"].sum()
+        fdf["cross_module_spike"] = (
+            fdf["build"].map(spikes_per_build) - fdf["_is_spike"]
+        ).clip(0).astype(int)
+        fdf.drop(columns=["_rolling_mean", "_is_spike"], inplace=True)
+        print(f"  New features: crit_ratio, new_module, total_historical_bugs, cross_module_spike")
 
     # Merge TF-IDF text features
     if tfidf_features is not None and not fdf.empty:
@@ -603,6 +674,172 @@ def train_predict(fdf: pd.DataFrame, orig_df: pd.DataFrame):
     latest["leading_signal"] = latest["module"].apply(_per_module_signal)
 
     return model, latest, imp, leading
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Change 19 — Learned risk classifier (replaces hand-tuned composite)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train_risk_classifier(fdf: pd.DataFrame, orig_df: pd.DataFrame,
+                          build_col: str = "Build#",
+                          mod_col: str = "parsed_module") -> "tuple | None":
+    """Train a calibrated GradientBoostingClassifier to predict probability
+    of at least one Critical (S1) bug in the NEXT build for each module.
+
+    The binary target is: did this module have any severity 1 (Critical) bug
+    in this build?  S2 bugs are too common (~89% of all bugs) to be a useful
+    signal — S1 is rare enough (~3.6%) to produce meaningful risk separation.
+
+    Returns (classifier, latest_proba) or None if not enough data.
+    """
+    df = orig_df.copy()
+    df[build_col] = pd.to_numeric(df[build_col], errors="coerce")
+    df = df.dropna(subset=[build_col, mod_col])
+    df[build_col] = df[build_col].astype(int)
+
+    if "severity_num" not in df.columns:
+        print("  Risk classifier: severity_num not found — skipping.")
+        return None
+
+    # Per (module, build): 1 if any S1 (Critical) bug, else 0
+    has_severe = (
+        df[df["severity_num"] == 1]
+        .groupby([mod_col, build_col])
+        .size()
+        .reset_index(name="_severe_count")
+    )
+    has_severe["_had_severe"] = 1
+
+    # Merge onto feature matrix
+    clf_df = fdf.copy()
+    clf_df = clf_df.merge(
+        has_severe[[mod_col, build_col, "_had_severe"]].rename(
+            columns={mod_col: "module", build_col: "build"}),
+        on=["module", "build"], how="left"
+    )
+    clf_df["_had_severe"] = clf_df["_had_severe"].fillna(0).astype(int)
+
+    fcols = [c for c in clf_df.columns
+             if c not in ["module", "build", "target", "_had_severe"]]
+    X = clf_df[fcols].fillna(0)
+    y = clf_df["_had_severe"]
+
+    pos_rate = y.mean()
+    print(f"\n  Risk classifier: {len(X)} samples, {y.sum():.0f} positive "
+          f"({pos_rate:.1%} had S1 critical bug)")
+
+    if y.sum() < 10 or (1 - pos_rate) < 0.05:
+        print("  Risk classifier: too few positive/negative samples — skipping.")
+        return None
+
+    base_clf = GradientBoostingClassifier(
+        n_estimators=150, max_depth=3, learning_rate=0.1,
+        random_state=42, min_samples_leaf=5,
+    )
+    # Calibrate probabilities using isotonic regression on CV folds
+    tscv = TimeSeriesSplit(n_splits=3)
+    try:
+        cal_clf = CalibratedClassifierCV(base_clf, cv=tscv, method="isotonic")
+        cal_clf.fit(X, y)
+    except Exception as e:
+        print(f"  Risk classifier: calibration failed ({e}), using uncalibrated.")
+        base_clf.fit(X, y)
+        cal_clf = base_clf
+
+    # CV score for reporting
+    from sklearn.metrics import brier_score_loss
+    cv_proba = np.zeros(len(X))
+    for train_idx, test_idx in tscv.split(X):
+        fold_clf = GradientBoostingClassifier(
+            n_estimators=150, max_depth=3, learning_rate=0.1,
+            random_state=42, min_samples_leaf=5,
+        )
+        fold_clf.fit(X.iloc[train_idx], y.iloc[train_idx])
+        cv_proba[test_idx] = fold_clf.predict_proba(X.iloc[test_idx])[:, 1]
+    # Only score on test folds (non-zero entries)
+    mask = cv_proba > 0
+    if mask.sum() > 10:
+        brier = brier_score_loss(y[mask], cv_proba[mask])
+        print(f"  Risk classifier CV Brier score: {brier:.4f} "
+              f"(lower is better, 0 = perfect, 0.25 = random)")
+
+    # Predict on latest rows
+    latest = fdf.groupby("module").tail(1).copy()
+    proba = cal_clf.predict_proba(latest[fcols].fillna(0))
+    # Handle binary vs single-class output
+    if proba.shape[1] == 2:
+        latest["risk_proba"] = proba[:, 1]
+    else:
+        latest["risk_proba"] = proba[:, 0]
+
+    print(f"  Risk classifier: predicted probabilities for {len(latest)} modules")
+    print(f"    Probability range: {latest['risk_proba'].min():.3f} – "
+          f"{latest['risk_proba'].max():.3f}")
+
+    return cal_clf, latest[["module", "risk_proba"]]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Change 19 — Stratified training (separate models for high/low activity)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train_predict_stratified(fdf: pd.DataFrame, orig_df: pd.DataFrame):
+    """Train separate GBR models for high-activity and low-activity modules.
+
+    Split point: modules with total historical bugs above the median get the
+    high-activity model; below median get the low-activity model.
+    Returns the same shape output as train_predict().
+    """
+    fcols = [c for c in fdf.columns if c not in ["module", "build", "target"]]
+    X_all = fdf[fcols].fillna(0)
+    y_all = fdf["target"]
+
+    # Split by module historical activity
+    mod_totals = fdf.groupby("module")["target"].sum()
+    median_bugs = mod_totals.median()
+    high_mods = set(mod_totals[mod_totals >= median_bugs].index)
+    low_mods = set(mod_totals[mod_totals < median_bugs].index)
+
+    print(f"\n  Stratified training: {len(high_mods)} high-activity modules "
+          f"(≥{median_bugs:.0f} total bugs), {len(low_mods)} low-activity")
+
+    all_latest = []
+    all_imp = pd.Series(dtype=float)
+
+    for label, mod_set in [("high-activity", high_mods), ("low-activity", low_mods)]:
+        mask = fdf["module"].isin(mod_set)
+        subset = fdf[mask]
+        if len(subset) < 20:
+            print(f"  {label}: too few samples ({len(subset)}) — skipping stratum.")
+            continue
+
+        X = subset[fcols].fillna(0)
+        y = subset["target"]
+
+        model = GradientBoostingRegressor(
+            n_estimators=200, max_depth=4, learning_rate=0.1, random_state=42
+        )
+        scores = cross_val_score(model, X, y,
+                                 cv=TimeSeriesSplit(n_splits=3),
+                                 scoring="neg_mean_absolute_error")
+        print(f"  {label} CV MAE: {-scores.mean():.2f} (+/- {scores.std():.2f})")
+        model.fit(X, y)
+
+        latest = subset.groupby("module").tail(1).copy()
+        latest["predicted_stratified"] = model.predict(latest[fcols].fillna(0)).round(1)
+        all_latest.append(latest[["module", "predicted_stratified"]])
+
+        imp = pd.Series(model.feature_importances_, index=fcols)
+        all_imp = all_imp.add(imp * len(subset), fill_value=0)
+
+    if not all_latest:
+        return None
+
+    stratified_preds = pd.concat(all_latest, ignore_index=True)
+    # Normalize importance by total samples
+    all_imp = (all_imp / len(fdf)).sort_values(ascending=False)
+
+    return stratified_preds, all_imp
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1602,82 +1839,96 @@ def main():
 
     preds = preds.sort_values("predicted", ascending=False)
 
-    # ── Composite risk scoring ────────────────────────────────────────────
-    # Pure count-based bins are unreliable with short data windows (most
-    # modules predict 1–3 bugs). Instead, we compute a 0–100 composite risk
-    # score from four normalised signals (each 0–1, then scaled to 0–100).
-    # Absolute thresholds mean most modules can be "Low" when the product
-    # is healthy — only genuinely risky modules reach "Critical".
-    #
-    # Weights (domain risk is the strongest signal):
-    #   50% — risk_score_final   (I×P×D from AI/heuristic scorer, 0–125)
-    #   20% — predicted count    (ML forecast, normalised to dataset range)
-    #   20% — severity_escalation (negative = worsening toward S1)
-    #   10% — recent trend / momentum
+    # ── Change 19 — Stratified training (show both global and stratified) ─
+    print("\n" + "─" * 78)
+    print(" STRATIFIED TRAINING (separate models for high/low activity modules)")
+    print("─" * 78)
+    strat_result = train_predict_stratified(fdf, orig_df)
+    if strat_result is not None:
+        strat_preds, strat_imp = strat_result
+        preds = preds.merge(strat_preds, on="module", how="left")
+        # Where stratified prediction is missing, fall back to global
+        preds["predicted_stratified"] = preds["predicted_stratified"].fillna(preds["predicted"])
+        print(f"\n  Stratified predictions merged for {strat_preds['module'].nunique()} modules.")
+        print(f"  Compare: predicted (global) vs predicted_stratified in output CSV.")
+    else:
+        preds["predicted_stratified"] = preds["predicted"]
+        print("  Stratified training could not run — using global model only.")
 
-    _rs = pd.to_numeric(preds.get("risk_score_final", 0), errors="coerce").fillna(0.0)
-    _pred = pd.to_numeric(preds["predicted"], errors="coerce").fillna(0.0)
-    _sev = pd.to_numeric(preds.get("severity_escalation", 0), errors="coerce").fillna(0.0)
-    _trend = pd.to_numeric(preds.get("trend", 0), errors="coerce").fillna(0.0)
+    # ── Change 19 — Learned risk classifier (replaces hand-tuned composite) ─
+    print("\n" + "─" * 78)
+    print(" RISK CLASSIFIER (learned probability of S1 critical bug next build)")
+    print("─" * 78)
+    clf_result = train_risk_classifier(fdf, orig_df)
 
-    # Normalise each signal to 0–1
-    # risk_score_final: normalise to the dataset's actual max (not theoretical 125)
-    # so the highest-risk module in this product maps to 1.0
-    rs_max = max(_rs.max(), 1.0)
-    norm_rs = (_rs / rs_max).clip(0, 1)
+    if clf_result is not None:
+        risk_clf, risk_proba = clf_result
+        preds = preds.merge(risk_proba, on="module", how="left")
+        preds["risk_proba"] = preds["risk_proba"].fillna(0.0)
 
-    # predicted count: normalise to dataset max (floor at 1 to avoid /0)
-    pred_max = max(_pred.max(), 1.0)
-    norm_pred = (_pred / pred_max).clip(0, 1)
+        # Use learned probability as the primary risk score (0–100)
+        preds["composite_risk"] = (preds["risk_proba"] * 100).round(2)
 
-    # severity_escalation: negative = worsening toward S1 = higher risk.
-    # Positive/zero escalation (improving or stable) should not reduce risk.
-    # Map negative values to 0–1 range: -1→1.0 (worst), 0→0.0 (neutral).
-    norm_sev = (-_sev).clip(0, 1)  # only negative escalation counts
+        # Thresholds on calibrated probability of S1 (critical) bug.
+        # S1 bugs are ~3.6% of all bugs, so even a 10% predicted
+        # probability represents a 3× baseline elevation.
+        #   >20% chance of S1 = Critical (6× baseline)
+        #   10–20% = High (3× baseline)
+        #   5–10% = Medium (above baseline)
+        #   <5% = Low (near or below baseline)
+        preds["risk_level"] = pd.cut(
+            preds["composite_risk"],
+            bins=[-1, 5, 10, 20, float("inf")],
+            labels=["Low", "Medium", "High", "Critical"],
+        )
+        risk_method = "learned classifier (P(S1 critical bug))"
+        risk_thresholds = "Critical >20% | High 10–20% | Medium 5–10% | Low <5%"
+    else:
+        # Fallback to weighted composite when classifier cannot train
+        print("  Falling back to weighted composite scoring.")
+        _rs = pd.to_numeric(preds.get("risk_score_final", 0), errors="coerce").fillna(0.0)
+        _pred = pd.to_numeric(preds["predicted"], errors="coerce").fillna(0.0)
+        _sev = pd.to_numeric(preds.get("severity_escalation", 0), errors="coerce").fillna(0.0)
+        _trend = pd.to_numeric(preds.get("trend", 0), errors="coerce").fillna(0.0)
 
-    # trend: positive = growing bugs = higher risk. Negative trend should not
-    # *reduce* risk (a declining count doesn't make a high-impact module safe).
-    # Clamp negative trends to 0 so trend can only increase composite risk.
-    trend_max = max(_trend.max(), 1.0)  # use positive max only
-    norm_trend = (_trend.clip(0, None) / trend_max).clip(0, 1)
+        rs_max = max(_rs.max(), 1.0)
+        norm_rs = (_rs / rs_max).clip(0, 1)
+        pred_max = max(_pred.max(), 1.0)
+        norm_pred = (_pred / pred_max).clip(0, 1)
+        norm_sev = (-_sev).clip(0, 1)
+        trend_max = max(_trend.max(), 1.0)
+        norm_trend = (_trend.clip(0, None) / trend_max).clip(0, 1)
 
-    raw_composite = (
-        0.50 * norm_rs +
-        0.20 * norm_pred +
-        0.20 * norm_sev +
-        0.10 * norm_trend
-    )
-
-    # Use the raw composite score (0–1 range) scaled to 0–100 so that risk
-    # levels reflect *absolute* risk magnitude, not just relative position.
-    # With percentile ranking the top 10% are always "Critical" even when
-    # every module has trivial risk.  Absolute scoring means most modules
-    # can be "Low" when the product is healthy, and only genuinely risky
-    # modules reach "Critical".
-    preds["composite_risk"] = (raw_composite * 100).round(2)
-
-    # Absolute thresholds — calibrated to the 0–100 scale where 100 means
-    # the module tops every risk signal simultaneously.
-    preds["risk_level"] = pd.cut(
-        preds["composite_risk"],
-        bins=[-1, 25, 50, 75, float("inf")],
-        labels=["Low", "Medium", "High", "Critical"],
-    )
+        raw_composite = (
+            0.50 * norm_rs +
+            0.20 * norm_pred +
+            0.20 * norm_sev +
+            0.10 * norm_trend
+        )
+        preds["composite_risk"] = (raw_composite * 100).round(2)
+        preds["risk_level"] = pd.cut(
+            preds["composite_risk"],
+            bins=[-1, 25, 50, 75, float("inf")],
+            labels=["Low", "Medium", "High", "Critical"],
+        )
+        risk_method = "weighted composite (fallback)"
+        risk_thresholds = "Critical >75 | High 50–75 | Medium 25–50 | Low <25"
 
     # Log the breakdown
     rl_counts = preds["risk_level"].value_counts()
-    print(f"\n  Composite risk scoring (50% domain risk, 20% predicted count, 20% severity trend, 10% momentum):")
-    print(f"    Thresholds — Critical >75 | High 50–75 | Medium 25–50 | Low <25")
+    print(f"\n  Risk scoring method: {risk_method}")
+    print(f"    Thresholds — {risk_thresholds}")
     for lvl in ["Critical", "High", "Medium", "Low"]:
         print(f"    {lvl}: {rl_counts.get(lvl, 0)} module(s)")
 
     print("\n" + "─" * 78)
     print(" PREDICTED BUG COUNT — next build estimate per module")
     print(" target = actual bugs in most recent build | predicted = next build forecast")
-    print(" composite_risk: 50% domain risk + 20% count + 20% severity trend + 10% momentum")
-    print(f" risk_level: Critical >75 | High 50–75 | Medium 25–50 | Low <25")
+    print(f" risk scoring: {risk_method}")
+    print(f" {risk_thresholds}")
     print("─" * 78)
-    display_cols = ["module", "target", "predicted", "composite_risk", "risk_level",
+    display_cols = ["module", "target", "predicted", "predicted_stratified",
+                    "composite_risk", "risk_level",
                     "dominant_bug_type", "leading_signal"]
     display_cols = [c for c in display_cols if c in preds.columns]
     preds = preds.sort_values("composite_risk", ascending=False)

@@ -13,7 +13,10 @@
       "Bash(brew services:*)",
       "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f'OK — embedding dim: {len\\(d[\\\\\"embedding\\\\\"]\\)}'\\)\")",
       "Bash(crontab -l)",
-      "Read(//Users/ethanhsuqa2/Library/LaunchAgents/**)"
+      "Read(//Users/ethanhsuqa2/Library/LaunchAgents/**)",
+      "Bash(python3 -c ':*)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('scripts/predict_defects.py'\\).read\\(\\)\\); print\\('predict_defects.py: OK'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('scripts/bug_heatmap_dashboard.py'\\).read\\(\\)\\); print\\('bug_heatmap_dashboard.py: OK'\\)\")"
     ]
   }
 }

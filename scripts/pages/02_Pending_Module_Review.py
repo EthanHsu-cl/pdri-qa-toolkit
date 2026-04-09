@@ -22,8 +22,10 @@ st.set_page_config(
 
 st.title("🧩 Pending Module Review")
 
-MAPPING_VERSIONS_DIR = Path("data/module_mappings/versions")
-MAPPING_PERMANENT_PATH = Path("data/module_mappings/permanent/mappings_global.json")
+PRODUCTS_DIR = Path("data/products")
+# Legacy single-product path (kept for backward compatibility)
+_LEGACY_VERSIONS_DIR = Path("data/module_mappings/versions")
+_LEGACY_PERMANENT_PATH = Path("data/module_mappings/permanent/mappings_global.json")
 
 
 def _load_json(path: Path) -> dict:
@@ -41,11 +43,34 @@ def _save_json(path: Path, data: dict):
 
 st.sidebar.header("Mapping Files")
 st.sidebar.code(
-    "data/module_mappings/versions/\n"
-    "data/module_mappings/permanent/mappings_global.json"
+    "data/products/<product>/module_mappings/versions/\n"
+    "data/products/<product>/module_mappings/permanent/mappings_global.json"
 )
 
-if not MAPPING_VERSIONS_DIR.exists():
+
+def _discover_mapping_dirs():
+    """Discover all per-product mapping version directories + legacy path."""
+    dirs = {}  # product_slug -> versions_dir Path
+    if PRODUCTS_DIR.exists():
+        for prod_dir in sorted(PRODUCTS_DIR.iterdir()):
+            ver_dir = prod_dir / "module_mappings" / "versions"
+            if ver_dir.exists():
+                dirs[prod_dir.name] = ver_dir
+    # Also check staging (mapping files may not have been promoted yet)
+    staging_products = Path("data/staging/products")
+    if staging_products.exists():
+        for prod_dir in sorted(staging_products.iterdir()):
+            ver_dir = prod_dir / "module_mappings" / "versions"
+            if ver_dir.exists() and prod_dir.name not in dirs:
+                dirs[prod_dir.name] = ver_dir
+    if _LEGACY_VERSIONS_DIR.exists() and not dirs:
+        dirs["(legacy)"] = _LEGACY_VERSIONS_DIR
+    return dirs
+
+
+mapping_dirs = _discover_mapping_dirs()
+
+if not mapping_dirs:
     st.info(
         "No mapping directory yet. Run parse_ecl_export.py at least once with fuzzy mapping enabled."
     )
@@ -56,25 +81,27 @@ if not MAPPING_VERSIONS_DIR.exists():
 # ---------------------------------------------------------------------
 
 pending_rows = []
-for p in sorted(MAPPING_VERSIONS_DIR.glob("*_pending.json")):
-    version = p.stem.replace("_pending", "")
-    try:
-        data = _load_json(p)
-    except Exception as e:
-        st.warning(f"Failed to read {p.name}: {e}")
-        continue
-
-    for raw, info in data.items():
-        if info.get("confirmed"):
+for product_slug, versions_dir in mapping_dirs.items():
+    for p in sorted(versions_dir.glob("*_pending.json")):
+        version = p.stem.replace("_pending", "")
+        try:
+            data = _load_json(p)
+        except Exception as e:
+            st.warning(f"Failed to read {p.name}: {e}")
             continue
-        suggested = info.get("suggested", "")
-        pending_rows.append(
-            {
-                "Version": version,
-                "Raw Module": raw,
-                "Suggested Canonical": suggested,
-            }
-        )
+
+        for raw, info in data.items():
+            if info.get("confirmed"):
+                continue
+            suggested = info.get("suggested", "")
+            pending_rows.append(
+                {
+                    "Product": product_slug,
+                    "Version": version,
+                    "Raw Module": raw,
+                    "Suggested Canonical": suggested,
+                }
+            )
 
 if not pending_rows:
     st.success("No pending mappings. All fuzzy matches are confirmed.")
@@ -227,7 +254,7 @@ with col_clear:
     st.button("Clear ALL selection", key="btn_clear", on_click=clear_all_rows)
 
 def _format_label(i: int) -> str:
-    return f"{df_pending.loc[i, 'Version']} – {df_pending.loc[i, 'Raw Module']}"
+    return f"{df_pending.loc[i, 'Product']}:{df_pending.loc[i, 'Version']} – {df_pending.loc[i, 'Raw Module']}"
 
 # Multiselect: its value is driven purely by st.session_state[MULTI_KEY]
 selected_indices = st.multiselect(
@@ -253,37 +280,44 @@ with col_promote:
         if not selected_indices:
             st.warning("No rows selected.")
         else:
-            permanent = _load_json(MAPPING_PERMANENT_PATH)
-            updated_versions: dict[str, dict] = {}
+            # Group updates by product
+            updated: dict[str, dict[str, dict]] = {}  # product -> {version -> {raw: canonical}}
 
             for i in selected_indices:
                 row = edited.loc[i]
+                product = str(row["Product"])
                 version = str(row["Version"])
                 raw = str(row["Raw Module"])
                 canonical = str(row["Suggested Canonical"]).strip()
                 if not canonical:
                     continue
+                updated.setdefault(product, {}).setdefault(version, {})[raw] = canonical
 
-                # Update permanent store
-                permanent[raw] = canonical
+            for product, ver_entries in updated.items():
+                versions_dir = mapping_dirs.get(product)
+                if versions_dir is None:
+                    continue
+                permanent_path = versions_dir.parent / "permanent" / "mappings_global.json"
+                permanent = _load_json(permanent_path)
 
-                # Also mark as confirmed in this version's _confirmed.json
-                conf_path = MAPPING_VERSIONS_DIR / f"{version}_confirmed.json"
-                conf_data = _load_json(conf_path)
-                conf_data[raw] = canonical
-                _save_json(conf_path, conf_data)
-                updated_versions.setdefault(version, {})[raw] = canonical
+                for version, entries in ver_entries.items():
+                    for raw, canonical in entries.items():
+                        permanent[raw] = canonical
 
-            _save_json(MAPPING_PERMANENT_PATH, permanent)
+                        # Mark as confirmed
+                        conf_path = versions_dir / f"{version}_confirmed.json"
+                        conf_data = _load_json(conf_path)
+                        conf_data[raw] = canonical
+                        _save_json(conf_path, conf_data)
 
-            # Remove promoted entries from pending files
-            for version, entries in updated_versions.items():
-                p_path = MAPPING_VERSIONS_DIR / f"{version}_pending.json"
-                pdata = _load_json(p_path)
-                for raw in entries.keys():
-                    if raw in pdata:
+                    # Remove promoted entries from pending file
+                    p_path = versions_dir / f"{version}_pending.json"
+                    pdata = _load_json(p_path)
+                    for raw in entries.keys():
                         pdata.pop(raw, None)
-                _save_json(p_path, pdata)
+                    _save_json(p_path, pdata)
+
+                _save_json(permanent_path, permanent)
 
             st.success(
                 f"Promoted {len(selected_indices)} mappings to permanent store. "
@@ -293,8 +327,8 @@ with col_promote:
 with col_info:
     st.markdown(
         """
-- **Permanent store**: `data/module_mappings/permanent/mappings_global.json`  
-- Future `parse_ecl_export.py` runs will use the canonical name immediately.  
+- **Permanent store**: `data/products/<product>/module_mappings/permanent/mappings_global.json`
+- Future `parse_ecl_export.py` runs will use the canonical name immediately.
 - You can return to this page anytime to review and clear new pending items.
 """
     )

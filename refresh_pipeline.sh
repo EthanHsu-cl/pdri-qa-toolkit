@@ -42,7 +42,8 @@ DATA="$SCRIPT_DIR/data"
 STAGING="$SCRIPT_DIR/data/staging"
 LOGS="$SCRIPT_DIR/logs"
 LOG_FILE="$LOGS/refresh_$(date +%Y%m%d_%H%M%S).log"
-OLLAMA_MODEL="gemma4"
+LOCK_FILE="$SCRIPT_DIR/.pipeline.lock"
+OLLAMA_MODEL="gemma4:e2b-it-q4_K_M"
 EMBED_MODEL="nomic-embed-text"
 STREAMLIT_PORT=8501
 export PYTHONUNBUFFERED=1   # force Python to flush stdout line-by-line when piped
@@ -116,6 +117,26 @@ done
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 mkdir -p "$STAGING" "$LOGS"
+
+# ── Lock: prevent concurrent pipeline runs ────────────────────────────────────
+# Writes PID + schedule to .pipeline.lock; cleans it up on exit (even on crash).
+# If a lock exists and its PID is still alive, the new run exits immediately so
+# a long weekend run cannot be clobbered by the next day's cron.
+if [ -f "$LOCK_FILE" ]; then
+  LOCK_PID=$(awk 'NR==1{print $1}' "$LOCK_FILE" 2>/dev/null || echo "")
+  LOCK_INFO=$(cat "$LOCK_FILE" 2>/dev/null || echo "unknown")
+  if [ -n "$LOCK_PID" ] && kill -0 "$LOCK_PID" 2>/dev/null; then
+    echo "[$(date '+%H:%M:%S')] ⚠️  Pipeline already running (PID $LOCK_PID — $LOCK_INFO). Exiting." \
+      | tee -a "$LOG_FILE"
+    exit 0
+  else
+    echo "[$(date '+%H:%M:%S')] Stale lock found (PID $LOCK_PID gone) — removing." \
+      | tee -a "$LOG_FILE"
+    rm -f "$LOCK_FILE"
+  fi
+fi
+echo "$$ ${FORCE_SCHEDULE:-auto} $(date '+%Y-%m-%d %H:%M:%S')" > "$LOCK_FILE"
+trap 'rm -f "$LOCK_FILE"' EXIT
 
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
 
@@ -208,6 +229,28 @@ run_product_pipeline() {
   log ""
   log "── [$SLUG] Stage 1: Fetch + Parse ───────────────────────"
 
+  # Seed staging ecl_raw.json from live data so the save_json merge logic in
+  # fetch_from_n8n.py can deduplicate by BugCode and preserve historical bugs.
+  # Without this, a 1-month weekday run would overwrite all older version data.
+  if [ -f "$DATA_PRODUCT/ecl_raw.json" ]; then
+    cp "$DATA_PRODUCT/ecl_raw.json" "$STAGING_PRODUCT/ecl_raw.json"
+    log "  Seeded staging ecl_raw.json from live data (merge cache active)."
+  fi
+
+  # Seed staging module_mappings from live data so previously confirmed/promoted
+  # mappings are available to the parser (staging dir is empty on each run).
+  if [ -d "$DATA_PRODUCT/module_mappings" ]; then
+    mkdir -p "$STAGING_PRODUCT/module_mappings/versions" "$STAGING_PRODUCT/module_mappings/permanent"
+    for f in "$DATA_PRODUCT"/module_mappings/permanent/*.json; do
+      [ -f "$f" ] && cp "$f" "$STAGING_PRODUCT/module_mappings/permanent/$(basename "$f")"
+    done
+    for f in "$DATA_PRODUCT"/module_mappings/versions/*.json; do
+      [ -f "$f" ] && cp "$f" "$STAGING_PRODUCT/module_mappings/versions/$(basename "$f")"
+    done
+    log "  Seeded staging module_mappings from live data."
+  fi
+
+
   # Desktop products (pdr, phd) have far more bugs — chunk into 6-month windows
   # to avoid 504 Gateway Timeout on the n8n webhook.
   case "$SLUG" in
@@ -229,6 +272,16 @@ run_product_pipeline() {
 
   [ -f "$STAGING_PRODUCT/version_catalogue.csv" ] && \
     promote "$STAGING_PRODUCT/version_catalogue.csv" "$DATA_PRODUCT/version_catalogue.csv"
+
+  # Promote module mappings (pending/confirmed JSON + permanent store)
+  if [ -d "$STAGING_PRODUCT/module_mappings" ]; then
+    if [ -d "$STAGING_PRODUCT/module_mappings/versions" ]; then
+      promote_dir "$STAGING_PRODUCT/module_mappings/versions" "$DATA_PRODUCT/module_mappings/versions"
+    fi
+    if [ -d "$STAGING_PRODUCT/module_mappings/permanent" ]; then
+      promote_dir "$STAGING_PRODUCT/module_mappings/permanent" "$DATA_PRODUCT/module_mappings/permanent"
+    fi
+  fi
 
   log "[$SLUG] Stage 1 complete."
 

@@ -208,6 +208,52 @@ MODULE_ALIASES.update({
     "STT":          "Text to Speech",  # pure acronym, no word overlap
 })
 
+# PHD-specific aliases: concatenated AI feature names (no spaces/underscores)
+MODULE_ALIASES.update({
+    "AIExpand":           "AI Expand",
+    "AIOutfit":           "AI Outfit",
+    "AIHeadshot":         "AI Headshot",
+    "AIRelight":          "AI Relight",
+    "AIHairstyle":        "AI Hairstyle",
+    "AI face swap":       "AI Face Swap",
+    "AI hairstyle":       "AI Hairstyle",
+    "AI expand":          "AI Expand",
+    "AI relight":         "AI Relight",
+    "AI outfit":          "AI Outfit",
+    "AI headshot":        "AI Headshot",
+    "AI try on":          "AI Try On",
+    "AI Try on":          "AI Try On",
+    "AI creative studio": "AI Creative Studio",
+    "AI Creative studio": "AI Creative Studio",
+    "AI magic studio":    "AI Magic Studio",
+    "AI Magic studio":    "AI Magic Studio",
+    "AI anime video":     "AI Anime Video",
+    "AI srt-custom":      "Auto Captions",
+    "AI srt":             "Auto Captions",
+    "Artistic avatar":    "Artistic Avatar",
+    "My AI Artwork":      "My AI Artwork",
+    "My AI artwork":      "My AI Artwork",
+    "My artwork":         "My Artwork",
+    "My Artwork":         "My Artwork",
+    "Quick action":       "Quick Actions",
+    "Quick Action":       "Quick Actions",
+    "Quick Actions":      "Quick Actions",
+    "Photo picker":       "Photo Picker",
+    "Photo Picker":       "Photo Picker",
+    "Add image":          "Add Image",
+    "Add-image":          "Add Image",
+    "Edit Room":          "Edit Room",
+    "Draw to image":      "Draw to Image",
+    "Draw to Image":      "Draw to Image",
+    "ID photo":           "ID Photo",
+    "ID Photo":           "ID Photo",
+    "Image fusion":       "Image Fusion",
+    "Image Fusion":       "Image Fusion",
+    "Removal YOLO":       "Removal",
+    "Gen AI":             "GAI",
+    "Opening intro":      "Opening Intro",
+})
+
 # Lowercase shadow for O(1) alias lookup — rebuilt after all updates
 _MODULE_ALIASES_LOWER = {k.lower(): v for k, v in MODULE_ALIASES.items()}
 
@@ -235,6 +281,19 @@ MODULE_CATEGORIES = {
         "Voice Cloning",
         "My Voices",
         "TTI Inspiration",
+        "AI Face Swap",
+        "AI Expand",
+        "AI Outfit",
+        "AI Headshot",
+        "AI Relight",
+        "AI Hairstyle",
+        "AI Try On",
+        "AI Creative Studio",
+        "AI Magic Studio",
+        "Artistic Avatar",
+        "AI Avatar",
+        "Draw to Image",
+        "Image Fusion",
     ],
     "Editor Core": [
         "Project",
@@ -271,6 +330,7 @@ MODULE_CATEGORIES = {
         "PIP",
         "PiP",
         "Drag and Drop",
+        "Edit Room",
     ],
     "Audio": [
         "Audio",
@@ -325,6 +385,7 @@ MODULE_CATEGORIES = {
         "Effect Layer",
         "AI Effect",
         "Magnifier",
+        "Blur Tool",
     ],
     "Color & Adjust": [
         "Adjust",
@@ -367,6 +428,10 @@ MODULE_CATEGORIES = {
         "Face Reshape",
         "Body Reshape",
         "Stabilizer",
+        "Makeup",
+        "Beautify",
+        "Removal",
+        "ID Photo",
     ],
     "Export & Output": [
         "Export",
@@ -404,10 +469,16 @@ MODULE_CATEGORIES = {
         "Notice",
         "Home indicator",
         "App icon",
+        "My AI Artwork",
+        "My Artwork",
+        "Mine",
+        "Quick Actions",
+        "Collage",
     ],
     "Launcher": ["Launcher", "Launch", "Opening Intro", "Splash", "Opening Tutorial", "Recent Task"],
     "Media Picker": [
         "Add Media",
+        "Add Image",
         "Media Picker",
         "Media Room",
         "File Picker",
@@ -415,6 +486,7 @@ MODULE_CATEGORIES = {
         "Gettyimages",
         "Pexels",
         "iStock",
+        "Photo Picker",
         "Cloud Storage (Media Picker)",
     ],
     "Cloud": ["Cloud Storage", "My Cloud", "Back Up to My Device"],
@@ -552,6 +624,72 @@ _FLAT_OVERRIDES = {
     "Setup": "QA / Testing",
     "CS": "QA / Testing",
     "Third party": "QA / Testing",
+    # PDR desktop: Editor Core
+    "Quick Editing": "Editor Core",
+    "PiP Quick Editing": "Editor Core",
+    "Title Quick Editing": "Editor Core",
+    "Speed Quick Editing": "Editor Core",
+    "Mask Quick Editing": "Editor Core",
+    "Quick Editing for Title": "Editor Core",
+    "On Screen Editing": "Editor Core",
+    "PiP Designer": "Editor Core",
+    "Mask Designer": "Editor Core",
+    "Range Selection": "Editor Core",
+    "Display Panel": "Editor Core",
+    "Customize Toolbar": "Editor Core",
+    "UI Revamp": "Editor Core",
+    # PDR desktop: Text & Captions
+    "Subtitle Room": "Text & Captions",
+    "Subtitles Room": "Text & Captions",
+    "Title Designer": "Text & Captions",
+    "Title Designer Revamp": "Text & Captions",
+    "Text-Based Editing": "Text & Captions",
+    "Trim by Speech": "Text & Captions",
+    # PDR desktop: AI Features
+    "AI Copilot": "AI Features",
+    "AI Video Generator": "AI Features",
+    "Image Generator": "AI Features",
+    "Video Generator": "AI Features",
+    "AI Voice Translator": "AI Features",
+    "Brand Kits": "AI Features",
+    # PDR desktop: Visual Effects / Media
+    "Effect Room": "Visual Effects",
+    "Audio Room": "Audio",
+    "Media Room": "Media Picker",
+    # PDR desktop: QA / Testing
+    "General": "QA / Testing",
+    "Installation": "QA / Testing",
+    # PHD-specific: Enhance & Fix
+    "Makeup": "Enhance & Fix",
+    "Beautify": "Enhance & Fix",
+    "Removal": "Enhance & Fix",
+    "ID Photo": "Enhance & Fix",
+    # PHD-specific: AI Features
+    "AI Face Swap": "AI Features",
+    "AI Expand": "AI Features",
+    "AI Outfit": "AI Features",
+    "AI Headshot": "AI Features",
+    "AI Relight": "AI Features",
+    "AI Hairstyle": "AI Features",
+    "AI Try On": "AI Features",
+    "AI Creative Studio": "AI Features",
+    "AI Magic Studio": "AI Features",
+    "Artistic Avatar": "AI Features",
+    "AI Avatar": "AI Features",
+    "Draw to Image": "AI Features",
+    "Image Fusion": "AI Features",
+    # PHD-specific: UI & Settings
+    "My AI Artwork": "UI & Settings",
+    "My Artwork": "UI & Settings",
+    "Mine": "UI & Settings",
+    "Quick Actions": "UI & Settings",
+    "Collage": "UI & Settings",
+    "Blur Tool": "Visual Effects",
+    # PHD-specific: Editor Core
+    "Edit Room": "Editor Core",
+    # PHD-specific: Media Picker
+    "Add Image": "Media Picker",
+    "Photo Picker": "Media Picker",
 }
 
 MODULE_CATEGORIES.update(_FLAT_OVERRIDES)
@@ -608,8 +746,10 @@ PRIORITY_LABEL_MAP = {
 }
 
 DESC_PATTERN = re.compile(
-    r"^(?P<product>[A-Z0-9-]+)\s+"
+    r"^(?P<product>[A-Z]+(?:-[A-Za-z])?)\s*"
+    r"(?:Mac\s+)?"
     r"(?P<version>[\d.]+(?:\s*\([\d.]+\))?)\s*"
+    r"(?:Mac\s*)?"
     r"-\s*"
     r"(?P<tags>(?:\[[^\]]*\]\s*)*)"
     r"(?P<module>[^:]+?):\s*"
@@ -708,6 +848,10 @@ def normalize_module(raw: str, version: str = "unknown",
     5. Raw string (Uncategorized; flagged for dashboard)
     """
     mod = raw.strip()
+
+    # Step 0: replace underscores with spaces (PHD-A/PHD-i use underscore-separated
+    # module names like "AI_Face_Swap" that should match canonical "AI Face Swap")
+    mod = mod.replace("_", " ")
 
     # Step 1: normalise compound module strings automatically.
     #
