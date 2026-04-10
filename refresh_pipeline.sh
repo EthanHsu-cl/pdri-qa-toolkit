@@ -9,7 +9,7 @@
 #
 # Product scheduling:
 #   Weekdays (Mon–Fri): PDRi + PHDi with 1-month data window
-#   Weekends (Sat–Sun): All products with 36-month data window
+#   Saturday only:      All products with 36-month data window (Sunday skipped)
 #   Override with --products and --duration-months
 #
 # Usage:
@@ -27,8 +27,9 @@
 #   ./refresh_pipeline.sh --embed-model nomic-embed-text           # default embed model
 #   ./refresh_pipeline.sh --embed-model mxbai-embed-large          # alternative embed model
 #
-# Cron example (runs every day at 03:00):
-#   0 3 * * * /Users/yourname/pdri-qa-toolkit/refresh_pipeline.sh >> /Users/yourname/pdri-qa-toolkit/logs/refresh.log 2>&1
+# Cron schedule (weekdays at 03:00, Saturday only at 03:00 — Sunday skipped):
+#   0 3 * * 1-5 /Users/yourname/pdri-qa-toolkit/refresh_pipeline.sh >> /Users/yourname/pdri-qa-toolkit/logs/refresh.log 2>&1
+#   0 3 * * 6   /Users/yourname/pdri-qa-toolkit/refresh_pipeline.sh >> /Users/yourname/pdri-qa-toolkit/logs/refresh.log 2>&1
 # =============================================================================
 
 set -euo pipefail

@@ -2818,7 +2818,7 @@ Output files saved to `data/predictions/`:
 
     # ── Severity escalation alerts ── (shown before primary content so urgent signals are seen first)
     if "severity_escalation" in pred_df.columns:
-        _esc = pred_df[["module", "predicted", "risk_level", "severity_escalation"]].copy()
+        _esc = pred_df[["module", "risk_level", "severity_escalation"]].copy()
         _esc["severity_escalation"] = pd.to_numeric(_esc["severity_escalation"], errors="coerce")
         _RISK_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
         _worsening = _esc[_esc["severity_escalation"] < -0.3].copy()
@@ -2838,7 +2838,7 @@ Output files saved to `data/predictions/`:
                 st.warning(
                     f"{_esc_icon} **{_er['module']}** — severity worsening by "
                     f"{abs(_esc_val):.2f} points toward S1 "
-                    f"(predicted {_er['predicted']:.0f} bugs, {_er['risk_level']} risk)"
+                    f"({_er['risk_level']} risk)"
                 )
 
 

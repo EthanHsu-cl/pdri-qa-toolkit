@@ -69,8 +69,16 @@ except ImportError:
 # Issue 2 – Status classification
 # ---------------------------------------------------------------------
 
-INACTIVE_STATUSES = {
+# Bugs that were real but are now resolved. They count in predictions at half
+# weight — they happened and cost engineering time, but the fix reduces ongoing risk.
+CLOSED_STATUSES = {
     "close",
+    "hqqa close",
+    "fae close",
+}
+
+# Bugs that were never confirmed as real defects. Excluded from predictions entirely.
+INVALID_STATUSES = {
     "need more info",
     "nab",
     "propose nab",
@@ -83,9 +91,10 @@ INACTIVE_STATUSES = {
     "not a bug",
     "new feature",
     "external issue",
-    "hqqa close",
-    "fae close",
 }
+
+# Combined for backward-compat callers that only need active vs. inactive
+INACTIVE_STATUSES = CLOSED_STATUSES | INVALID_STATUSES
 
 
 def classify_status(status_val) -> bool:
@@ -94,6 +103,23 @@ def classify_status(status_val) -> bool:
         return True
     s = str(status_val).strip().lower()
     return s not in INACTIVE_STATUSES
+
+
+def classify_status_weight(status_val) -> float:
+    """
+    Prediction weight for a bug based on its status.
+      1.0 — open/active: full signal
+      0.5 — closed/fixed: real bug, but resolved; counts at half weight
+      0.0 — invalid (NAB, Won't Fix, etc.): excluded from predictions
+    """
+    if pd.isna(status_val):
+        return 1.0
+    s = str(status_val).strip().lower()
+    if s in INVALID_STATUSES:
+        return 0.0
+    if s in CLOSED_STATUSES:
+        return 0.5
+    return 1.0
 
 
 # ---------------------------------------------------------------------
@@ -1183,14 +1209,17 @@ def parse_ecl_export(
     for tk, tv in tag_cols.items():
         df[f"tag_{tk}"] = tv
 
-    # status_active
+    # status_active and status_weight
     if status_col:
         df["status_active"] = df[status_col].apply(classify_status)
+        df["status_weight"] = df[status_col].apply(classify_status_weight)
         print("\nStatus classification:")
         print(f"  Active bugs:   {df['status_active'].sum():,}")
-        print(f"  Inactive bugs: {(~df['status_active']).sum():,}")
+        print(f"  Closed bugs:   {((df['status_weight'] == 0.5)).sum():,}")
+        print(f"  Invalid bugs:  {((df['status_weight'] == 0.0)).sum():,}")
     else:
         df["status_active"] = True
+        df["status_weight"] = 1.0
         print("\nWARNING: No 'Status' column found — all bugs marked active.")
 
     # Severity

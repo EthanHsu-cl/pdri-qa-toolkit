@@ -445,12 +445,32 @@ def build_features(df, build_col="Build#", mod_col="parsed_module",
         print(f"  WARNING: {non_numeric}/{total_before} rows dropped — "
               f"'{build_col}' could not be parsed as numbers.")
 
+    # Apply status weighting if available:
+    #   1.0 = open/active  → full contribution
+    #   0.5 = closed/fixed → real bug but resolved; counts at half weight
+    #   0.0 = invalid (NAB, Won't Fix, etc.) → excluded entirely
+    if "status_weight" in df.columns:
+        df["status_weight"] = pd.to_numeric(df["status_weight"], errors="coerce").fillna(1.0)
+        invalid_count = (df["status_weight"] == 0.0).sum()
+        closed_count  = (df["status_weight"] == 0.5).sum()
+        df = df[df["status_weight"] > 0].copy()
+        print(f"  Status weighting: {invalid_count} invalid bugs excluded, "
+              f"{closed_count} closed bugs weighted at 0.5")
+        df["_bug_weight"] = df["status_weight"]
+        df["severity_weight"] = df["severity_weight"] * df["status_weight"]
+        df["_crit_w"] = (df["severity_num"] == 1).astype(float) * df["status_weight"]
+        df["_major_w"] = (df["severity_num"] == 2).astype(float) * df["status_weight"]
+    else:
+        df["_bug_weight"] = 1.0
+        df["_crit_w"] = (df["severity_num"] == 1).astype(float)
+        df["_major_w"] = (df["severity_num"] == 2).astype(float)
+
     # Aggregate per (module, build) — added avg_sev for severity_escalation
     agg = df.groupby([mod_col, build_col]).agg(
-        bug_count=("severity_weight", "size"),
+        bug_count=("_bug_weight", "sum"),
         sev_w=("severity_weight", "sum"),
-        crit=("severity_num", lambda x: (x == 1).sum()),
-        major=("severity_num", lambda x: (x == 2).sum()),
+        crit=("_crit_w", "sum"),
+        major=("_major_w", "sum"),
         avg_sev=("severity_num", "mean"),    # NEW v3.0
     ).reset_index()
 
