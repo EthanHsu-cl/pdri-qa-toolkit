@@ -82,3 +82,6 @@ test_results/
 
 # Generated visual regression files
 visual_results/
+
+# Pipeline lock
+.pipeline.lock

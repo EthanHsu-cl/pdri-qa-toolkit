@@ -267,7 +267,7 @@ def _file_mtime(fp: str) -> float:
 
 
 @st.cache_data
-def _load_csv_cached(fp: str, _mtime: float) -> pd.DataFrame:
+def _load_csv_cached(fp: str, mtime: float) -> pd.DataFrame:
     df = pd.read_csv(fp, low_memory=False)
     for dc in ["Create Date", "Closed Date"]:
         if dc in df.columns:
@@ -673,6 +673,16 @@ if "parsed_version" in df.columns:
     # so "All versions" / "Clear" buttons can override it without being
     # overwritten by the default= argument on subsequent renders.
     default_vers = vers_real[:3] if vers_real else vers_all[:3]
+
+    # Reset version selection when the data file changes on disk (e.g., mid-pipeline
+    # refresh where pdri completes before Streamlit is restarted). Without this, the
+    # old selection (e.g., 2 weekday versions) persists even after new 36-month data
+    # is promoted because the pruning below only removes versions that no longer exist.
+    _cur_mtime = _file_mtime(fp) if ds != "Upload CSV" else 0.0
+    if st.session_state.get("_version_data_mtime") != _cur_mtime:
+        st.session_state["_version_data_mtime"] = _cur_mtime
+        st.session_state.pop("version_multiselect", None)
+
     if "version_multiselect" not in st.session_state:
         st.session_state["version_multiselect"] = default_vers
     else:
@@ -2810,12 +2820,15 @@ Output files saved to `data/predictions/`:
     if "severity_escalation" in pred_df.columns:
         _esc = pred_df[["module", "predicted", "risk_level", "severity_escalation"]].copy()
         _esc["severity_escalation"] = pd.to_numeric(_esc["severity_escalation"], errors="coerce")
-        _worsening = _esc[_esc["severity_escalation"] < -0.3].sort_values(
-            "severity_escalation").head(8)
+        _RISK_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+        _worsening = _esc[_esc["severity_escalation"] < -0.3].copy()
+        _worsening["_risk_order"] = _worsening["risk_level"].map(_RISK_ORDER).fillna(99)
+        _worsening = _worsening.sort_values(
+            ["_risk_order", "severity_escalation"]).head(8)
         if not _worsening.empty:
             st.subheader("⚠️ Severity Escalation Alerts")
             st.caption(
-                "These modules have bugs getting **more severe** in recent builds — "
+                "These modules have bugs getting **more severe** in recent versions — "
                 "the average severity is trending toward Critical (S1). "
                 "Flag for immediate investigation even if raw bug counts look low."
             )
@@ -2827,33 +2840,7 @@ Output files saved to `data/predictions/`:
                     f"{abs(_esc_val):.2f} points toward S1 "
                     f"(predicted {_er['predicted']:.0f} bugs, {_er['risk_level']} risk)"
                 )
-            st.markdown("---")
 
-    # ── Builds since last critical summary ─────────────────────────────────
-    if "builds_since_last_crit" in pred_df.columns:
-        _bslc = pred_df[["module", "predicted", "risk_level", "builds_since_last_crit"]].copy()
-        _bslc["builds_since_last_crit"] = pd.to_numeric(
-            _bslc["builds_since_last_crit"], errors="coerce")
-        _overdue = _bslc[
-            (_bslc["builds_since_last_crit"] >= 5) &
-            (_bslc["builds_since_last_crit"] <= 20) &
-            (~_bslc["risk_level"].isin(["Low"]))
-        ].sort_values("builds_since_last_crit").head(6)
-        if not _overdue.empty:
-            with st.expander(
-                f"🕒 {len(_overdue)} module(s) overdue for a critical bug — had S1s historically, none recently",
-                expanded=True,
-            ):
-                st.caption(
-                    "Modules that have produced critical bugs in the past but have been quiet for 5–20 builds. "
-                    "They are not 'fixed' — they may be accumulating risk. Monitor closely."
-                )
-                for _, _od in _overdue.iterrows():
-                    st.info(
-                        f"**{_od['module']}** — {int(_od['builds_since_last_crit'])} builds "
-                        f"since last critical · predicted {_od['predicted']:.0f} bugs · {_od['risk_level']} risk"
-                    )
-            st.markdown("---")
 
     # ── "What to Test Next Build" — PRIMARY SECTION ──────────────────────
     st.markdown("---")
@@ -3043,7 +3030,7 @@ Output files saved to `data/predictions/`:
             else:
                 fc2.metric("Predicted bugs", f"{pred_val:.0f}")
             if target_v is not None:
-                fc3.metric("Actual last build", f"{float(target_v):.0f}")
+                fc3.metric("Actual last version", f"{float(target_v):.0f}")
 
             # Row 2 — v3.0 signals
             sev_esc   = row.get("severity_escalation", None)
@@ -3064,10 +3051,10 @@ Output files saved to `data/predictions/`:
                         "✅ Stable / improving"
                     )
                     sc1.metric("Severity trend", _esc_label,
-                               help="Negative = severity worsening toward S1 in recent builds")
+                               help="Negative = severity worsening toward S1 in recent versions")
                 if bslc is not None:
-                    sc2.metric("Builds since last critical", f"{int(float(bslc))}",
-                               help="How many builds have passed since the last S1 bug in this module")
+                    sc2.metric("Versions since last critical", f"{int(float(bslc))}",
+                               help="How many versions have passed since the last S1 bug in this module")
                 if mod_ent is not None:
                     _ent_label = (
                         "⚠️ Broad instability" if mod_ent > 2.0 else
@@ -3245,8 +3232,8 @@ Output files saved to `data/predictions/`:
             color_discrete_map=FORECAST_COLORS,
             category_orders={"risk_level": RISK_ORDER},
             hover_data={"predicted": ":.1f", "risk_level": True, **hover_extra},
-            labels={"module": "Module", "predicted": "Predicted bugs (next build)",
-                    "risk_level": "Risk level", "target": "Actual (last build)",
+            labels={"module": "Module", "predicted": "Predicted bugs (next version)",
+                    "risk_level": "Risk level", "target": "Actual (last version)",
                     "dominant_bug_type": "Typical bug type"},
             text="predicted",
         )
@@ -3269,13 +3256,13 @@ Output files saved to `data/predictions/`:
             avp_melt = avp.melt(id_vars="module", value_vars=["target", "predicted"],
                                 var_name="Type", value_name="Bugs")
             avp_melt["Type"] = avp_melt["Type"].map(
-                {"target": "Actual (last build)", "predicted": "Forecast (next build)"}
+                {"target": "Actual (last version)", "predicted": "Forecast (next version)"}
             )
             fig_avp = px.bar(
                 avp_melt, x="module", y="Bugs", color="Type", barmode="group",
                 color_discrete_map={
-                    "Actual (last build)":     "#6366f1",
-                    "Forecast (next build)":   "#f97316",
+                    "Actual (last version)":     "#6366f1",
+                    "Forecast (next version)":   "#f97316",
                 },
                 labels={"module": "Module", "Bugs": "Bug count"},
             )
@@ -3307,7 +3294,7 @@ Output files saved to `data/predictions/`:
                 "composite_risk": "Risk score",
                 "risk_level": "Risk",
                 "severity_escalation": "Sev. escalation",
-                "builds_since_last_crit": "Builds since S1",
+                "builds_since_last_crit": "Versions since S1",
                 "crit_ratio": "S1 ratio",
                 "new_module": "New module?",
                 "cross_module_spike": "Cross-module spike",
@@ -3333,14 +3320,14 @@ Output files saved to `data/predictions/`:
             "module": "Module",
             "predicted": "Forecast (global)",
             "predicted_stratified": "Forecast (stratified)",
-            "target": "Actual (last build)",
+            "target": "Actual (last version)",
             "composite_risk": "Risk score",
             "risk_level": "Risk level",
             "dominant_bug_type": "Typical bug type",
             "leading_signal": "Leading signal",
             "severity_escalation": "Sev. escalation",
             "builds_since_last_crit": "Builds since S1",
-            "crit_ratio": "S1 ratio (last 3 builds)",
+            "crit_ratio": "S1 ratio (last 3 versions)",
             "new_module": "New module?",
             "cross_module_spike": "Cross-module spike",
         }
@@ -3387,22 +3374,22 @@ Output files saved to `data/predictions/`:
                 _imp = _imp.sort_values(imp_col, ascending=False).head(20)
                 # Map feature names to human-readable labels using predict_defects' label dict
                 _FEAT_LABELS_T9 = {
-                    "crit_1": "Critical-bug momentum (last build)",
-                    "crit_2": "Critical-bug momentum (last 2 builds)",
-                    "crit_3": "Critical-bug momentum (last 3 builds)",
-                    "bugs_1": "Bug-count momentum (last build)",
-                    "bugs_2": "Bug-count momentum (last 2 builds)",
-                    "bugs_3": "Bug-count momentum (last 3 builds)",
-                    "sev_1":  "Severity-weighted momentum (last build)",
-                    "sev_2":  "Severity-weighted momentum (last 2 builds)",
-                    "sev_3":  "Severity-weighted momentum (last 3 builds)",
+                    "crit_1": "Critical-bug momentum (last version)",
+                    "crit_2": "Critical-bug momentum (last 2 versions)",
+                    "crit_3": "Critical-bug momentum (last 3 versions)",
+                    "bugs_1": "Bug-count momentum (last version)",
+                    "bugs_2": "Bug-count momentum (last 2 versions)",
+                    "bugs_3": "Bug-count momentum (last 3 versions)",
+                    "sev_1":  "Severity-weighted momentum (last version)",
+                    "sev_2":  "Severity-weighted momentum (last 2 versions)",
+                    "sev_3":  "Severity-weighted momentum (last 3 versions)",
                     "trend":  "Upward bug-count trend",
                     "severity_escalation":    "Severity escalation (→S1)",
-                    "builds_since_last_crit": "Builds since last critical",
-                    "cluster_entropy_2":      "Bug-theme diversity (last 2 builds)",
-                    "cluster_entropy_3":      "Bug-theme diversity (last 3 builds)",
+                    "builds_since_last_crit": "Versions since last critical",
+                    "cluster_entropy_2":      "Bug-theme diversity (last 2 versions)",
+                    "cluster_entropy_3":      "Bug-theme diversity (last 3 versions)",
                     "top_cluster_velocity":   "Fastest-growing theme velocity",
-                    "crit_ratio":             "S1 bug proportion (last 3 builds)",
+                    "crit_ratio":             "S1 bug proportion (last 3 versions)",
                     "new_module":             "New module flag",
                     "cross_module_spike":     "Correlated cross-module spike",
                     "total_historical_bugs":  "Total historical bug count",
