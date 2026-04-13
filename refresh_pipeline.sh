@@ -545,18 +545,24 @@ else
   if lsof -ti tcp:"$STREAMLIT_PORT" >/dev/null 2>&1; then
     log "  ERROR: port $STREAMLIT_PORT still occupied — skipping Streamlit start"
   else
+    # Brief pause to let any TIME_WAIT sockets fully clear before binding
+    sleep 1
     nohup streamlit run "$SCRIPT_DIR/scripts/bug_heatmap_dashboard.py" \
       --server.address 0.0.0.0 \
       --server.port "$STREAMLIT_PORT" \
       --server.headless true \
       >> "$LOGS/streamlit.log" 2>&1 &
     NEW_PID=$!
-    sleep 3
-    # Verify the new process is actually listening
-    if lsof -ti tcp:"$STREAMLIT_PORT" >/dev/null 2>&1; then
-      log "  Streamlit restarted (PID $NEW_PID) on :$STREAMLIT_PORT"
-    else
-      log "  WARNING: Streamlit process started but not yet listening on :$STREAMLIT_PORT"
+    # Poll up to 15s — large dashboard takes longer than 3s to bind
+    for _i in $(seq 1 15); do
+      sleep 1
+      if lsof -ti tcp:"$STREAMLIT_PORT" >/dev/null 2>&1; then
+        log "  Streamlit restarted (PID $NEW_PID) on :$STREAMLIT_PORT — ready after ${_i}s"
+        break
+      fi
+    done
+    if ! lsof -ti tcp:"$STREAMLIT_PORT" >/dev/null 2>&1; then
+      log "  WARNING: Streamlit process started but not yet listening on :$STREAMLIT_PORT after 15s"
       log "  Check $LOGS/streamlit.log for errors"
     fi
   fi
