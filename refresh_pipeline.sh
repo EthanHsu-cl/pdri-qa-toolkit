@@ -22,8 +22,8 @@
 #   ./refresh_pipeline.sh --skip-ollama                  # use heuristic scorer
 #   ./refresh_pipeline.sh --skip-cluster                 # skip clustering
 #   ./refresh_pipeline.sh --skip-predict                 # skip predictions
-#   ./refresh_pipeline.sh --ollama-model gemma4                    # default
-#   ./refresh_pipeline.sh --ollama-model gemma4:e2b-it-q4_K_M     # quantised variant
+#   ./refresh_pipeline.sh --force-relabel                # re-run cluster labels only (no re-embedding)
+#   ./refresh_pipeline.sh --ollama-model gemma4:e2b-it-q4_K_M     # AI risk scorer model
 #   ./refresh_pipeline.sh --embed-model nomic-embed-text           # default embed model
 #   ./refresh_pipeline.sh --embed-model mxbai-embed-large          # alternative embed model
 #
@@ -46,6 +46,7 @@ LOG_FILE="$LOGS/refresh_$(date +%Y%m%d_%H%M%S).log"
 LOCK_FILE="$SCRIPT_DIR/.pipeline.lock"
 OLLAMA_MODEL="gemma4:e2b-it-q4_K_M"
 EMBED_MODEL="nomic-embed-text"
+CLUSTER_LABEL_MODEL="gemma4"
 STREAMLIT_PORT=8501
 export PYTHONUNBUFFERED=1   # force Python to flush stdout line-by-line when piped
 
@@ -59,6 +60,7 @@ DRY_RUN=false
 SKIP_OLLAMA=false
 SKIP_CLUSTER=false
 SKIP_PREDICT=false
+FORCE_RELABEL=false
 OVERRIDE_PRODUCTS=""
 OVERRIDE_DURATION=""
 FORCE_SCHEDULE=""
@@ -69,6 +71,7 @@ for arg in "$@"; do
     --skip-ollama)        SKIP_OLLAMA=true ;;
     --skip-cluster)       SKIP_CLUSTER=true ;;
     --skip-predict)       SKIP_PREDICT=true ;;
+    --force-relabel)      FORCE_RELABEL=true ;;
     --weekday)            FORCE_SCHEDULE=weekday ;;
     --weekend|--full)     FORCE_SCHEDULE=weekend ;;
     --products=*)         OVERRIDE_PRODUCTS="${arg#*=}" ;;
@@ -361,24 +364,29 @@ run_product_pipeline() {
     CLUSTER_OUT="$DATA_PRODUCT/clusters"
     mkdir -p "$CLUSTER_OUT"
 
-    if $SKIP_OLLAMA; then
-      run "python scripts/cluster_bugs.py \
+    CLUSTER_CMD="python scripts/cluster_bugs.py \
         '$DATA_PRODUCT/ecl_parsed.csv' \
         '$CLUSTER_OUT/ecl_parsed_clustered.csv'"
-    else
-      run "python scripts/cluster_bugs.py \
-        '$DATA_PRODUCT/ecl_parsed.csv' \
-        '$CLUSTER_OUT/ecl_parsed_clustered.csv' \
+
+    if ! $SKIP_OLLAMA; then
+      CLUSTER_CMD="$CLUSTER_CMD \
         --provider ollama \
-        --model '$OLLAMA_MODEL' \
+        --label-model '$CLUSTER_LABEL_MODEL' \
         --embed-model '$EMBED_MODEL'"
     fi
+
+    if $FORCE_RELABEL; then
+      CLUSTER_CMD="$CLUSTER_CMD --relabel"
+    fi
+
+    run "$CLUSTER_CMD"
 
     log "[$SLUG] Stage 5 complete."
   fi
 
   # ── Stage 6: Defect Predictions ────────────────────────────────────────
-  if $SKIP_PREDICT; then
+  # --force-relabel overrides --skip-predict because predictions consume cluster labels
+  if $SKIP_PREDICT && ! $FORCE_RELABEL; then
     log ""
     log "── [$SLUG] Stage 6: Predictions SKIPPED ────────────────"
   else
@@ -449,7 +457,7 @@ resolve_product_schedule() {
 
 log "======================================================"
 log "QA Daily Refresh  $(date '+%Y-%m-%d %H:%M:%S')"
-log "dry_run=$DRY_RUN  skip_ollama=$SKIP_OLLAMA  skip_cluster=$SKIP_CLUSTER  skip_predict=$SKIP_PREDICT  force_schedule=$FORCE_SCHEDULE  ollama_model=$OLLAMA_MODEL  embed_model=$EMBED_MODEL"
+log "dry_run=$DRY_RUN  skip_ollama=$SKIP_OLLAMA  skip_cluster=$SKIP_CLUSTER  skip_predict=$SKIP_PREDICT  force_relabel=$FORCE_RELABEL  force_schedule=$FORCE_SCHEDULE  ollama_model=$OLLAMA_MODEL  embed_model=$EMBED_MODEL  cluster_label_model=$CLUSTER_LABEL_MODEL"
 log "======================================================"
 
 # 1. Make sure Streamlit is up before we do anything

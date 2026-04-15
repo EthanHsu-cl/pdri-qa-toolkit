@@ -312,7 +312,7 @@ Per-module metrics computed:
 - Total bugs, severity-weighted total (S1×10 + S2×5 + S3×2 + S4×1)
 - Critical/Major/Normal/Minor counts
 - Side Effect (regression) rate, AT Found (automation catch) rate
-- Average repro rate, days-to-close, builds-to-fix
+- Average repro rate, days-to-close, versions-to-fix
 - Unique reporter count, open/closed/postponed counts
 - Auto-calculated probability score (1–5 via quintile percentile ranking of bug count)
 
@@ -434,7 +434,7 @@ The dashboard reads `data/version_catalogue.csv` (produced by the parser) to ord
 | 5 | 👥 Team Coverage | Step 1 | Tester × Category matrix — knowledge silo detection |
 | 6 | 📊 KPI Dashboard | Steps 1–2 | Total bugs, critical count, weekly trend, severity pie. P1/P2 counts + avg risk score when risk data loaded. |
 | 7 | 🔥 Risk Heatmap | Steps 1–2 | Interactive treemap with version-aware scores. Click any module to see its bugs. P1 bar chart. Risk vs Probability scatter (jittered for readability). |
-| 8 | 🔬 Bug Clusters | Steps 1+3 | Theme overview bar chart, expandable per-theme cards with sample bugs and plain-English action lines. **New in v3.0:** velocity chart (theme acceleration over recent builds), module entropy chart, stratified S1/S2 vs S3/S4 tabs when stratified files are loaded. |
+| 8 | 🔬 Bug Clusters | Steps 1+3 | Theme overview bar chart, expandable per-theme cards with sample bugs and plain-English action lines. **New in v3.0:** velocity chart (theme acceleration over recent versions), module entropy chart, stratified S1/S2 vs S3/S4 tabs when stratified files are loaded. |
 | 9 | 🔮 Defect Forecast | Steps 1+4 | Forecast bar chart, actual-vs-predicted comparison, per-module "what to test" cards, leading indicators chart. **New in v3.0:** per-theme breakdown under "What to expect" (e.g. "~3 bugs — login crash / timeout") when `_by_cluster.csv` is loaded. |
 
 Each tab has a **📖 How to read this chart** expander written for both QA engineers and non-technical team members.
@@ -484,7 +484,7 @@ Each expandable card shows: bug count, average severity score (1 = Critical, 4 =
 **New v3.0 cluster metrics:**
 | Metric | What it means |
 |--------|--------------|
-| `cluster_velocity_ratio` | Bug count in last 3 builds ÷ prior 3 builds. Above 1.5 = theme accelerating. Below 0.67 = declining. |
+| `cluster_velocity_ratio` | Bug count in last 3 versions ÷ prior 3 versions. Above 1.5 = theme accelerating. Below 0.67 = declining. |
 | `cluster_trend` | `"growing"` / `"stable"` / `"declining"` — quick sort key for the weekly meeting. |
 | `recurrence_rate` | Fraction of recent bugs whose module recurred in the same cluster from the prior window. Above 0.5 = root cause not fixed — escalate to RD. |
 | `cluster_entropy` | Shannon entropy of a module's cluster distribution. Below 1.0 = single-theme (easy to target). Above 2.0 = multi-theme (needs comprehensive coverage). |
@@ -494,7 +494,7 @@ Running with `--provider ollama --model <model>` produces richer, meaning-aware 
 
 ### Step 4.5 — Defect Forecast Tab (Tab 9) — Detail
 
-Tab 9 shows a **machine-learning forecast** of how many bugs each module is likely to produce in the **next build**, based on its recent history. It is designed to be readable by QA engineers and non-technical team members alike — no data-science background required.
+Tab 9 shows a **machine-learning forecast** of how many bugs each module is likely to produce in the **next version**, based on its recent history. It is designed to be readable by QA engineers and non-technical team members alike — no data-science background required.
 
 **What is being predicted:**
 `predict_defects.py` counts how many bugs were filed against each module in each past version, trains a Gradient Boosting model on that history, and forecasts the count for the next version. Bug counts are status-weighted: invalid bugs (NAB, Won't Fix, Not Reproducible, etc.) are excluded entirely; closed/fixed bugs count at half weight; open bugs count at full weight. At startup the script prints a full `PREDICTION_GUIDE` box explaining every feature column, the target variable, and how to interpret the output.
@@ -509,7 +509,7 @@ Tab 9 shows a **machine-learning forecast** of how many bugs each module is like
 **Risk level thresholds:**
 | Level | Predicted bugs | What to do |
 |-------|---------------|------------|
-| 🔴 Critical | > 10 | Must test every build — module is highly unstable |
+| 🔴 Critical | > 10 | Must test every version — module is highly unstable |
 | 🟠 High | 6–10 | Test every sprint. Watch for side-effect regressions in adjacent modules. |
 | 🟡 Medium | 3–5 | Include in release-candidate pass. Spot-check recently changed areas. |
 | 🟢 Low | < 3 | Standard release-cycle coverage. No special urgency. |
@@ -517,51 +517,51 @@ Tab 9 shows a **machine-learning forecast** of how many bugs each module is like
 **Headline metrics (top row):**
 | Metric | What it means |
 |--------|--------------|
-| 🔴 Critical modules | Modules predicted to produce > 10 bugs next build |
+| 🔴 Critical modules | Modules predicted to produce > 10 bugs next version |
 | 🟠 High-risk modules | Modules predicted to produce 6–10 bugs |
-| Total modules forecast | All modules the model has enough history to score (≥ 20 build-module rows) |
-| Model accuracy (MAE) | Mean absolute error vs the last known build's actual count — lower is better |
+| Total modules forecast | All modules the model has enough history to score (≥ 20 version-module rows) |
+| Model accuracy (MAE) | Mean absolute error vs the last known version's actual count — lower is better |
 
 **Forecast bar chart:**
-Bar height = predicted bug count. Colour = risk level. Hover to see the current actual count (last build) alongside the prediction.
+Bar height = predicted bug count. Colour = risk level. Hover to see the current actual count (last version) alongside the prediction.
 
 **Actual vs Predicted expander:**
 Grouped bar chart comparing the model's most-recent prediction against what actually happened. Bars close to equal = accurate model; bars far apart = a surprise spike occurred (or the module's behaviour recently changed significantly).
 
 **Module forecast cards:**
 One card per Critical or High-risk module. Each card shows:
-- **Predicted bugs** — the model's next-build estimate
-- **Actual last build** — what actually happened (when available)
+- **Predicted bugs** — the model's next-version estimate
+- **Actual last version** — what actually happened (when available)
 - **Risk level**
 - **Typical bug type** — the module's most common historical severity (e.g. "crash/Critical (S1)", "Major functional (S2)"), so the team knows what *kind* of bugs to expect
-- **Why high risk** — the leading signal driving this module's score (e.g. "critical-bug momentum in last 3 builds", "sustained high volume over last 5 builds")
+- **Why high risk** — the leading signal driving this module's score (e.g. "critical-bug momentum in last 3 versions", "sustained high volume over last 5 versions")
 - **What to test** — a plain-English testing instruction matching the risk level
 
 **Leading Indicators chart:**
-Shows which current bug signals are most strongly correlated (Pearson r) with future bug counts across all modules. A red bar (positive correlation) means: when this signal is high now, more bugs tend to follow next build. A green bar (negative correlation) means: when this signal is high now, fewer bugs tend to follow. The chart is sorted by absolute correlation strength so the most reliable predictors appear first. Bars are labelled in plain English (e.g. "Critical bugs (last 3 builds)"), not raw feature variable names.
+Shows which current bug signals are most strongly correlated (Pearson r) with future bug counts across all modules. A red bar (positive correlation) means: when this signal is high now, more bugs tend to follow next version. A green bar (negative correlation) means: when this signal is high now, fewer bugs tend to follow. The chart is sorted by absolute correlation strength so the most reliable predictors appear first. Bars are labelled in plain English (e.g. "Critical bugs (last 3 versions)"), not raw feature variable names.
 
 **Files produced by `predict_defects.py` (load in Sidebar Step 4):**
 | File | Contents |
 |------|---------|
-| `predictions/ecl_parsed_predictions.csv` | Per-module: `predicted` (next build count), `target` (last-build actual), `risk_level`, `dominant_bug_type`, `leading_signal` |
+| `predictions/ecl_parsed_predictions.csv` | Per-module: `predicted` (next version count), `target` (last-version actual), `risk_level`, `dominant_bug_type`, `leading_signal` |
 | `predictions/ecl_parsed_predictions_by_cluster.csv` | *(optional, v3.0)* Per-module, per-theme: `cluster_id`, `cluster_label`, `historical_pct`, `predicted_count`. Enables per-theme breakdown in forecast cards. |
 | `predictions/ecl_parsed_predictions_focus_summary.txt` | Plain-English paragraph per top-risk module: what to test, which signal is driving risk, what bug type to expect. Per-theme breakdowns included when cluster data is present. |
-| `predictions/ecl_parsed_predictions_leading_indicators.csv` | Pearson correlation of each lag feature vs future bug count — identifies which current signals best predict next build |
+| `predictions/ecl_parsed_predictions_leading_indicators.csv` | Pearson correlation of each lag feature vs future bug count — identifies which current signals best predict next version |
 | `predictions/ecl_parsed_predictions_importance.csv` | Gradient Boosting internal feature importance ranking |
 
 **Example focus summary output:**
 ```
 📍 Export  →  predicted 14 bugs  [Critical]
    Bug type to expect : crash/Critical (S1)
-   Leading signal     : critical-bug momentum (last 3 builds)
-   Testing advice     : Mandatory — add to test suite for every build.
+   Leading signal     : critical-bug momentum (last 3 versions)
+   Testing advice     : Mandatory — add to test suite for every version.
                         Focus on crash scenarios, data loss, and any
                         recently changed functionality.
 ```
 
 **Data requirements:**
 - `Build#` must be numeric integers, not version strings. Non-numeric values are dropped automatically (the count is logged at startup).
-- At least 20 build-module data points are needed to train the model (approximately 5+ builds per module). If there is insufficient history the script exits with a clear message — run predictions again after more builds have been captured.
+- At least 20 version-module data points are needed to train the model (approximately 5+ versions per module). If there is insufficient history the script exits with a clear message — run predictions again after more versions have been captured.
 - Modules with very few historical bugs receive less reliable forecasts. The `dominant_bug_type` and `leading_signal` columns will show "mixed" when history is too sparse for confident attribution.
 
 ### Step 4.6 — Enable Auto-Start on Login
@@ -690,15 +690,15 @@ Uses TF-IDF + K-Means globally (25 clusters) and DBSCAN per-module on the 5 busi
 
 **New v3.0 output columns explained:**
 
-`cluster_velocity_ratio` — ratio of bug count in the most recent 3 builds vs the prior 3 builds per cluster. Above 1.5 = theme accelerating, prioritise in testing. Below 0.67 = theme declining, fixes may be holding.
+`cluster_velocity_ratio` — ratio of bug count in the most recent 3 versions vs the prior 3 versions per cluster. Above 1.5 = theme accelerating, prioritise in testing. Below 0.67 = theme declining, fixes may be holding.
 
 `cluster_trend` — `"growing"` / `"stable"` / `"declining"`. Sort the summary by `cluster_trend == "growing"` before the weekly team meeting.
 
-`recurrence_rate` — fraction of recent bugs in the cluster whose source module also appeared in the same cluster during the prior build window. Above 0.5 = root cause not fixed — escalate to RD.
+`recurrence_rate` — fraction of recent bugs in the cluster whose source module also appeared in the same cluster during the prior version window. Above 0.5 = root cause not fixed — escalate to RD.
 
 `cluster_entropy` (per module) — Shannon entropy of a module's cluster distribution. Below 1.0 = all bugs in one theme (easy to target). Above 2.0 = bugs everywhere (needs comprehensive coverage).
 
-### Step 6.2 — Predict Next Build's Defects
+### Step 6.2 — Predict Next Version's Defects
 
 ```bash
 # Without cluster features (same as v2.2):
@@ -715,24 +715,24 @@ python scripts/predict_defects.py data/ecl_parsed.csv \
     --provider ollama --model qwen3:7b
 ```
 
-Trains a Gradient Boosting model on historical build-module bug counts and forecasts how many bugs each module will produce in the **next build**. `--cluster-csv` is auto-detected from the default path if present — no flag needed after an initial run.
+Trains a Gradient Boosting model on historical version-module bug counts and forecasts how many bugs each module will produce in the **next version**. `--cluster-csv` is auto-detected from the default path if present — no flag needed after an initial run.
 
 **Requirements:**
 - `Build#` must be numeric integers. Version strings (e.g. "16.3.5") are dropped automatically; the count dropped is printed at startup.
-- At least 20 build-module data points are needed (≈5+ builds per module with bugs).
+- At least 20 version-module data points are needed (≈5+ versions per module with bugs).
 
 **Features used by the model:**
 | Feature | Plain-English meaning |
 |---------|-----------------------|
-| `bugs_lag1` | Bug count in the most recent build |
-| `bugs_lag3` | Bug count averaged over the last 3 builds |
-| `bugs_lag5` | Bug count averaged over the last 5 builds |
-| `crit_lag3` | Critical bug count over the last 3 builds |
-| `trend_3` | Rate of change (slope) over the last 3 builds |
-| `sev_weighted_lag3` | Severity-weighted bug total over the last 3 builds |
+| `bugs_lag1` | Bug count in the most recent version |
+| `bugs_lag3` | Bug count averaged over the last 3 versions |
+| `bugs_lag5` | Bug count averaged over the last 5 versions |
+| `crit_lag3` | Critical bug count over the last 3 versions |
+| `trend_3` | Rate of change (slope) over the last 3 versions |
+| `sev_weighted_lag3` | Severity-weighted bug total over the last 3 versions |
 | `severity_escalation` | *(v3.0)* Mean severity in last version minus mean in prior 3 versions. Negative = worsening toward S1. |
 | `builds_since_last_crit` | *(v3.0)* Versions elapsed since the last S1 bug. Used as a model feature only — the dashboard section that surfaced this as an alert was removed in v3.2. |
-| `cluster_entropy_3/_5` | *(v3.0)* Bug-theme diversity over 3/5 builds. Rising entropy = new *kinds* of failures, not just more of the same. |
+| `cluster_entropy_3/_5` | *(v3.0)* Bug-theme diversity over 3/5 versions. Rising entropy = new *kinds* of failures, not just more of the same. |
 | `top_cluster_velocity` | *(v3.0)* Growth rate of the dominant bug theme. Early-warning for theme-specific regressions. |
 
 **Output files (load in Dashboard Sidebar Step 4):**
@@ -749,8 +749,8 @@ Trains a Gradient Boosting model on historical build-module bug counts and forec
 ```
 📍 Export  →  predicted 14 bugs  [Critical]
    Bug type to expect : crash/Critical (S1)
-   Leading signal     : critical-bug momentum (last 3 builds)
-   Testing advice     : Mandatory — add to test suite for every build.
+   Leading signal     : critical-bug momentum (last 3 versions)
+   Testing advice     : Mandatory — add to test suite for every version.
                         Focus on crash scenarios, data loss, and any
                         recently changed functionality.
 ```
@@ -826,7 +826,7 @@ Results are published to Allure automatically. Each test shows:
 | Monday | Review dashboard for new hotspots (Tabs 1, 6, 7) | 15 min |
 | Wednesday | Review Allure report, update failing tests | 1 hr |
 | Friday | Re-run clustering + predictions, check Tab 8 and Tab 9 for new patterns | 15 min |
-| Friday | Review `_focus_summary.txt` with team — confirm next build test focus | 10 min |
+| Friday | Review `_focus_summary.txt` with team — confirm next version test focus | 10 min |
 
 ### Monthly Cadence
 
@@ -936,7 +936,7 @@ All v3.0 changes are strictly additive. Every command from v2.6 continues to wor
 | Parse rate below 90% | Non-standard Short Description format | Check `*_pending.json` files; confirm suggestions |
 | 1000+ uncategorized modules | Old parser without auto-strip | Replace with v2.3+, delete `module_mappings/versions/*_pending.json`, re-run |
 | `predict_defects.py` drops many rows | `Build#` contains version strings not plain integers | Expected — script logs the count. Use numeric build numbers for better accuracy. |
-| `predict_defects.py` "Not enough data" | Fewer than 20 build-module data points | Need at least ~5 builds per module. Run predictions after more build history is available. |
+| `predict_defects.py` "Not enough data" | Fewer than 20 version-module data points | Need at least ~5 versions per module. Run predictions after more version history is available. |
 | `cluster_bugs.py` not enough terms | Module has very few unique bug descriptions | Expected — script handles gracefully, produces "Unclustered" label |
 | Ollama timeout errors | Model too large for available RAM | Switch to `phi3` or use `--provider heuristic` |
 | Scorer stops mid-run | Timeout / crash | Re-run same command — resume support skips already-scored modules automatically |

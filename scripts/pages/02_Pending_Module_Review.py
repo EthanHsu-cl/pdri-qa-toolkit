@@ -171,7 +171,7 @@ Each row in the table represents one unconfirmed fuzzy match:
 
 ### When to Run This
 
-- **After every new ECL export** parsed by `parse_ecl_export.py`. New builds frequently introduce new or misspelled module names.
+- **After every new ECL export** parsed by `parse_ecl_export.py`. New versions frequently introduce new or misspelled module names.
 - **Before running risk scoring** — accurate module names are required for correct I×P×D aggregation.
 - Aim to clear the pending list to zero before each release review so risk scores are based on fully normalised data.
 """)

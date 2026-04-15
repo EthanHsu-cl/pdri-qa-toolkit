@@ -1,7 +1,28 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python3 -c ':*)"
+      "Bash(python3 -c ':*)",
+      "Bash(curl -s -X POST http://localhost:11434/api/generate -H 'Content-Type: application/json' -d '{\"model\":\"gemma4\",\"prompt\":\"Label: test\",\"stream\":false,\"options\":{\"temperature\":0.2,\"num_predict\":10}}')",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(d.get\\('response',''\\)[:100]\\)\")",
+      "Bash(bash -n /Users/ethanhsuqa2/pdri-qa-toolkit/refresh_pipeline.sh)",
+      "Bash(bash refresh_pipeline.sh --dry-run --force-relabel --products pdri)",
+      "Bash(ls -t /Users/ethanhsuqa2/pdri-qa-toolkit/logs/*.log)",
+      "Bash(.venv/bin/python -c ':*)",
+      "Bash(.venv/bin/python -)",
+      "Bash(.venv/bin/python -c \"import ast; ast.parse\\(open\\('scripts/predict_defects.py'\\).read\\(\\)\\); ast.parse\\(open\\('scripts/cluster_bugs.py'\\).read\\(\\)\\); ast.parse\\(open\\('scripts/bug_heatmap_dashboard.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(wc -l data/products/pdri/ecl_parsed.csv data/products/pdri/risk_register_scored_all.csv data/products/pdri/clusters/*.csv)",
+      "Bash(.venv/bin/python scripts/predict_defects.py /tmp/predict_test/ecl_parsed.csv --provider none)",
+      "Bash(curl -s http://localhost:11434/api/tags)",
+      "Bash(.venv/bin/python scripts/predict_defects.py /tmp/predict_test/ecl_parsed.csv --provider ollama --model gemma4)",
+      "Bash(grep -E \"\\\\.\\(json|yaml|py\\)$\")",
+      "Bash(grep -r \"st\\\\.data_editor\\\\|st\\\\.dataframe\" /Users/ethanhsuqa2/pdri-qa-toolkit/scripts/pages/*.py)",
+      "Bash(grep -l \"Import\\\\|Export\\\\|Decor\\\\|Demo\\\\|Tint\\\\|Hint\" /Users/ethanhsuqa2/pdri-qa-toolkit/data/products/pdri/module_mappings/versions/*_pending.json)",
+      "Bash(grep -r \"Fx effect\\\\|Text\\\\\\\\\\\\\\\\Animation\\\\|Cutout.*Fx\\\\|Produce.*16\\\\|Decor\\\\|AI Sticker\\\\|Mixtape\\\\|Hint\\\\|Filter/Transition\\\\|Settings Transition\" /Users/ethanhsuqa2/pdri-qa-toolkit/data/products/pdri/module_mappings/versions/*_pending.json)",
+      "Bash(xargs ls:*)",
+      "Bash(grep -r \"copy\" /Users/ethanhsuqa2/pdri-qa-toolkit/scripts/pages/*.py)"
+    ],
+    "additionalDirectories": [
+      "/tmp"
     ]
   }
 }

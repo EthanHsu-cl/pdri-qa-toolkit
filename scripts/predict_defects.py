@@ -55,6 +55,16 @@ from sklearn.metrics.pairwise import cosine_distances
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
 warnings.filterwarnings("ignore")
 
+try:
+    from parse_ecl_export import (
+        FIXED_BUG_INITIAL, FIXED_BUG_FLOOR, FIXED_BUG_DECAY_SPAN,
+    )
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from parse_ecl_export import (
+        FIXED_BUG_INITIAL, FIXED_BUG_FLOOR, FIXED_BUG_DECAY_SPAN,
+    )
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
@@ -67,7 +77,7 @@ PREDICTION_GUIDE = """
 ║  WHAT THIS TOOL PREDICTS                                                    ║
 ║  ───────────────────────                                                    ║
 ║  For each module, the model predicts:                                       ║
-║   1. A risk level (Low / Medium / High / Critical) for the NEXT build.     ║
+║   1. A risk level (Low / Medium / High / Critical) for the NEXT version.   ║
 ║   2. WHAT TYPES of bugs are expected (by QA category).                     ║
 ║   3. CONCRETE BUG SCENARIOS — specific, testable predictions like real     ║
 ║      bug titles, grounded in recurring historical patterns.                 ║
@@ -96,29 +106,52 @@ SCENARIO_TOP_MODULES    = 10
 SCENARIOS_PER_MODULE    = 5
 SCENARIO_HISTORY_BUILDS = 5
 
+# Quadrant-aware scenario selection — keeps "What to Test" aligned with the
+# FMEA heatmap. Any P1 module with enough data is always included, regardless
+# of its ML priority_score rank, up to SCENARIO_HARD_CAP.
+SCENARIO_HARD_CAP = 20
+SCENARIO_FORCE_P1 = True
+SCENARIO_FORCE_P2 = True
+QUADRANT_BONUS = {
+    "P1": 1.00,
+    "P2": 0.60,
+    "P3": 0.20,
+    "P4": 0.00,
+}
+
+# Stability signal thresholds — a module is "stable_mature" only when it has
+# enough history, has been quiet of recent S1s for a while, AND has no recent
+# bug volume. Lets the classifier tell silent P1 cores apart from unknowns.
+STABLE_HISTORY_MIN = 10  # builds of module history required
+STABLE_CRIT_GAP    = 8   # builds since last S1 required
+
 _FEATURE_LABELS = {
-    "crit_1":  "critical-bug momentum (last build)",
-    "crit_2":  "critical-bug momentum (last 2 builds)",
-    "crit_3":  "critical-bug momentum (last 3 builds)",
-    "bugs_1":  "recent bug-count momentum (last build)",
-    "bugs_2":  "recent bug-count momentum (last 2 builds)",
-    "bugs_3":  "recent bug-count momentum (last 3 builds)",
-    "sev_1":   "severity-weighted momentum (last build)",
-    "sev_2":   "severity-weighted momentum (last 2 builds)",
-    "sev_3":   "severity-weighted momentum (last 3 builds)",
+    "crit_1":  "critical-bug momentum (last version)",
+    "crit_2":  "critical-bug momentum (last 2 versions)",
+    "crit_3":  "critical-bug momentum (last 3 versions)",
+    "bugs_1":  "recent bug-count momentum (last version)",
+    "bugs_2":  "recent bug-count momentum (last 2 versions)",
+    "bugs_3":  "recent bug-count momentum (last 3 versions)",
+    "sev_1":   "severity-weighted momentum (last version)",
+    "sev_2":   "severity-weighted momentum (last 2 versions)",
+    "sev_3":   "severity-weighted momentum (last 3 versions)",
     "trend":   "upward bug-count trend",
     # Change 11 — new features
     "severity_escalation":     "severity escalation (negative = worsening toward S1)",
-    "builds_since_last_crit":  "builds elapsed since last critical bug",
+    "builds_since_last_crit":  "versions elapsed since last critical bug",
     # Change 12 — cluster features
-    "cluster_entropy_2":       "bug-theme diversity index (last 2 builds)",
-    "cluster_entropy_3":       "bug-theme diversity index (last 3 builds)",
+    "cluster_entropy_2":       "bug-theme diversity index (last 2 versions)",
+    "cluster_entropy_3":       "bug-theme diversity index (last 3 versions)",
     "top_cluster_velocity":    "fastest-growing bug theme velocity",
     # Change 19 — new features
     "crit_ratio":             "proportion of critical bugs (S1 / total)",
-    "new_module":             "new module (first appeared in recent builds)",
+    "new_module":             "new module (first appeared in recent versions)",
     "cross_module_spike":     "correlated spike — related modules also spiking",
     "total_historical_bugs":  "total historical bug count (module maturity)",
+    # Impact-aware features — make the classifier FMEA-aware
+    "stable_mature":          "mature & quiet (stable core modules)",
+    "impact_bug_ratio":       "impact per unit of recent activity",
+    "impact_weighted_spike":  "cross-module spike weighted by FMEA impact",
     # existing optional features
     "repro_rate":             "high reproduce rate (consistently reproducible bugs)",
     "impact_score":           "domain impact score (I×P×D scorer)",
@@ -128,12 +161,12 @@ _FEATURE_LABELS = {
 }
 
 # Cluster feature columns — excluded from per-module leading_signal search
-# because they are more structural signals than per-build time-series signals.
+# because they are more structural signals than per-version time-series signals.
 _CLUSTER_FEATURE_COLS = {"cluster_entropy_2", "cluster_entropy_3", "top_cluster_velocity"}
 
 _RISK_ADVICE = {
-    "Critical": "Mandatory — add to test suite for every build. Focus on crash and data-loss scenarios.",
-    "High":     "Priority — run core functional tests every build and watch for regressions.",
+    "Critical": "Mandatory — add to test suite for every version. Focus on crash and data-loss scenarios.",
+    "High":     "Priority — run core functional tests every version and watch for regressions.",
     "Medium":   "Standard — include in sprint regression pass.",
     "Low":      "Monitor — include in release-candidate pass.",
 }
@@ -248,6 +281,116 @@ def load_risk_features(scored_csv: str) -> "pd.DataFrame | None":
     return out
 
 
+def load_risk_metadata(scored_csv: str) -> "pd.DataFrame | None":
+    """Load per-module metadata (quadrant label, regression rate, open count)
+    for use in priority_score blending and the scenario explanation column.
+    Kept separate from `load_risk_features` because these columns include
+    non-numeric fields that must NOT flow into the regression feature matrix.
+    """
+    try:
+        rdf = pd.read_csv(scored_csv)
+    except Exception:
+        return None
+    mod_col = ("parsed_module" if "parsed_module" in rdf.columns
+               else "module" if "module" in rdf.columns else None)
+    if mod_col is None:
+        return None
+    meta_cols = [c for c in [
+        "quadrant", "regression_rate", "open_count",
+        "total_bugs", "critical_count",
+    ] if c in rdf.columns]
+    if not meta_cols:
+        return None
+    out = rdf[[mod_col] + meta_cols].copy()
+    out = out.rename(columns={mod_col: "module"})
+    out = out.drop_duplicates(subset=["module"]).set_index("module")
+    return out
+
+
+def load_module_cluster_velocity(cluster_csv: str,
+                                  inp_dir: Path) -> "pd.DataFrame | None":
+    """Compute per-module max cluster velocity from the cluster pipeline outputs.
+
+    Joins cluster assignment (module, cluster_id from `*_clustered.csv`) with
+    cluster velocity (`cluster_id → cluster_velocity_ratio` from
+    `*_cluster_summary.csv`) to produce a DataFrame indexed by module with the
+    module's hottest-cluster velocity. Rows where every joined cluster has an
+    undefined velocity (insufficient history) stay NaN rather than being
+    silently coerced to 1.0.
+    """
+    try:
+        cdf = pd.read_csv(cluster_csv)
+    except Exception as e:
+        print(f"  WARNING: could not load cluster CSV ({e}) — skipping module velocity.")
+        return None
+
+    mod_col = ("parsed_module" if "parsed_module" in cdf.columns
+               else "module" if "module" in cdf.columns else None)
+    if mod_col is None or "cluster_id" not in cdf.columns:
+        return None
+
+    # Find summary file alongside the clustered CSV
+    stem = Path(cluster_csv).stem  # e.g. ecl_parsed_clustered
+    summary_candidates = [
+        Path(cluster_csv).parent / (stem.replace("_clustered", "_cluster_summary") + ".csv"),
+        inp_dir / "clusters" / (stem.replace("_clustered", "_cluster_summary") + ".csv"),
+        inp_dir / "ecl_parsed_cluster_summary.csv",
+    ]
+    summary_path = next((p for p in summary_candidates if p.exists()), None)
+    if summary_path is None:
+        print("  NOTE: cluster summary CSV not found — module velocity unavailable.")
+        return None
+
+    try:
+        sdf = pd.read_csv(summary_path)
+    except Exception as e:
+        print(f"  WARNING: could not load cluster summary ({e}).")
+        return None
+
+    if "cluster_velocity_ratio" not in sdf.columns or "cluster_id" not in sdf.columns:
+        return None
+
+    mapping = cdf[[mod_col, "cluster_id"]].dropna()
+    mapping = mapping[mapping["cluster_id"] != -1]
+    mapping["cluster_id"] = pd.to_numeric(mapping["cluster_id"], errors="coerce")
+    sdf["cluster_id"] = pd.to_numeric(sdf["cluster_id"], errors="coerce")
+    sdf["cluster_velocity_ratio"] = pd.to_numeric(sdf["cluster_velocity_ratio"], errors="coerce")
+
+    merged = mapping.merge(sdf[["cluster_id", "cluster_velocity_ratio"]],
+                            on="cluster_id", how="left")
+    # Per module take the max velocity across its clusters (skipping NaN).
+    # If every cluster is NaN the result is NaN, which is what we want.
+    grouped = merged.groupby(mod_col)["cluster_velocity_ratio"].max(numeric_only=True)
+    out = grouped.to_frame("module_cluster_velocity")
+    out.index.name = "module"
+    print(f"  Loaded module cluster velocity for {out['module_cluster_velocity'].notna().sum()}"
+          f" / {len(out)} modules")
+    return out
+
+
+def ollama_is_reachable(timeout: float = 2.0) -> bool:
+    """Ping Ollama's /api/tags endpoint. Returns True if reachable.
+
+    Used to decide whether to attempt AI scenario generation or fall back to
+    the heuristic path. Cached via module-level flag so we only hit the network
+    once per run.
+    """
+    global _OLLAMA_REACHABLE
+    if _OLLAMA_REACHABLE is not None:
+        return _OLLAMA_REACHABLE
+    try:
+        req = urllib.request.Request(f"{OLLAMA_BASE}/api/tags",
+                                      headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            _OLLAMA_REACHABLE = resp.status == 200
+    except Exception:
+        _OLLAMA_REACHABLE = False
+    return _OLLAMA_REACHABLE
+
+
+_OLLAMA_REACHABLE: "bool | None" = None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TF-IDF text features  (updated v6.0 — rolling version window)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -338,11 +481,11 @@ def load_cluster_features(cluster_csv: str,
                            mod_col: str = "parsed_module") -> "pd.DataFrame | None":
     """
     Read the clustered bug CSV produced by cluster_bugs.py and build per-module
-    per-build cluster-derived features:
+    per-version cluster-derived features:
 
-      cluster_entropy_2   Shannon entropy of bug-theme distribution, last 2 builds
-      cluster_entropy_3   Shannon entropy of bug-theme distribution, last 3 builds
-      top_cluster_velocity  Growth ratio of the dominant theme over last 3 builds
+      cluster_entropy_2   Shannon entropy of bug-theme distribution, last 2 versions
+      cluster_entropy_3   Shannon entropy of bug-theme distribution, last 3 versions
+      top_cluster_velocity  Growth ratio of the dominant theme over last 3 versions
 
     Returns a DataFrame keyed on (module, build) for merging into fdf,
     or None if the cluster CSV cannot be used.
@@ -400,7 +543,7 @@ def load_cluster_features(cluster_csv: str,
                         float(-np.sum(probs * np.log2(probs + 1e-12))), 3
                     )
 
-            # Velocity of the dominant cluster: recent 3 builds vs prior 3
+            # Velocity of the dominant cluster: recent 3 versions vs prior 3
             if idx >= 6:
                 recent_b = builds_sorted[idx - 3:idx]
                 prior_b  = builds_sorted[idx - 6:idx - 3]
@@ -445,89 +588,144 @@ def build_features(df, build_col="Build#", mod_col="parsed_module",
         print(f"  WARNING: {non_numeric}/{total_before} rows dropped — "
               f"'{build_col}' could not be parsed as numbers.")
 
-    # Apply status weighting if available:
-    #   1.0 = open/active  → full contribution
-    #   0.5 = closed/fixed → real bug but resolved; counts at half weight
-    #   0.0 = invalid (NAB, Won't Fix, etc.) → excluded entirely
+    # Status: drop invalid entirely; keep open + closed for per-target-build
+    # time-decay below. status_weight == 0.5 marks a closed bug whose weight
+    # decays linearly from FIXED_BUG_INITIAL down to FIXED_BUG_FLOOR over
+    # FIXED_BUG_DECAY_SPAN builds since close, so old fixed bugs fade without
+    # fully vanishing from the history.
     if "status_weight" in df.columns:
         df["status_weight"] = pd.to_numeric(df["status_weight"], errors="coerce").fillna(1.0)
-        invalid_count = (df["status_weight"] == 0.0).sum()
-        closed_count  = (df["status_weight"] == 0.5).sum()
+        invalid_count = int((df["status_weight"] == 0.0).sum())
+        closed_count  = int((df["status_weight"] == 0.5).sum())
         df = df[df["status_weight"] > 0].copy()
-        print(f"  Status weighting: {invalid_count} invalid bugs excluded, "
-              f"{closed_count} closed bugs weighted at 0.5")
-        df["_bug_weight"] = df["status_weight"]
-        df["severity_weight"] = df["severity_weight"] * df["status_weight"]
-        df["_crit_w"] = (df["severity_num"] == 1).astype(float) * df["status_weight"]
-        df["_major_w"] = (df["severity_num"] == 2).astype(float) * df["status_weight"]
+        df["_is_closed"] = (df["status_weight"] == 0.5).values
+        print(f"  Status weighting: {invalid_count} invalid bugs excluded; "
+              f"{closed_count} closed bugs time-decayed "
+              f"(initial={FIXED_BUG_INITIAL}, floor={FIXED_BUG_FLOOR}, "
+              f"span={FIXED_BUG_DECAY_SPAN} builds).")
     else:
-        df["_bug_weight"] = 1.0
-        df["_crit_w"] = (df["severity_num"] == 1).astype(float)
-        df["_major_w"] = (df["severity_num"] == 2).astype(float)
+        df["_is_closed"] = False
 
-    # Aggregate per (module, build) — added avg_sev for severity_escalation
-    agg = df.groupby([mod_col, build_col]).agg(
-        bug_count=("_bug_weight", "sum"),
-        sev_w=("severity_weight", "sum"),
-        crit=("_crit_w", "sum"),
-        major=("_major_w", "sum"),
-        avg_sev=("severity_num", "mean"),    # NEW v3.0
-    ).reset_index()
+    # Close-build column for time-decay; absence falls back to flat weight.
+    close_col = next(
+        (c for c in df.columns if c.lower().strip() in ("close build#", "close build")),
+        None,
+    )
+    if close_col:
+        df["_close_build_num"] = pd.to_numeric(df[close_col], errors="coerce")
+    else:
+        df["_close_build_num"] = np.nan
+        if df["_is_closed"].any():
+            print(f"  NOTE: 'Close Build#' column missing — closed bugs use flat "
+                  f"{FIXED_BUG_INITIAL}x weight (no decay).")
 
-    if "repro_rate" in df.columns:
-        repro = df.groupby([mod_col, build_col])["repro_rate"].mean().reset_index()
-        agg = agg.merge(repro, on=[mod_col, build_col], how="left")
-    agg = agg.sort_values([mod_col, build_col])
+    if "severity_num" not in df.columns:
+        df["severity_num"] = 3
+    df["severity_num"] = pd.to_numeric(df["severity_num"], errors="coerce").fillna(3)
+    if "severity_weight" not in df.columns:
+        df["severity_weight"] = 1.0
+    df["severity_weight"] = pd.to_numeric(df["severity_weight"], errors="coerce").fillna(1.0)
+
+    total_distinct_builds = int(df[build_col].nunique())
 
     rows = []
-    for mod in agg[mod_col].unique():
-        md = agg[agg[mod_col] == mod].sort_values(build_col).reset_index(drop=True)
-        for i in range(5, len(md)):
-            r = {"module": mod,
-                 "build": md.loc[i, build_col],
-                 "target": md.loc[i, "bug_count"]}
+    for mod, mdf in df.groupby(mod_col):
+        mdf = mdf.sort_values(build_col).reset_index(drop=True)
+        module_builds = np.sort(mdf[build_col].unique())
+        if len(module_builds) < 6:
+            continue
 
-            # Existing lag windows
+        bug_build    = mdf[build_col].values.astype(float)
+        bug_close    = mdf["_close_build_num"].values.astype(float)
+        bug_isclosed = mdf["_is_closed"].values.astype(bool)
+        bug_sev_num  = mdf["severity_num"].values.astype(float)
+        bug_sev_w    = mdf["severity_weight"].values.astype(float)
+        bug_crit     = (bug_sev_num == 1).astype(float)
+        bug_major    = (bug_sev_num == 2).astype(float)
+
+        def weights_at(V: float) -> np.ndarray:
+            w = np.ones(len(mdf), dtype=float)
+            if not bug_isclosed.any():
+                return w
+            known = bug_isclosed & np.isfinite(bug_close) & (bug_close <= V)
+            if known.any():
+                age = V - bug_close[known]
+                span = max(1, FIXED_BUG_DECAY_SPAN)
+                dec = FIXED_BUG_INITIAL - (FIXED_BUG_INITIAL - FIXED_BUG_FLOOR) * (age / span)
+                w[known] = np.maximum(dec, FIXED_BUG_FLOOR)
+            fallback = bug_isclosed & ~np.isfinite(bug_close)
+            w[fallback] = FIXED_BUG_INITIAL
+            return w
+
+        def per_build_sum(mask_by_bug: np.ndarray, w: np.ndarray, build: float) -> float:
+            m = mask_by_bug & (bug_build == build)
+            return float(w[m].sum())
+
+        for i in range(5, len(module_builds)):
+            V = float(module_builds[i])
+            w = weights_at(V)
+
+            target_mask = (bug_build == V)
+            target_val  = float(w[target_mask].sum())
+
+            r = {"module": mod, "build": int(V), "target": target_val}
+
             for lag in [1, 2, 3]:
-                w = md.loc[max(0, i - lag):i - 1]
-                r[f"bugs_{lag}"] = w["bug_count"].sum()
-                r[f"sev_{lag}"]  = w["sev_w"].sum()
-                r[f"crit_{lag}"] = w["crit"].sum()
-            l3 = md.loc[max(0, i - 3):i - 1, "bug_count"].values
-            r["trend"] = l3[-1] - l3[0] if len(l3) >= 2 else 0
+                prev_builds = module_builds[max(0, i - lag):i]
+                lag_mask = np.isin(bug_build, prev_builds)
+                r[f"bugs_{lag}"] = float(w[lag_mask].sum())
+                r[f"sev_{lag}"]  = float((w[lag_mask] * bug_sev_w[lag_mask]).sum())
+                r[f"crit_{lag}"] = float((w[lag_mask] * bug_crit[lag_mask]).sum())
 
-            # Change 11 — severity_escalation
-            # Mean severity in the last build vs the mean in the 3 builds before that.
-            # Negative = severity is worsening (moving toward S1).
-            sv_last  = md.loc[i - 1, "avg_sev"] if i >= 1 else 3.0
-            sv_prior_slice = md.loc[max(0, i - 4):i - 2, "avg_sev"]
-            sv_prior = float(sv_prior_slice.mean()) if len(sv_prior_slice) > 0 else float(sv_last)
+            three_prev = module_builds[max(0, i - 3):i]
+            per_build_counts = [per_build_sum(np.ones_like(bug_build, dtype=bool), w, float(b))
+                                for b in three_prev]
+            r["trend"] = (per_build_counts[-1] - per_build_counts[0]) if len(per_build_counts) >= 2 else 0
+
+            # avg_sev (unweighted) at last active build vs the three before that
+            last_mask = (bug_build == float(module_builds[i - 1]))
+            sv_last = float(bug_sev_num[last_mask].mean()) if last_mask.any() else 3.0
+            prior_builds = module_builds[max(0, i - 4):i - 1]
+            prior_mask = np.isin(bug_build, prior_builds)
+            sv_prior = float(bug_sev_num[prior_mask].mean()) if prior_mask.any() else sv_last
             r["severity_escalation"] = round(float(sv_last - sv_prior), 3)
 
-            # Change 11 — builds_since_last_crit
-            crit_hist = md.loc[:i - 1, "crit"]
-            crit_rows = crit_hist.index[crit_hist > 0].tolist()
-            r["builds_since_last_crit"] = int(i - crit_rows[-1] - 1) if crit_rows else i
+            last_crit_pos = None
+            for p in range(i - 1, -1, -1):
+                b = float(module_builds[p])
+                b_mask = (bug_build == b)
+                if float((w[b_mask] * bug_crit[b_mask]).sum()) > 0:
+                    last_crit_pos = p
+                    break
+            r["builds_since_last_crit"] = (i - last_crit_pos - 1) if last_crit_pos is not None else i
 
-            # Change 19 — crit_ratio: proportion of S1 bugs in last 3 builds
-            w3 = md.loc[max(0, i - 3):i - 1]
-            total_w3 = w3["bug_count"].sum()
-            r["crit_ratio"] = round(float(w3["crit"].sum() / max(total_w3, 1)), 3)
+            three_mask = np.isin(bug_build, module_builds[max(0, i - 3):i])
+            total_w3 = float(w[three_mask].sum())
+            crit_w3  = float((w[three_mask] * bug_crit[three_mask]).sum())
+            r["crit_ratio"] = round(float(crit_w3 / max(total_w3, 1)), 3)
 
-            # Change 19 — new_module: 1 if module first appeared in the
-            # most recent 20% of builds (i.e. a newly-added feature)
-            r["new_module"] = 1 if len(md) <= max(5, int(len(agg[build_col].unique()) * 0.2)) else 0
+            r["new_module"] = 1 if len(module_builds) <= max(5, int(total_distinct_builds * 0.2)) else 0
 
-            # Change 19 — total_historical_bugs (module maturity / size)
-            r["total_historical_bugs"] = int(md.loc[:i - 1, "bug_count"].sum())
+            # stable_mature: mature module (enough history) that has been quiet
+            # for a while (no recent S1s + no recent bugs). Lets the classifier
+            # distinguish "stable core" from "dormant unknown" — both silent,
+            # very different risk.
+            r["stable_mature"] = int(
+                i >= STABLE_HISTORY_MIN
+                and r["builds_since_last_crit"] >= STABLE_CRIT_GAP
+                and r["bugs_3"] == 0
+            )
+
+            hist_mask = (bug_build < V)
+            r["total_historical_bugs"] = int(round(float(w[hist_mask].sum())))
 
             rows.append(r)
 
     fdf = pd.DataFrame(rows)
 
-    # Change 19 — cross_module_spike: for each (module, build), compute
-    # how many OTHER modules also spiked in that build.  A "spike" is a
-    # build where bug_count > module's rolling 3-build mean.
+    # Change 19 — cross_module_spike: for each (module, version), compute
+    # how many OTHER modules also spiked in that version.  A "spike" is a
+    # version where bug_count > module's rolling 3-version mean.
     if not fdf.empty:
         # Pre-compute per-module rolling mean bug count
         fdf = fdf.sort_values(["module", "build"])
@@ -536,7 +734,7 @@ def build_features(df, build_col="Build#", mod_col="parsed_module",
             .transform(lambda s: s.rolling(3, min_periods=1).mean().shift(1))
         )
         fdf["_is_spike"] = (fdf["target"] > fdf["_rolling_mean"]).astype(int)
-        # Count how many modules spiked per build (excluding self)
+        # Count how many modules spiked per version (excluding self)
         spikes_per_build = fdf.groupby("build")["_is_spike"].sum()
         fdf["cross_module_spike"] = (
             fdf["build"].map(spikes_per_build) - fdf["_is_spike"]
@@ -554,14 +752,30 @@ def build_features(df, build_col="Build#", mod_col="parsed_module",
     # Merge risk features
     if risk_features is not None and not fdf.empty:
         fdf = fdf.merge(risk_features, on="module", how="left")
+        # Conservative imputation: missing FMEA = low-risk (1), not neutral (3).
+        # Forces the classifier to treat unknown-impact modules as low-risk rather
+        # than letting pure activity signals dominate the probability output.
         for col, default in [
-            ("impact_score", 3.0), ("detectability_score", 3.0),
-            ("probability_score_auto", 3.0), ("risk_score_final", 0.0),
+            ("impact_score", 1.0), ("detectability_score", 1.0),
+            ("probability_score_auto", 1.0), ("risk_score_final", 1.0),
         ]:
             if col in fdf.columns:
                 fdf[col] = fdf[col].fillna(default)
         n_matched = fdf["impact_score"].notna().sum() if "impact_score" in fdf.columns else 0
         print(f"  Risk features merged: {n_matched}/{len(fdf)} rows have scores.")
+
+        # Impact-aware features — make the classifier FMEA-aware so P1 cores
+        # with low recent activity don't get scored below churning P4 modules.
+        if "impact_score" in fdf.columns:
+            recent = fdf["bugs_3"] if "bugs_3" in fdf.columns else 0.0
+            fdf["impact_bug_ratio"] = (
+                fdf["impact_score"] / (1.0 + np.log1p(recent))
+            ).round(3)
+            if "cross_module_spike" in fdf.columns:
+                max_imp = max(float(fdf["impact_score"].max()), 1.0)
+                fdf["impact_weighted_spike"] = (
+                    fdf["cross_module_spike"] * (fdf["impact_score"] / max_imp)
+                ).round(3)
 
     # Change 12 — merge cluster features
     if cluster_features is not None and not fdf.empty:
@@ -704,10 +918,10 @@ def train_risk_classifier(fdf: pd.DataFrame, orig_df: pd.DataFrame,
                           build_col: str = "Build#",
                           mod_col: str = "parsed_module") -> "tuple | None":
     """Train a calibrated GradientBoostingClassifier to predict probability
-    of at least one Critical (S1) bug in the NEXT build for each module.
+    of at least one Critical (S1) bug in the NEXT version for each module.
 
     The binary target is: did this module have any severity 1 (Critical) bug
-    in this build?  S2 bugs are too common (~89% of all bugs) to be a useful
+    in this version?  S2 bugs are too common (~89% of all bugs) to be a useful
     signal — S1 is rare enough (~3.6%) to produce meaningful risk separation.
 
     Returns (classifier, latest_proba) or None if not enough data.
@@ -874,7 +1088,7 @@ def predict_bug_type(latest_preds: pd.DataFrame,
                      history_builds: int = 5) -> "pd.DataFrame | None":
     """
     For each module, predict the expected count per bug theme (cluster) for
-    the next build. Strategy: scale the recent historical cluster distribution
+    the next version. Strategy: scale the recent historical cluster distribution
     by the total predicted count from train_predict().
 
     Parameters
@@ -882,7 +1096,7 @@ def predict_bug_type(latest_preds: pd.DataFrame,
     latest_preds   : DataFrame with [module, predicted] from train_predict()
     orig_df        : raw bug-level DataFrame
     cluster_csv    : path to the clustered output CSV from cluster_bugs.py
-    history_builds : number of most recent builds to use for the distribution
+    history_builds : number of most recent versions to use for the distribution
 
     Returns
     -------
@@ -983,13 +1197,13 @@ def predict_category_breakdown(latest_preds: pd.DataFrame,
     """
     Classify each recent bug into a QA category (BUG_CATEGORIES) and scale
     the distribution by the ML-model total prediction to produce expected
-    per-category counts for the next build.
+    per-category counts for the next version.
 
     Parameters
     ----------
     latest_preds   : DataFrame with [module, predicted] from train_predict()
     orig_df        : raw bug-level DataFrame with parsed_description
-    history_builds : number of most recent builds to use for the distribution
+    history_builds : number of most recent versions to use for the distribution
 
     Returns
     -------
@@ -1109,6 +1323,16 @@ def _extract_description_patterns(
             seen.add(d_stripped)
             unique_descs.append(d_stripped)
 
+    # Keep aligned bookkeeping: for each unique description, remember the
+    # original row index so we can recover severity / build info for the
+    # explanation string later.
+    row_by_desc: dict = {}
+    for idx, d in zip(recent.index.tolist(), recent[text_col].dropna().astype(str).tolist()):
+        s = d.strip()
+        if s and len(s) > 10 and s not in row_by_desc:
+            row_by_desc[s] = idx
+    desc_rows = [row_by_desc.get(d, -1) for d in unique_descs]
+
     if len(unique_descs) < 2:
         if unique_descs:
             return [{
@@ -1116,6 +1340,8 @@ def _extract_description_patterns(
                 "confidence": "low",
                 "source_count": 1,
                 "source_examples": unique_descs[0],
+                "cluster_top_terms": [],
+                "member_row_indices": [desc_rows[0]] if desc_rows else [],
             }]
         return []
 
@@ -1132,7 +1358,11 @@ def _extract_description_patterns(
             "confidence": "low",
             "source_count": 1,
             "source_examples": unique_descs[0],
+            "cluster_top_terms": [],
+            "member_row_indices": [desc_rows[0]] if desc_rows else [],
         }]
+
+    feature_names = list(vec.get_feature_names_out())
 
     # Cosine distance matrix
     dist_matrix = cosine_distances(X)
@@ -1165,6 +1395,8 @@ def _extract_description_patterns(
             "confidence": "low",
             "source_count": 1,
             "source_examples": unique_descs[0],
+            "cluster_top_terms": [],
+            "member_row_indices": [desc_rows[0]] if desc_rows else [],
         }]
 
     # Group descriptions by cluster, pick representative (closest to centroid)
@@ -1202,11 +1434,25 @@ def _extract_description_patterns(
         examples = [d for d in member_descs if d != representative][:3]
         example_str = " | ".join(examples) if examples else representative
 
+        # Cluster top terms — aggregate TF-IDF over cluster members and pick top features
+        top_terms: list = []
+        try:
+            sub_tfidf = X[member_indices].toarray().mean(axis=0)
+            if sub_tfidf.size > 0:
+                order = sub_tfidf.argsort()[::-1]
+                top_terms = [feature_names[i] for i in order[:5] if sub_tfidf[i] > 0]
+        except Exception:
+            top_terms = []
+
+        member_rows = [desc_rows[i] for i in member_indices if desc_rows[i] != -1]
+
         results.append({
             "scenario_text": representative,
             "confidence": confidence,
             "source_count": cluster_size,
             "source_examples": example_str,
+            "cluster_top_terms": top_terms,
+            "member_row_indices": member_rows,
         })
 
     return results
@@ -1235,16 +1481,16 @@ def _generate_scenarios_ai_ollama(
         cluster_block = "\nBug theme clusters: " + ", ".join(cluster_labels[:5])
 
     prompt = (
-        f"You are a QA lead predicting specific bugs for the next build.\n\n"
+        f"You are a QA lead predicting specific bugs for the next version.\n\n"
         f"Module: {module}\n"
         f"Risk level: {risk_level}\n"
         f"Strongest predictive signal: {leading_signal}"
         f"{cat_block}\n{cluster_block}\n\n"
         f"Recent bug descriptions for this module:\n{desc_block}\n\n"
-        f"Predict 3-5 specific bug scenarios likely to occur next build.\n"
+        f"Predict 3-5 specific bug scenarios likely to occur next version.\n"
         f"Each must be a concrete, testable statement like real bug titles.\n"
         f"Do NOT write vague summaries. Do NOT mention counts.\n"
-        f'Return ONLY a JSON array: [{{"scenario": "...", "confidence": "high|medium|low", "based_on": "..."}}]'
+        f'Return ONLY a JSON array: [{{"scenario": "...", "confidence": "high|medium|low", "based_on": "...", "explanation": "1-2 sentences on why this scenario is likely, grounded in the descriptions and signal above"}}]'
     )
 
     payload = json.dumps({
@@ -1252,7 +1498,7 @@ def _generate_scenarios_ai_ollama(
         "prompt": prompt,
         "stream": False,
         "format": "json",
-        "options": {"temperature": 0.3, "num_predict": 800},
+        "options": {"temperature": 0.3, "num_predict": 1100},
     }).encode()
     req = urllib.request.Request(
         f"{OLLAMA_BASE}/api/generate",
@@ -1310,21 +1556,21 @@ def _generate_scenarios_ai_claude(
         cluster_block = "\nBug theme clusters: " + ", ".join(cluster_labels[:5])
 
     prompt = (
-        f"You are a QA lead predicting specific bugs for the next build.\n\n"
+        f"You are a QA lead predicting specific bugs for the next version.\n\n"
         f"Module: {module}\n"
         f"Risk level: {risk_level}\n"
         f"Strongest predictive signal: {leading_signal}"
         f"{cat_block}\n{cluster_block}\n\n"
         f"Recent bug descriptions for this module:\n{desc_block}\n\n"
-        f"Predict 3-5 specific bug scenarios likely to occur next build.\n"
+        f"Predict 3-5 specific bug scenarios likely to occur next version.\n"
         f"Each must be a concrete, testable statement like real bug titles.\n"
         f"Do NOT write vague summaries. Do NOT mention counts.\n"
-        f'Return ONLY a JSON array: [{{"scenario": "...", "confidence": "high|medium|low", "based_on": "..."}}]'
+        f'Return ONLY a JSON array: [{{"scenario": "...", "confidence": "high|medium|low", "based_on": "...", "explanation": "1-2 sentences on why this scenario is likely, grounded in the descriptions and signal above"}}]'
     )
 
     payload = json.dumps({
         "model": "claude-sonnet-4-20250514",
-        "max_tokens": 800,
+        "max_tokens": 1200,
         "messages": [{"role": "user", "content": prompt}],
     }).encode()
     req = urllib.request.Request(
@@ -1357,6 +1603,106 @@ def _generate_scenarios_ai_claude(
     return []
 
 
+def _build_scenario_explanation(
+    *,
+    module: str,
+    mod_row: pd.Series,
+    scenario: dict,
+    orig_df: pd.DataFrame,
+    mod_col: str,
+    build_col: str,
+    scenario_type: str,
+) -> str:
+    """Produce a multi-line explanation covering four dimensions:
+    pattern evidence, module-selection rationale, cluster representation,
+    and forward-looking risk. Used to populate the `explanation` column on
+    `ecl_parsed_predictions_by_scenario.csv`."""
+
+    # ── 1. Pattern evidence ──────────────────────────────────────────────
+    member_rows = scenario.get("member_row_indices") or []
+    source_count = int(scenario.get("source_count", 0) or 0)
+    critical_hits = 0
+    most_recent_build = None
+    if member_rows and not orig_df.empty:
+        try:
+            sub = orig_df.loc[[i for i in member_rows if i in orig_df.index]]
+            if "severity_num" in sub.columns:
+                sev = pd.to_numeric(sub["severity_num"], errors="coerce")
+                critical_hits = int((sev <= 1).sum())
+            if build_col in sub.columns:
+                builds = pd.to_numeric(sub[build_col], errors="coerce").dropna()
+                if len(builds) > 0:
+                    most_recent_build = int(builds.max())
+        except Exception:
+            pass
+
+    pattern_bits = [f"{source_count or 1} similar bug(s) in this module"]
+    if critical_hits:
+        pattern_bits.append(f"{critical_hits} Critical/S1")
+    if most_recent_build is not None:
+        pattern_bits.append(f"most recent build {most_recent_build}")
+    pattern_evidence = "Pattern evidence: " + "; ".join(pattern_bits) + "."
+
+    # ── 2. Module selection rationale ────────────────────────────────────
+    rs = mod_row.get("risk_score_final")
+    quadrant = mod_row.get("heatmap_quadrant") or mod_row.get("quadrant")
+    predicted = mod_row.get("predicted")
+    leading = mod_row.get("leading_signal") or ""
+    priority = mod_row.get("priority_score")
+
+    module_bits = [f"module='{module}'"]
+    if rs is not None and pd.notna(rs):
+        module_bits.append(f"risk_score_final={float(rs):.0f}")
+    if quadrant and pd.notna(quadrant):
+        module_bits.append(f"heatmap quadrant {quadrant}")
+    if priority is not None and pd.notna(priority):
+        module_bits.append(f"blended priority={float(priority):.1f}")
+    if predicted is not None and pd.notna(predicted):
+        module_bits.append(f"predicted next build={float(predicted):.1f} bug(s)")
+    if leading:
+        module_bits.append(f"leading signal: {leading}")
+    module_selection = "Module selected: " + ", ".join(module_bits) + "."
+
+    # ── 3. Cluster representation logic ──────────────────────────────────
+    top_terms = scenario.get("cluster_top_terms") or []
+    if scenario_type == "historical_pattern":
+        cluster_repr = (
+            f"Cluster representation: chosen as centroid-closest description "
+            f"among {source_count or 1} bugs sharing theme"
+        )
+        if top_terms:
+            cluster_repr += f" (top terms: {', '.join(top_terms[:5])})."
+        else:
+            cluster_repr += "."
+    else:
+        cluster_repr = (
+            "Cluster representation: AI-synthesized from "
+            f"{source_count or 'the recent'} bug description(s)"
+        )
+        if top_terms:
+            cluster_repr += f" sharing terms ({', '.join(top_terms[:5])})."
+        else:
+            cluster_repr += "."
+
+    # ── 4. Forward-looking risk rationale ────────────────────────────────
+    reg_rate = mod_row.get("regression_rate")
+    open_count = mod_row.get("open_count")
+    vel = mod_row.get("module_cluster_velocity")
+    forward_bits = []
+    if reg_rate is not None and pd.notna(reg_rate):
+        forward_bits.append(f"regression rate {float(reg_rate) * 100:.0f}%")
+    if open_count is not None and pd.notna(open_count) and float(open_count) > 0:
+        forward_bits.append(f"{int(open_count)} related bug(s) still Open")
+    if vel is not None and pd.notna(vel):
+        tag = "growing" if float(vel) >= 1.5 else ("declining" if float(vel) <= 0.67 else "stable")
+        forward_bits.append(f"cluster velocity {float(vel):.2f}× ({tag})")
+    if not forward_bits:
+        forward_bits.append("watch recent builds for recurrence")
+    forward_risk = "Forward-looking risk: " + "; ".join(forward_bits) + "."
+
+    return "\n".join([pattern_evidence, module_selection, cluster_repr, forward_risk])
+
+
 def generate_bug_scenarios(
     preds: pd.DataFrame,
     orig_df: pd.DataFrame,
@@ -1374,12 +1720,53 @@ def generate_bug_scenarios(
     For each module: gather context, call AI or heuristic scenario generator,
     build a DataFrame of predicted bug scenarios.
     """
-    # Select top modules by risk
-    risk_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+    # Select top modules by blended priority_score if available, otherwise
+    # fall back to the legacy risk_level + predicted ordering.
     ranked = preds.copy()
-    ranked["_risk_rank"] = ranked["risk_level"].astype(str).map(risk_order).fillna(3).astype(int)
-    ranked = ranked.sort_values(["_risk_rank", "predicted"], ascending=[True, False])
-    top_modules = ranked.head(SCENARIO_TOP_MODULES)
+    if "priority_score" in ranked.columns and ranked["priority_score"].notna().any():
+        ranked = ranked.sort_values("priority_score", ascending=False)
+    else:
+        risk_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+        ranked["_risk_rank"] = ranked["risk_level"].astype(str).map(risk_order).fillna(3).astype(int)
+        ranked = ranked.sort_values(["_risk_rank", "predicted"], ascending=[True, False])
+
+    selected = ranked.head(SCENARIO_TOP_MODULES)
+
+    # Force-include every P1 (and P2) module with data, guaranteeing heatmap
+    # alignment. The forced set is unioned with the top-N by priority_score and
+    # the result is capped at SCENARIO_HARD_CAP to bound AI call cost.
+    forced_tiers: list[str] = []
+    if SCENARIO_FORCE_P1:
+        forced_tiers.append("P1")
+    if SCENARIO_FORCE_P2:
+        forced_tiers.append("P2")
+
+    if "heatmap_quadrant" in ranked.columns and forced_tiers:
+        q = (ranked["heatmap_quadrant"].astype("string").str.upper()
+             .str.extract(r"(P[1-4])")[0])
+        forced = ranked[q.isin(forced_tiers)]
+        top_modules = (
+            pd.concat([selected, forced])
+              .drop_duplicates(subset=["module"], keep="first")
+              .head(SCENARIO_HARD_CAP)
+        )
+    else:
+        top_modules = selected.head(SCENARIO_HARD_CAP)
+
+    print(f"  Scenario modules selected: {len(top_modules)} "
+          f"(top-N={SCENARIO_TOP_MODULES}, cap={SCENARIO_HARD_CAP}, "
+          f"forced={forced_tiers})")
+
+    # Resolve AI availability once per run. Ollama is only used if reachable,
+    # otherwise we cleanly fall back to heuristic + relabel.
+    ai_active = False
+    if provider == "ollama":
+        if ollama_is_reachable():
+            ai_active = True
+        else:
+            print("  NOTE: Ollama unreachable — scenarios will use historical-pattern fallback.")
+    elif provider == "claude" and api_key:
+        ai_active = True
 
     # Determine predicted build number
     if build_col in orig_df.columns:
@@ -1421,9 +1808,9 @@ def generate_bug_scenarios(
         if category_distribution:
             supporting_cats = ", ".join(list(category_distribution.keys())[:3])
 
-        # Try AI scenario generation
+        # Try AI scenario generation (only when we've confirmed AI is usable)
         scenarios = []
-        if provider == "ollama":
+        if ai_active and provider == "ollama":
             scenarios = _generate_scenarios_ai_ollama(
                 module=mod, risk_level=risk_level,
                 descriptions=descriptions,
@@ -1432,7 +1819,7 @@ def generate_bug_scenarios(
                 leading_signal=leading_signal,
                 model=model,
             )
-        elif provider == "claude" and api_key:
+        elif ai_active and provider == "claude":
             scenarios = _generate_scenarios_ai_claude(
                 module=mod, risk_level=risk_level,
                 descriptions=descriptions,
@@ -1442,23 +1829,33 @@ def generate_bug_scenarios(
                 api_key=api_key,
             )
 
-        # Fallback to heuristic if AI returned nothing or provider is "none"
+        # Heuristic results always computed — used as the fallback AND as the
+        # substrate for the explanation column on AI-synthesized scenarios.
+        heuristic = _extract_description_patterns(
+            orig_df, mod, mod_col=mod_col, text_col=text_col,
+            build_col=build_col,
+        )
+
+        # Fallback to heuristic if AI returned nothing or AI was disabled
         if not scenarios:
-            heuristic = _extract_description_patterns(
-                orig_df, mod, mod_col=mod_col, text_col=text_col,
-                build_col=build_col,
-            )
             for i, h in enumerate(heuristic):
+                explanation = _build_scenario_explanation(
+                    module=mod, mod_row=mod_row, scenario=h, orig_df=orig_df,
+                    mod_col=mod_col, build_col=build_col,
+                    scenario_type="historical_pattern",
+                )
                 all_rows.append({
                     "module": mod,
                     "risk_level": risk_level,
                     "predicted_build": predicted_build,
                     "scenario_rank": i + 1,
+                    "scenario_type": "historical_pattern",
                     "scenario_text": h["scenario_text"],
                     "confidence": h["confidence"],
                     "source_bug_examples": h["source_examples"],
                     "supporting_categories": supporting_cats,
                     "leading_signal": leading_signal,
+                    "explanation": explanation,
                 })
         else:
             for i, s in enumerate(scenarios[:SCENARIOS_PER_MODULE]):
@@ -1467,16 +1864,33 @@ def generate_bug_scenarios(
                 if confidence not in ("high", "medium", "low"):
                     confidence = "medium"
                 based_on = s.get("based_on", "")
+                # If AI returned its own explanation, prefer it; otherwise
+                # synthesize one from the nearest heuristic pattern we have.
+                ai_expl = str(s.get("explanation", "")).strip()
+                if ai_expl:
+                    explanation = ai_expl
+                else:
+                    substrate = heuristic[i] if i < len(heuristic) else {
+                        "source_count": 0, "cluster_top_terms": [],
+                        "member_row_indices": [],
+                    }
+                    explanation = _build_scenario_explanation(
+                        module=mod, mod_row=mod_row, scenario=substrate,
+                        orig_df=orig_df, mod_col=mod_col, build_col=build_col,
+                        scenario_type="ai_synthesized",
+                    )
                 all_rows.append({
                     "module": mod,
                     "risk_level": risk_level,
                     "predicted_build": predicted_build,
                     "scenario_rank": i + 1,
+                    "scenario_type": "ai_synthesized",
                     "scenario_text": scenario_text,
                     "confidence": confidence,
                     "source_bug_examples": based_on,
                     "supporting_categories": supporting_cats,
                     "leading_signal": leading_signal,
+                    "explanation": explanation,
                 })
 
     if not all_rows:
@@ -1503,7 +1917,7 @@ def generate_ai_narrative(module, predicted, risk_level, dominant_bug_type,
         for cat, pct in list(category_forecast.items())[:6]:
             lines.append(f"  • {cat} ({pct*100:.0f}% of recent bugs)")
         type_block = (
-            "\n\nExpected bug category distribution for next build "
+            "\n\nExpected bug category distribution for next version "
             f"(risk level: {risk_level}):\n" + "\n".join(lines)
         )
     elif cluster_forecast:
@@ -1511,11 +1925,11 @@ def generate_ai_narrative(module, predicted, risk_level, dominant_bug_type,
         for label, count in list(cluster_forecast.items())[:5]:
             lines.append(f"  • '{label}'")
         type_block = (
-            "\n\nExpected bug themes for next build:\n" + "\n".join(lines)
+            "\n\nExpected bug themes for next version:\n" + "\n".join(lines)
         )
 
     prompt = (
-        f"You are a QA lead writing a pre-build risk briefing for your team.\n\n"
+        f"You are a QA lead writing a pre-version risk briefing for your team.\n\n"
         f"Module: {module}\n"
         f"Risk level: {risk_level}\n"
         f"Dominant bug type historically: {dominant_bug_type}\n"
@@ -1569,7 +1983,7 @@ def generate_ai_narrative_ollama(module, predicted, risk_level, dominant_bug_typ
         for cat, pct in list(category_forecast.items())[:6]:
             lines.append(f"  • {cat} ({pct*100:.0f}% of recent bugs)")
         type_block = (
-            "\n\nExpected bug category distribution for next build "
+            "\n\nExpected bug category distribution for next version "
             f"(risk level: {risk_level}):\n" + "\n".join(lines)
         )
     elif cluster_forecast:
@@ -1577,11 +1991,11 @@ def generate_ai_narrative_ollama(module, predicted, risk_level, dominant_bug_typ
         for label, count in list(cluster_forecast.items())[:5]:
             lines.append(f"  • '{label}'")
         type_block = (
-            "\n\nExpected bug themes for next build:\n" + "\n".join(lines)
+            "\n\nExpected bug themes for next version:\n" + "\n".join(lines)
         )
 
     prompt = (
-        f"You are a QA lead writing a pre-build risk briefing for your team.\n\n"
+        f"You are a QA lead writing a pre-version risk briefing for your team.\n\n"
         f"Module: {module}\n"
         f"Risk level: {risk_level}\n"
         f"Dominant bug type historically: {dominant_bug_type}\n"
@@ -1819,14 +2233,18 @@ def main():
 
     # ── Load optional risk scores ─────────────────────────────────────────────
     risk_features = None
-    if scored_csv_path:
-        print(f"\nLoading risk scores from: {scored_csv_path}")
-        risk_features = load_risk_features(scored_csv_path)
+    risk_metadata = None
+    _scored_path = scored_csv_path
+    if _scored_path:
+        print(f"\nLoading risk scores from: {_scored_path}")
     else:
         auto_path = inp_dir / "risk_register_scored_all.csv"
         if auto_path.exists():
             print(f"\nAuto-detected risk scores: {auto_path}")
-            risk_features = load_risk_features(str(auto_path))
+            _scored_path = str(auto_path)
+    if _scored_path:
+        risk_features = load_risk_features(_scored_path)
+        risk_metadata = load_risk_metadata(_scored_path)
 
     # ── TF-IDF text features ──────────────────────────────────────────────────
     print("\nBuilding TF-IDF text features from parsed_description...")
@@ -1852,7 +2270,7 @@ def main():
     print(f"Feature matrix: {fdf.shape}")
 
     if len(fdf) < 20:
-        print("Not enough data for prediction. Need ≥5 builds per module.")
+        print("Not enough data for prediction. Need ≥5 versions per module.")
         sys.exit(0)
 
     model_obj, preds, imp, leading = train_predict(fdf, orig_df)
@@ -1877,7 +2295,7 @@ def main():
 
     # ── Change 19 — Learned risk classifier (replaces hand-tuned composite) ─
     print("\n" + "─" * 78)
-    print(" RISK CLASSIFIER (learned probability of S1 critical bug next build)")
+    print(" RISK CLASSIFIER (learned probability of S1 critical bug next version)")
     print("─" * 78)
     clf_result = train_risk_classifier(fdf, orig_df)
 
@@ -1934,6 +2352,70 @@ def main():
         risk_method = "weighted composite (fallback)"
         risk_thresholds = "Critical >75 | High 50–75 | Medium 25–50 | Low <25"
 
+    # ── Blended priority_score — aligns Forecast ranking with Heatmap/Clusters ──
+    # The Risk Heatmap sorts by risk_score_final (I×P×D). The forecast's own
+    # ML-derived risk_proba and the cluster velocity add information, but the
+    # heatmap signal must dominate so the top-N lists overlap. A structural
+    # quadrant bonus guarantees a P1 module always outscores a P4 regardless
+    # of ML/velocity signal strength.
+    # Weights: 50% heatmap, 25% quadrant tier, 15% ML, 10% velocity.
+    def _norm(series: pd.Series) -> pd.Series:
+        s = pd.to_numeric(series, errors="coerce").fillna(0.0)
+        max_v = float(s.max()) if len(s) else 0.0
+        return (s / max_v).clip(0, 1) if max_v > 0 else s * 0.0
+
+    # Merge module cluster velocity if we can find the cluster summary
+    mod_velocity = None
+    if cluster_features is not None and cluster_csv_path:
+        mod_velocity = load_module_cluster_velocity(cluster_csv_path, inp_dir)
+    elif cluster_features is not None:
+        auto_cluster = inp_dir / "clusters" / (Path(inp).stem + "_clustered.csv")
+        if auto_cluster.exists():
+            mod_velocity = load_module_cluster_velocity(str(auto_cluster), inp_dir)
+    if mod_velocity is not None and not mod_velocity.empty:
+        preds = preds.merge(mod_velocity, left_on="module", right_index=True, how="left")
+    else:
+        preds["module_cluster_velocity"] = float("nan")
+
+    # Pull heatmap_quadrant (P1–P4) from the risk register metadata if present
+    if risk_metadata is not None and "quadrant" in risk_metadata.columns:
+        preds = preds.merge(
+            risk_metadata[["quadrant"]].rename(columns={"quadrant": "heatmap_quadrant"}),
+            left_on="module", right_index=True, how="left",
+        )
+    else:
+        preds["heatmap_quadrant"] = pd.NA
+
+    # Also surface regression_rate / open_count for the explanation column
+    for extra_col in ("regression_rate", "open_count"):
+        if (risk_metadata is not None and extra_col in risk_metadata.columns
+                and extra_col not in preds.columns):
+            preds = preds.merge(
+                risk_metadata[[extra_col]],
+                left_on="module", right_index=True, how="left",
+            )
+
+    rs = pd.to_numeric(preds.get("risk_score_final", 0), errors="coerce").fillna(0.0)
+    rp = pd.to_numeric(preds.get("risk_proba", 0), errors="coerce").fillna(0.0)
+    vel = pd.to_numeric(preds.get("module_cluster_velocity", 1.0), errors="coerce")
+    # For the blend we treat NaN velocity as neutral (=1.0) and cap positive
+    # signal at 2×; undefined velocity shouldn't penalize a module.
+    vel_signal = (vel.fillna(1.0) - 1.0).clip(lower=0, upper=1.0)
+
+    q_raw = preds.get("heatmap_quadrant", pd.Series(pd.NA, index=preds.index))
+    quadrant_bonus = (
+        q_raw.astype("string").str.upper().str.extract(r"(P[1-4])")[0]
+             .map(QUADRANT_BONUS).fillna(0.0)
+    )
+
+    preds["priority_score"] = (
+        0.50 * _norm(rs) +
+        0.25 * quadrant_bonus +
+        0.15 * _norm(rp) +
+        0.10 * vel_signal
+    ) * 100
+    preds["priority_score"] = preds["priority_score"].round(2)
+
     # Log the breakdown
     rl_counts = preds["risk_level"].value_counts()
     print(f"\n  Risk scoring method: {risk_method}")
@@ -1942,16 +2424,18 @@ def main():
         print(f"    {lvl}: {rl_counts.get(lvl, 0)} module(s)")
 
     print("\n" + "─" * 78)
-    print(" PREDICTED BUG COUNT — next build estimate per module")
-    print(" target = actual bugs in most recent build | predicted = next build forecast")
+    print(" PREDICTED BUG COUNT — next version estimate per module")
+    print(" target = actual bugs in most recent version | predicted = next version forecast")
     print(f" risk scoring: {risk_method}")
     print(f" {risk_thresholds}")
     print("─" * 78)
     display_cols = ["module", "target", "predicted", "predicted_stratified",
-                    "composite_risk", "risk_level",
+                    "priority_score", "composite_risk", "risk_level",
+                    "heatmap_quadrant", "module_cluster_velocity",
                     "dominant_bug_type", "leading_signal"]
     display_cols = [c for c in display_cols if c in preds.columns]
-    preds = preds.sort_values("composite_risk", ascending=False)
+    sort_col = "priority_score" if "priority_score" in preds.columns else "composite_risk"
+    preds = preds.sort_values(sort_col, ascending=False)
     print(preds[display_cols].head(20).to_string(index=False))
 
     # ── Bug-type prediction (Change 13 — cluster-based) ──────────────────────
@@ -2060,7 +2544,8 @@ def main():
 
     imp_path     = str(out_stem) + "_predictions_importance.csv"
     leading_path = str(out_stem) + "_predictions_leading_indicators.csv"
-    imp.to_csv(imp_path, encoding="utf-8-sig")
+    imp_df = imp.rename_axis("feature").reset_index(name="importance")
+    imp_df.to_csv(imp_path, index=False, encoding="utf-8-sig")
 
     leading_df = leading.reset_index()
     leading_df.columns = ["feature", "pearson_r"]

@@ -12,7 +12,7 @@ New in v3.0:
           clusters/<stem>_cluster_summary_s34.csv
 
   - Cluster velocity: for each cluster, compares bug count in the most recent
-    VELOCITY_WINDOW builds against the prior VELOCITY_WINDOW builds.
+    VELOCITY_WINDOW versions against the prior VELOCITY_WINDOW versions.
     Exported as cluster_velocity_ratio and cluster_trend (growing/stable/declining)
     in the cluster summary CSV.
 
@@ -22,7 +22,7 @@ New in v3.0:
     Exported to clusters/<stem>_module_entropy.csv.
 
   - Cluster recurrence rate: fraction of bugs in each cluster whose source module
-    also contributed to that cluster in the prior build window. High recurrence =
+    also contributed to that cluster in the prior version window. High recurrence =
     the fix isn't holding — a strong predictor of future bugs of the same type.
     Exported as recurrence_rate in the cluster summary CSV.
 
@@ -56,7 +56,7 @@ from pathlib import Path
 
 OLLAMA_BASE            = "http://localhost:11434"
 EMBED_CHECKPOINT_EVERY = 50
-VELOCITY_WINDOW        = 2    # builds per velocity comparison window
+VELOCITY_WINDOW        = 2    # versions per velocity comparison window
 MIN_BUGS_STRATIFIED    = 20   # min bugs per severity tier to run a stratified cluster pass
 
 
@@ -64,12 +64,12 @@ MIN_BUGS_STRATIFIED    = 20   # min bugs per severity tier to run a stratified c
 # Input fingerprint helpers  (unchanged from v2.4)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _compute_fingerprint(df: pd.DataFrame, embed_model: str = "") -> str:
+def _compute_fingerprint(df: pd.DataFrame, embed_model: str = "", label_model: str = "") -> str:
     n = len(df)
     latest = ""
     if "Create Date" in df.columns:
         latest = str(pd.to_datetime(df["Create Date"], errors="coerce").max())
-    raw = f"{n}|{latest}|{embed_model}"
+    raw = f"{n}|{latest}|{embed_model}|{label_model}"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
@@ -205,34 +205,46 @@ def get_ollama_embeddings(
     return arr
 
 
-def _ollama_label_cluster(samples: "list[str]", model: str = "gemma4") -> str:
+def _ollama_label_cluster(samples: "list[str]", model: str = "gemma4:e2b-it-q4_K_M",
+                          retries: int = 3) -> str:
     joined = "\n".join(f"- {s}" for s in samples[:8])
-    prompt = (
-        "You are a QA analyst. Given these bug descriptions from the same cluster, "
+    user_msg = (
+        "Given these bug descriptions from the same cluster, "
         "respond with ONLY a concise 3-6 word label (no punctuation, no quotes) that "
         "best captures the common theme.\n\n"
         f"Bug descriptions:\n{joined}\n\nLabel:"
     )
+    # Use /api/chat with an explicit system role — some models (e.g. gemma4
+    # quantised variants) return empty content when no system message is present.
     payload = json.dumps({
         "model": model,
-        "prompt": prompt,
+        "messages": [
+            {"role": "system", "content": "You are a QA analyst. Always respond with a short text label."},
+            {"role": "user", "content": user_msg},
+        ],
         "stream": False,
-        "options": {"temperature": 0.2, "num_predict": 20},
+        "options": {"temperature": 0.2, "num_predict": 300},
     }).encode()
     req = urllib.request.Request(
-        f"{OLLAMA_BASE}/api/generate",
+        f"{OLLAMA_BASE}/api/chat",
         data=payload,
         headers={"Content-Type": "application/json"},
     )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            raw = json.loads(resp.read().decode()).get("response", "").strip()
-            lines = raw.splitlines()
-            label = lines[0].strip().strip('"\'') if lines else ""
-            return label if label else "unlabelled"
-    except Exception as e:
-        print(f"  [label] Ollama error: {e}", file=sys.stderr)
-        return "unlabelled"
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode())
+                raw = data.get("message", {}).get("content", "").strip()
+                lines = raw.splitlines()
+                label = lines[0].strip().strip('"\'') if lines else ""
+                if label:
+                    return label
+                if attempt < retries - 1:
+                    print(f"  [label] Empty response on attempt {attempt + 1}/{retries} — retrying …",
+                          file=sys.stderr)
+        except Exception as e:
+            print(f"  [label] Ollama error (attempt {attempt + 1}/{retries}): {e}", file=sys.stderr)
+    return "unlabelled"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -280,6 +292,7 @@ def cluster_bugs(
     texts      = df.loc[valid_idx, text_col].tolist()
     X_dense    = None
     embed_source = "tfidf"
+    new_embeds_generated = False
 
     if provider == "ollama":
         if "BugCode" in df.columns:
@@ -287,6 +300,7 @@ def cluster_bugs(
         else:
             bug_codes = [str(i) for i in valid_idx]
 
+        new_indices_count = sum(1 for c in bug_codes if str(c) not in (embed_cache or {}))
         arr = get_ollama_embeddings(
             texts, bug_codes=bug_codes, model=embed_model,
             cache=embed_cache, cache_path=cache_path, fingerprint=fingerprint,
@@ -294,6 +308,7 @@ def cluster_bugs(
         if arr is not None:
             X_dense      = normalize(arr)
             embed_source = "ollama"
+            new_embeds_generated = new_indices_count > 0
         else:
             print("  Ollama embedding failed — falling back to TF-IDF.")
 
@@ -321,6 +336,10 @@ def cluster_bugs(
 
     unique_ids = sorted(set(labels))
     clabels = {}
+    # If we just ran live embeddings (not all from cache), give Ollama a moment
+    # to unload the embedding model before switching to the chat model for labelling.
+    if embed_source == "ollama" and new_embeds_generated:
+        time.sleep(3)
     for cid in unique_ids:
         if cid == -1:
             clabels[-1] = "Noise/Unclustered"
@@ -360,8 +379,10 @@ def compute_cluster_velocity(df: pd.DataFrame,
                               cluster_col: str = "cluster_id",
                               window: int = VELOCITY_WINDOW) -> dict:
     """
-    For each cluster, compare bug count in the most recent `window` builds
-    against the prior `window` builds.
+    For each cluster, compare bug mass in the most recent `window` versions
+    against the prior `window` versions. Bug mass uses ``status_weight`` when
+    available so closed/fixed bugs contribute less than open bugs — a cluster
+    made of ancient fixes shouldn't read as "growing".
 
     Returns
     -------
@@ -378,6 +399,11 @@ def compute_cluster_velocity(df: pd.DataFrame,
     if work.empty:
         return {}
 
+    if "status_weight" in work.columns:
+        work["_w"] = pd.to_numeric(work["status_weight"], errors="coerce").fillna(1.0)
+    else:
+        work["_w"] = 1.0
+
     max_build  = work[build_col].max()
     recent_min = max_build - window + 1
     prior_min  = max_build - window * 2 + 1
@@ -385,19 +411,20 @@ def compute_cluster_velocity(df: pd.DataFrame,
     result = {}
     for cid in work[cluster_col].unique():
         cdf    = work[work[cluster_col] == cid]
-        recent = int((cdf[build_col] >= recent_min).sum())
-        prior  = int(((cdf[build_col] >= prior_min) & (cdf[build_col] < recent_min)).sum())
+        recent = float(cdf.loc[cdf[build_col] >= recent_min, "_w"].sum())
+        prior  = float(cdf.loc[(cdf[build_col] >= prior_min) & (cdf[build_col] < recent_min), "_w"].sum())
         if prior == 0:
-            ratio = float(recent) if recent > 0 else 1.0
+            ratio = float("nan")
+            trend = "insufficient_history"
         else:
             ratio = recent / prior
-        trend = ("growing"   if ratio >= 1.5 else
-                 "declining" if ratio <= 0.67 else
-                 "stable")
+            trend = ("growing"   if ratio >= 1.5 else
+                     "declining" if ratio <= 0.67 else
+                     "stable")
         result[int(cid)] = {
-            "recent_count":   recent,
-            "prior_count":    prior,
-            "velocity_ratio": round(ratio, 2),
+            "recent_count":   round(recent, 2),
+            "prior_count":    round(prior, 2),
+            "velocity_ratio": round(ratio, 2) if ratio == ratio else float("nan"),
             "trend":          trend,
         }
     return result
@@ -438,9 +465,11 @@ def compute_cluster_recurrence_rate(df: pd.DataFrame,
                                      mod_col: str = "parsed_module",
                                      window: int = VELOCITY_WINDOW) -> dict:
     """
-    For each cluster, compute the fraction of bugs in the most recent build
-    window whose source module also contributed to that cluster in the prior
-    build window. High recurrence = the fix isn't sticking.
+    For each cluster, compute the fraction of recent bug mass whose source
+    module also contributed to that cluster in the prior window. Uses
+    ``status_weight`` when available so a module whose only recent bugs are
+    closed counts less than a module with fresh open bugs — high recurrence
+    should reflect regressions that are still active, not fixed history.
 
     Returns
     -------
@@ -456,6 +485,11 @@ def compute_cluster_recurrence_rate(df: pd.DataFrame,
     if work.empty:
         return {}
 
+    if "status_weight" in work.columns:
+        work["_w"] = pd.to_numeric(work["status_weight"], errors="coerce").fillna(1.0)
+    else:
+        work["_w"] = 1.0
+
     max_build  = work[build_col].max()
     recent_min = max_build - window + 1
     prior_min  = max_build - window * 2 + 1
@@ -465,13 +499,16 @@ def compute_cluster_recurrence_rate(df: pd.DataFrame,
 
     result = {}
     for cid in work[cluster_col].unique():
-        r_mods = set(recent_df[recent_df[cluster_col] == cid][mod_col].unique())
-        p_mods = set(prior_df[prior_df[cluster_col]  == cid][mod_col].unique())
-        if not r_mods:
+        r_grp = recent_df[recent_df[cluster_col] == cid]
+        p_grp = prior_df[prior_df[cluster_col]  == cid]
+        r_mass = r_grp.groupby(mod_col)["_w"].sum()
+        p_mods = set(p_grp[mod_col].unique())
+        total = float(r_mass.sum())
+        if total <= 0:
             result[int(cid)] = 0.0
         else:
-            overlap = len(r_mods & p_mods)
-            result[int(cid)] = round(overlap / len(r_mods), 3)
+            overlap = float(r_mass.loc[r_mass.index.isin(p_mods)].sum())
+            result[int(cid)] = round(overlap / total, 3)
     return result
 
 
@@ -566,19 +603,21 @@ def summarize(df: pd.DataFrame,
           .sort_values("count", ascending=False)
           .reset_index())
 
-    # Merge velocity columns
+    # Merge velocity columns. Clusters absent from the velocity map (e.g. too
+    # few samples to compute) get NaN + "insufficient_history" so downstream
+    # code can filter them out, rather than being silently labeled "stable 1.0×".
     if velocity_map:
         cl["cluster_velocity_ratio"] = cl["cluster_id"].map(
-            lambda cid: velocity_map.get(int(cid), {}).get("velocity_ratio", 1.0))
+            lambda cid: velocity_map.get(int(cid), {}).get("velocity_ratio", float("nan")))
         cl["cluster_trend"] = cl["cluster_id"].map(
-            lambda cid: velocity_map.get(int(cid), {}).get("trend", "stable"))
+            lambda cid: velocity_map.get(int(cid), {}).get("trend", "insufficient_history"))
         cl["recent_count"] = cl["cluster_id"].map(
             lambda cid: velocity_map.get(int(cid), {}).get("recent_count", 0))
         cl["prior_count"] = cl["cluster_id"].map(
             lambda cid: velocity_map.get(int(cid), {}).get("prior_count", 0))
     else:
-        cl["cluster_velocity_ratio"] = 1.0
-        cl["cluster_trend"]          = "stable"
+        cl["cluster_velocity_ratio"] = float("nan")
+        cl["cluster_trend"]          = "insufficient_history"
         cl["recent_count"]           = 0
         cl["prior_count"]            = 0
 
@@ -602,6 +641,62 @@ def summarize(df: pd.DataFrame,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Relabel-only helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def relabel_clusters(
+    df: pd.DataFrame,
+    model: str,
+    text_col: str = "parsed_description",
+) -> pd.DataFrame:
+    """Re-run only the Ollama label step on an already-clustered DataFrame.
+
+    Cluster IDs and embeddings are left untouched — only cluster_label is updated.
+    Falls back to TF-IDF top-keywords if Ollama returns unlabelled after retries.
+    """
+    df = df.copy()
+    if "cluster_id" not in df.columns:
+        print("  relabel: no cluster_id column — nothing to relabel.", file=sys.stderr)
+        return df
+
+    unique_ids = sorted(
+        c for c in df["cluster_id"].unique() if c != -1
+    )
+    if not unique_ids:
+        print("  relabel: no non-noise clusters found.", file=sys.stderr)
+        return df
+
+    print(f"  Re-labelling {len(unique_ids)} clusters using model={model} …", file=sys.stderr)
+    for cid in unique_ids:
+        mask  = df["cluster_id"] == cid
+        texts = (
+            df.loc[mask & df[text_col].notna(), text_col]
+            .tolist()[:8]
+        )
+        if not texts:
+            continue
+        label = _ollama_label_cluster(texts, model=model)
+        if label == "unlabelled":
+            # TF-IDF keyword fallback
+            try:
+                cluster_texts = df.loc[mask & df[text_col].notna(), text_col].tolist()
+                if len(cluster_texts) >= 2:
+                    X_sp, vec_inner = _tfidf_matrix(cluster_texts)
+                    if X_sp is not None:
+                        mean_vec = X_sp.mean(axis=0)
+                        mean_vec = mean_vec.A1 if hasattr(mean_vec, "A1") else np.asarray(mean_vec).flatten()
+                        fnames = vec_inner.get_feature_names_out()
+                        top = mean_vec.argsort()[-3:][::-1]
+                        label = " | ".join(fnames[i] for i in top)
+            except Exception:
+                pass
+        df.loc[mask, "cluster_label"] = label
+        print(f"    Cluster {int(cid):>3}: {label}", file=sys.stderr)
+
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -610,12 +705,18 @@ def main():
     parser.add_argument("input_csv")
     parser.add_argument("output_csv")
     parser.add_argument("--provider", choices=["tfidf", "ollama"], default="tfidf")
-    parser.add_argument("--model", default="gemma4",
-                        help="Ollama model for cluster label generation")
+    parser.add_argument("--model", default="gemma4:e2b-it-q4_K_M",
+                        help="Ollama model for cluster label generation (DEPRECATED: use --label-model)")
+    parser.add_argument("--label-model", default="gemma4",
+                        help="Ollama model for cluster label generation (default: gemma4)")
     parser.add_argument("--embed-model", default="nomic-embed-text",
                         help="Ollama model for bug embeddings (must support /api/embeddings)")
     parser.add_argument("--force",    action="store_true")
     parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument(
+        "--relabel", action="store_true",
+        help="Re-run only the Ollama label step on the existing clustered CSV (no re-embedding)"
+    )
     parser.add_argument(
         "--stratify-severity", action="store_true",
         help="Also run separate cluster passes for S1/S2 and S3/S4 bugs"
@@ -633,17 +734,61 @@ def main():
 
     # ── Load input ────────────────────────────────────────────────────────────
     df = pd.read_csv(str(inp))
-    print(f"Loaded {len(df):,} bugs | provider={args.provider} model={args.model}"
-          + (f" embed-model={args.embed_model}" if args.provider == "ollama" else "")
+    label_model = args.label_model
+    print(f"Loaded {len(df):,} bugs | provider={args.provider} embed-model={args.embed_model} label-model={label_model}"
           + (" | stratify-severity=ON" if args.stratify_severity else ""))
+
+    # ── Relabel-only mode ─────────────────────────────────────────────────────
+    if args.relabel:
+        if not out.exists():
+            print(f"  --relabel: output file not found ({out}) — run a full cluster first.")
+            sys.exit(1)
+        existing = pd.read_csv(str(out))
+        existing = relabel_clusters(existing, model=label_model)
+        # Recompute summary with new labels
+        velocity_map   = compute_cluster_velocity(existing)
+        recurrence_map = compute_cluster_recurrence_rate(existing)
+        summary = summarize(existing, velocity_map=velocity_map, recurrence_map=recurrence_map)
+        if not summary.empty:
+            summary_path = cluster_dir / (inp.stem + "_cluster_summary.csv")
+            summary.to_csv(str(summary_path), encoding="utf-8-sig", index=False)
+            print(f"  Cluster summary → {summary_path}")
+        existing.to_csv(str(out), index=False, encoding="utf-8-sig")
+        print(f"\nSaved to: {out}")
+        return
 
     # ── Fingerprint check ─────────────────────────────────────────────────────
     embed_model_for_fp = args.embed_model if args.provider == "ollama" else ""
-    fingerprint = _compute_fingerprint(df, embed_model=embed_model_for_fp)
+    fingerprint = _compute_fingerprint(df, embed_model=embed_model_for_fp,
+                                       label_model=label_model if args.provider == "ollama" else "")
 
     if not args.force and not args.no_cache:
         cached_fp = _load_fingerprint(cache_path)
         if cached_fp == fingerprint and out.exists():
+            # Validate: if the existing output has all-unlabelled labels, auto-relabel
+            try:
+                existing = pd.read_csv(str(out))
+                if "cluster_label" in existing.columns:
+                    unlabelled_pct = (existing["cluster_label"] == "unlabelled").mean()
+                    if unlabelled_pct > 0.9 and args.provider == "ollama":
+                        print(
+                            f"\n  ⚠️  Cache hit but {unlabelled_pct:.0%} of labels are 'unlabelled'."
+                            f"  Auto-running relabel step (no re-embedding needed)."
+                        )
+                        existing = relabel_clusters(existing, model=label_model)
+                        velocity_map   = compute_cluster_velocity(existing)
+                        recurrence_map = compute_cluster_recurrence_rate(existing)
+                        summary = summarize(existing, velocity_map=velocity_map,
+                                            recurrence_map=recurrence_map)
+                        if not summary.empty:
+                            summary_path = cluster_dir / (inp.stem + "_cluster_summary.csv")
+                            summary.to_csv(str(summary_path), encoding="utf-8-sig", index=False)
+                            print(f"  Cluster summary → {summary_path}")
+                        existing.to_csv(str(out), index=False, encoding="utf-8-sig")
+                        print(f"\nSaved to: {out}")
+                        return
+            except Exception as e:
+                print(f"  Warning: could not validate existing output ({e}).")
             print(
                 f"\n  ✅ Cache hit — input fingerprint unchanged ({fingerprint}).\n"
                 f"  Provider={args.provider}  Output already exists → skipping re-cluster.\n"
@@ -678,7 +823,7 @@ def main():
     # ── Global clustering ─────────────────────────────────────────────────────
     df = cluster_bugs(
         df, method="kmeans", n_clusters=25,
-        provider=args.provider, model=args.model, embed_model=args.embed_model,
+        provider=args.provider, model=label_model, embed_model=args.embed_model,
         embed_cache=embed_cache,
         cache_path=cache_path if not args.no_cache else None,
         fingerprint=fingerprint,
@@ -689,7 +834,7 @@ def main():
         print("\nRunning severity-stratified clustering …")
         df = cluster_bugs_stratified(
             df, method="kmeans", n_clusters=15,
-            provider=args.provider, model=args.model, embed_model=args.embed_model,
+            provider=args.provider, model=label_model, embed_model=args.embed_model,
             embed_cache=embed_cache, fingerprint=fingerprint,
         )
 

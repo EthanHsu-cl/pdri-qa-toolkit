@@ -38,6 +38,24 @@ IMPACT_OVERRIDES = {
 }
 
 
+def clamp_detectability_by_coverage(row, detect: int, impact: int) -> tuple[int, str]:
+    """Post-hoc sanity clamp: LLMs frequently invert the FMEA detectability scale.
+    Enforce monotonicity with AutomationCatchRate so a fully-automated module can't
+    end up rated as 'hard to detect' and vice versa."""
+    at = float(row.get("automation_catch_rate", 0) or 0)
+    crit = float(row.get("critical_count", 0) or 0)
+    reg = float(row.get("regression_rate", 0) or 0)
+    original = detect
+    if at >= 0.5:
+        detect = min(detect, 2)
+    elif at >= 0.1:
+        detect = min(detect, 3)
+    elif at < 0.1 and (crit >= 5 or reg > 0.1 or impact >= 4):
+        detect = max(detect, 4)
+    note = "" if detect == original else f" [clamped D {original}->{detect} by AT={at:.2f}]"
+    return detect, note
+
+
 def score_heuristic(row):
     mod = str(row.get("module","")).lower()
     crit = float(row.get("critical_count",0))
@@ -61,9 +79,20 @@ def score_heuristic(row):
 def score_ollama(row, model="gemma4"):
     mod = row.get("module", "Unknown")
     prompt = (
-        "You are a QA risk analyst.\n"
+        "You are a QA risk analyst using FMEA scoring.\n"
         "Return ONLY a JSON object, no extra text.\n"
         'Schema: {"impact": int (1-5), "detectability": int (1-5), "reasoning": string}\n\n'
+        "SCALES (read carefully — higher = worse for BOTH):\n"
+        "  impact: 1=cosmetic/minor, 3=feature-level disruption, 5=blocks core workflow "
+        "(export, project save, crash on launch, data loss).\n"
+        "  detectability: 5=HARD to catch (AutomationCatchRate near 0, low reproducibility, "
+        "escapes to production), 3=partial coverage, 1=EASY to catch (AutomationCatchRate high, "
+        "deterministic repro, caught pre-release). High automation coverage => LOW detectability.\n"
+        "Rubric anchors:\n"
+        "  AutomationCatchRate >= 0.5  => detectability 1-2\n"
+        "  AutomationCatchRate 0.1-0.5 => detectability 2-3\n"
+        "  AutomationCatchRate <  0.1  => detectability 4-5 (especially if Critical>=5 or RegressionRate>0.1)\n"
+        "  Critical >= 10 OR module touches export/project/AI generation => impact >= 4\n\n"
         f"Module: {mod}\n"
         f"Category: {row.get('category', '')}\n"
         f"TotalBugs: {row.get('total_bugs', 0)}\n"
@@ -100,7 +129,8 @@ def score_ollama(row, model="gemma4"):
         reason = str(obj.get("reasoning", ""))
         impact = max(1, min(5, impact))
         detect = max(1, min(5, detect))
-        return impact, detect, "ollama", reason
+        detect, clamp_note = clamp_detectability_by_coverage(row, detect, impact)
+        return impact, detect, "ollama", reason + clamp_note
     except Exception as e:
         print(f"    Ollama failed for {mod} (model={model}): {e}")
         return score_heuristic(row)
@@ -112,9 +142,17 @@ def score_openai(row):
         return score_heuristic(row)
     mod = row.get("module","Unknown")
     msgs = [
-        {"role":"system","content":"You are a QA risk analyst. Return only JSON."},
+        {"role":"system","content":(
+            "You are a QA risk analyst using FMEA scoring. Return only JSON. "
+            "impact 1-5 (5=blocks core workflow). "
+            "detectability 1-5: 5=HARD to catch (low AutomationCatchRate, escapes to prod), "
+            "1=EASY to catch (high AutomationCatchRate). High coverage => LOW detectability."
+        )},
         {"role":"user","content":(
-            f"Score '{mod}' Bugs:{row.get('total_bugs',0)} Crit:{row.get('critical_count',0)} "
+            f"Module:{mod} Bugs:{row.get('total_bugs',0)} Crit:{row.get('critical_count',0)} "
+            f"Major:{row.get('major_count',0)} "
+            f"RegressionRate:{row.get('regression_rate',0):.3f} "
+            f"AutomationCatchRate:{row.get('automation_catch_rate',0):.3f}\n"
             'Return JSON: {"impact":<1-5>,"detectability":<1-5>,"reasoning":"..."}'
         )},
     ]
@@ -137,12 +175,10 @@ def score_openai(row):
         jm = re.search(r"\{[^}]+\}", text)
         if jm:
             obj = json.loads(jm.group())
-            return (
-                int(obj.get("impact",3)),
-                int(obj.get("detectability",3)),
-                "openai",
-                obj.get("reasoning",""),
-            )
+            impact = max(1, min(5, int(obj.get("impact", 3))))
+            detect = max(1, min(5, int(obj.get("detectability", 3))))
+            detect, clamp_note = clamp_detectability_by_coverage(row, detect, impact)
+            return impact, detect, "openai", str(obj.get("reasoning", "")) + clamp_note
     except Exception as e:
         print(f"    OpenAI failed for {mod}: {e}")
     return score_heuristic(row)

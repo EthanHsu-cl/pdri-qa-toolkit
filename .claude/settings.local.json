@@ -16,7 +16,13 @@
       "Read(//Users/ethanhsuqa2/Library/LaunchAgents/**)",
       "Bash(python3 -c ':*)",
       "Bash(python3 -c \"import ast; ast.parse\\(open\\('scripts/predict_defects.py'\\).read\\(\\)\\); print\\('predict_defects.py: OK'\\)\")",
-      "Bash(python3 -c \"import ast; ast.parse\\(open\\('scripts/bug_heatmap_dashboard.py'\\).read\\(\\)\\); print\\('bug_heatmap_dashboard.py: OK'\\)\")"
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('scripts/bug_heatmap_dashboard.py'\\).read\\(\\)\\); print\\('bug_heatmap_dashboard.py: OK'\\)\")",
+      "Bash(python3:*)",
+      "Bash(ls -t /Users/ethanhsuqa2/pdri-qa-toolkit/logs/refresh_*.log)",
+      "Bash(ls -lt /Users/ethanhsuqa2/pdri-qa-toolkit/logs/refresh_*.log)",
+      "Bash(curl -s -X POST http://localhost:11434/api/chat -H 'Content-Type: application/json' -d '{:*)",
+      "Bash(sed -n '10100,10120p' /Users/ethanhsuqa2/pdri-qa-toolkit/logs/refresh_20260409_104822.log)",
+      "Bash(sed -n '10960,10990p' /Users/ethanhsuqa2/pdri-qa-toolkit/logs/refresh_20260409_104822.log)"
     ]
   }
 }

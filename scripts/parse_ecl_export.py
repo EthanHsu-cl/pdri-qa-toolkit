@@ -122,6 +122,49 @@ def classify_status_weight(status_val) -> float:
     return 1.0
 
 
+# Time-decay knobs for closed bugs. A fix is still informative the build after
+# it lands (regression candidate), but its signal weakens as more clean builds
+# pass. Decay is linear from INITIAL down to FLOOR over DECAY_SPAN builds; it
+# never drops below FLOOR so long-settled modules still carry a faint echo of
+# their bug history instead of looking pristine.
+FIXED_BUG_INITIAL = 0.5
+FIXED_BUG_FLOOR = 0.1
+FIXED_BUG_DECAY_SPAN = 12
+
+
+def decayed_fixed_weight(status_val, close_build, at_build) -> float:
+    """
+    Status weight for a bug evaluated as of build `at_build`.
+
+    Invalid bugs return 0.0. Bugs not yet closed at `at_build` return 1.0
+    (they were still open then). Closed bugs decay linearly from FIXED_BUG_INITIAL
+    to FIXED_BUG_FLOOR over FIXED_BUG_DECAY_SPAN builds since close.
+
+    Falls back to the static classify_status_weight when close_build or
+    at_build is missing / unparseable.
+    """
+    if pd.isna(status_val):
+        return 1.0
+    s = str(status_val).strip().lower()
+    if s in INVALID_STATUSES:
+        return 0.0
+    if s not in CLOSED_STATUSES:
+        return 1.0
+    try:
+        cb = float(close_build)
+        ab = float(at_build)
+    except (TypeError, ValueError):
+        return FIXED_BUG_INITIAL
+    if pd.isna(cb) or pd.isna(ab):
+        return FIXED_BUG_INITIAL
+    if cb > ab:
+        return 1.0
+    age = ab - cb
+    span = max(1, FIXED_BUG_DECAY_SPAN)
+    decayed = FIXED_BUG_INITIAL - (FIXED_BUG_INITIAL - FIXED_BUG_FLOOR) * (age / span)
+    return max(FIXED_BUG_FLOOR, decayed)
+
+
 # ---------------------------------------------------------------------
 # Aliases / Categories (truncated to what's needed for behaviour change)
 # ---------------------------------------------------------------------
@@ -139,21 +182,8 @@ MODULE_ALIASES = {
     "voice-Over": "Voice-Over",
     "Voiceover": "Voice-Over",
     "Voice Over": "Voice-Over",
-    "Text To Video": "Text to Video",
-    "Text To Image": "Text to Image",
-    "Image To Video": "Image to Video",
-    "text to video": "Text to Video",
-    "text to image": "Text to Image",
-    "image to video": "Image to Video",
-    "Ai Storytelling": "AI Storytelling",
-    "AI storytelling": "AI Storytelling",
     "AI Storyteller": "AI Storytelling",
     "AI Storytelljng": "AI Storytelling",
-    "Ai Art": "AI Art",
-    "AI art": "AI Art",
-    "auto edit": "Auto Edit",
-    "Auto edit": "Auto Edit",
-    "export": "Export",
     "Colour Board": "Color Board",
     "Crop&Rotate": "Crop & Rotate",
     "Crop(Rotate)": "Crop & Rotate",
@@ -278,6 +308,38 @@ MODULE_ALIASES.update({
     "Removal YOLO":       "Removal",
     "Gen AI":             "GAI",
     "Opening intro":      "Opening Intro",
+})
+
+# Canonical forms for modules that appear in data under multiple casings but
+# aren't listed in MODULE_CATEGORIES. Each entry seeds the canonical set (via
+# MODULE_ALIASES.values()) so step 2.5 case-fold in normalize_module collapses
+# all case variants. Convention: Title Case with acronyms in caps (FX, AI).
+MODULE_ALIASES.update({
+    "Credit system":        "Credit System",
+    "Tool menu":            "Tool Menu",
+    "Media picker":         "Media Picker",
+    "Video Effect layer":   "Video Effect Layer",
+    "Filter layer":         "Filter Layer",
+    "AI music":             "AI Music",
+    "Video Fx":             "Video FX",
+    "Trim before Edit":     "Trim Before Edit",
+    "Trim before edit":     "Trim Before Edit",
+    "Main tool menu":       "Main Tool Menu",
+    "Sample project":       "Sample Project",
+    "Media room":           "Media Room",
+    "User Sign in":         "User Sign In",
+    "AIsticker":            "AISticker",
+    "shutterstock":         "Shutterstock",
+    "Demo video":           "Demo Video",
+    "File picker":          "File Picker",
+    "Intro template":       "Intro Template",
+    "Music/Sound Fx":       "Music/Sound FX",
+    "Advanced cutout":      "Advanced Cutout",
+    "Recent task":          "Recent Task",
+    "New tag":              "New Tag",
+    "Fx":                   "FX",
+    "Color filter":         "Color Filter",
+    "AI Audio tool":        "AI Audio Tool",
 })
 
 # Lowercase shadow for O(1) alias lookup — rebuilt after all updates
@@ -868,7 +930,9 @@ def normalize_module(raw: str, version: str = "unknown",
     """Normalize raw module string -> canonical.
 
     1. Strip parenthetical sub-variants e.g. "Auto Edit(Pet 02)" -> "Auto Edit"
+       and square-bracket segments e.g. "Transition[Portrait]" -> "Transition"
     2. O(1) alias lookup via lowercase shadow dict
+    2.5. Case-insensitive match against the canonical module list
     3. Mapping store (permanent + confirmed versions)
     4. Fuzzy match (>= threshold -> auto-confirm, 65-threshold -> pending)
     5. Raw string (Uncategorized; flagged for dashboard)
@@ -909,10 +973,34 @@ def normalize_module(raw: str, version: str = "unknown",
                 mod = first
                 break
 
+    # (d) Strip square-bracket segments like [Portrait], [JPN], [iPhone 12 Pro Max].
+    #     These encode test conditions (locale/device/orientation/content), not a
+    #     different module:
+    #       "Transition[Portrait]"          -> "Transition"
+    #       "AI Storytelling [JPN]"         -> "AI Storytelling"
+    #       "Shortcut[ iPhone 12 Pro Max]"  -> "Shortcut"
+    stripped = re.sub(r'\s*\[[^\]]*\]\s*', ' ', mod).strip()
+    stripped = re.sub(r' +', ' ', stripped)
+    if stripped:
+        mod = stripped
+
     # Step 2: O(1) alias lookup (case-insensitive via lowercase shadow dict)
     alias_result = _MODULE_ALIASES_LOWER.get(mod.lower())
     if alias_result:
         return alias_result
+
+    # Step 2.5: Case-insensitive match against the canonical module list
+    # ("text to speech" -> "Text to Speech"). Handles case variants that aren't
+    # in MODULE_ALIASES, as long as the canonical form exists somewhere (either
+    # in MODULE_CATEGORIES or as an alias target). Cached on the function object.
+    if not hasattr(normalize_module, "_canonical_lower"):
+        canonical_set = set(_CANONICAL_MODULES) | set(MODULE_ALIASES.values())
+        normalize_module._canonical_lower = {
+            m.lower(): m for m in canonical_set
+        }
+    canonical = normalize_module._canonical_lower.get(mod.lower())
+    if canonical:
+        return canonical
 
     # Step 3: Mapping store (permanent + confirmed versions)
     if store is not None:
@@ -939,6 +1027,60 @@ def normalize_module(raw: str, version: str = "unknown",
             store.add_pending(mod, match, version)
 
     return mod
+
+
+def detect_case_variant_groups(
+    modules, store: VersionMappingStore, bucket: str = "case_variants"
+) -> int:
+    """Surface case-only module duplicates to the pending review page.
+
+    Groups parsed_module values by lowercase. For each group with >1 distinct
+    casing, picks a winner (canonical form if any variant is in the canonical
+    set, else the most-frequent casing) and writes every non-winner variant to
+    `<bucket>_pending.json` via `store.add_pending`. Entries already present as
+    aliases (MODULE_ALIASES), or already in the permanent store, are skipped.
+
+    The fix takes effect after the user promotes them in the Pending Review
+    page; on the next pipeline run, step 3 (mapping store lookup) resolves them.
+
+    Returns the number of new pending entries written.
+    """
+    from collections import Counter
+
+    counts = Counter(m for m in modules if isinstance(m, str) and m)
+    groups: dict[str, list[tuple[str, int]]] = {}
+    for m, c in counts.items():
+        groups.setdefault(m.lower(), []).append((m, c))
+
+    canonical_set = set(_CANONICAL_MODULES) | set(MODULE_ALIASES.values())
+    permanent = store._permanent if store is not None else {}
+    existing_pending: dict = {}
+    if store is not None:
+        existing_pending = store._load_json(
+            store.versions_dir / f"{bucket}_pending.json"
+        )
+    written = 0
+
+    for variants in groups.values():
+        if len(variants) <= 1:
+            continue
+        known = [v for v, _ in variants if v in canonical_set]
+        if known:
+            winner = known[0]
+        else:
+            winner = max(variants, key=lambda x: x[1])[0]
+        for v, _ in variants:
+            if v == winner:
+                continue
+            if v.lower() in _MODULE_ALIASES_LOWER:
+                continue
+            if v in permanent or v in existing_pending:
+                continue
+            if store is not None:
+                store.add_pending(v, winner, bucket)
+                written += 1
+    return written
+
 
 def get_category(module_name: str) -> str:
     cat = _FLAT_OVERRIDES.get(module_name)
@@ -1208,6 +1350,16 @@ def parse_ecl_export(
         df[k] = v
     for tk, tv in tag_cols.items():
         df[f"tag_{tk}"] = tv
+
+    # Surface case-only module duplicates (e.g. "Credit System" vs "Credit system"
+    # where no form is canonical) to the Pending Module Review page.
+    new_case_pending = detect_case_variant_groups(df["parsed_module"], store)
+    if new_case_pending:
+        print(
+            f"\n📝 Surfaced {new_case_pending} case-variant module mapping(s) to "
+            f"pending review (bucket: case_variants). Review in the 'Pending "
+            f"Module Review' page of the dashboard."
+        )
 
     # status_active and status_weight
     if status_col:

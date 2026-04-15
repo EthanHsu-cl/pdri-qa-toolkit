@@ -60,7 +60,7 @@ Changes from v2.16:
 Changes from v2.15:
   - Tab 8 (Bug Clusters): Expanded "📖 How to read this tab" expander into a
     full reference guide covering headline metrics, colour coding, bar chart
-    interpretation, theme detail cards, investigation workflow, Ollama vs
+    interpretation, issue group detail cards, investigation workflow, Ollama vs
     TF-IDF mode explanation, and re-run cadence guidance.
   - Tab 9 (Defect Forecast): Expanded "📖 How to read this tab" expander into
     a full reference guide covering the prediction target, all six model
@@ -281,17 +281,16 @@ def load_csv(fp: str) -> pd.DataFrame:
 
 
 def normalise_module(name: str) -> str:
-    """Strip parenthetical sub-variants from module names.
-    e.g. "Auto Edit(Pet 02)" -> "Auto Edit"
-         "AI Storytelling (Describe your clips)" -> "AI Storytelling"
+    """Strip parenthetical and bracketed sub-variants from module names.
+    e.g. "Auto Edit(Pet 02)"    -> "Auto Edit"
+         "Transition[Portrait]" -> "Transition"
     Also collapses multiple spaces and strips whitespace.
     """
     import re
     if not isinstance(name, str):
         return name
-    # Remove anything in parentheses (including the parens)
     name = re.sub(r'\s*\([^)]*\)', '', name)
-    # Collapse multiple spaces
+    name = re.sub(r'\s*\[[^\]]*\]\s*', ' ', name)
     name = re.sub(r' +', ' ', name).strip()
     return name
 
@@ -946,7 +945,7 @@ Columns are sorted in **ascending version order** — oldest release on the left
 - A single cell that suddenly darkens in one column = a regression was introduced in that specific release for that module.
 - A row that stays consistently warm across all versions = a **chronic problem** — this module is never stable regardless of release cadence. It likely needs an architectural fix, not just a patch.
 - A column that is uniformly dark across many rows = a **systemically bad release** — a large merge, SDK update, or new feature likely affected many areas at once.
-- A cell that goes dark → light → dark again = a fix was applied and then regressed in a later build. Escalate to RD for a root-cause review.
+- A cell that goes dark → light → dark again = a fix was applied and then regressed in a later version. Escalate to RD for a root-cause review.
 - A cell that gradually lightens over time = bugs are being resolved and not reintroduced (healthy trend — ideally what every row looks like toward the end of a release cycle).
 
 **Version filter:** Use the **version multiselect** in the sidebar to narrow the columns to a specific release window.
@@ -1016,7 +1015,7 @@ For example: `PDR-I 16.2.5 - [EDF][UX] AI Storytelling: subtitle misplaced` → 
 **The main heatmap** (top of the tab) shows the raw count of each tag per module/category. Darker cells = more bugs with that tag in that area.
 
 **Regression Bug Rate (Side Effect %):** A dedicated bar chart below the main heatmap ranks modules by their side-effect rate — the fraction of all their bugs that are regressions.
-- A rate above **30%** means nearly 1 in 3 bugs is a regression — this module needs dedicated regression testing every single build.
+- A rate above **30%** means nearly 1 in 3 bugs is a regression — this module needs dedicated regression testing every single version.
 - Computed as: `(bugs tagged [Side Effect]) ÷ (total bugs) × 100`.
 
 **AT Found Rate bar chart:** Ranks modules by what fraction of their bugs were caught by automated testing.
@@ -1259,8 +1258,8 @@ elif active_tab == "📊 KPI Dashboard":
 | **Avg Days to Close** | Mean calendar days from bug `Create Date` to `Closed Date` | Measures RD fix velocity. Rising trend = backlog is accumulating faster than it is being resolved. Compare across releases to detect if fix rate is deteriorating. |
 | **Regression Bug Rate** | % of bugs tagged `[Side Effect]` in their Short Description | Side-effect bugs are regressions — features that previously worked and broke after a code change. A rate above 20% indicates insufficient regression test coverage for the complexity of changes being made. |
 | **Active vs Inactive** | Active = Open / In-Progress; Inactive = Closed / NAB / Won't Fix | Active count = live unresolved risk in the current filter. |
-| **P1 Modules** | Modules with I×P×D risk score > 90 (from loaded risk register) | Every P1 module must be tested every single build — no exceptions. |
-| **P2 Modules** | Modules with I×P×D risk score 70–90 | Also test every build alongside P1. |
+| **P1 Modules** | Modules with I×P×D risk score > 90 (from loaded risk register) | Every P1 module must be tested every single version — no exceptions. |
+| **P2 Modules** | Modules with I×P×D risk score 70–90 | Also test every version alongside P1. |
 | **Avg Risk Score** | Mean I×P×D risk score across all modules in the current filter | Overall risk health signal. A rising trend = cumulative risk is growing. A declining trend = risk is being managed and reduced. |
 
 ---
@@ -1394,7 +1393,7 @@ Key outputs per bug row:
 - `module_category` — one of 20 top-level categories (222 flat overrides + partial matching)
 - `severity_num` / `severity_weight` — S1=10 pts, S2=5 pts, S3=2 pts, S4=1 pt
 - `tag_side_effect`, `tag_at_found`, `tag_edf`, `tag_ux` etc. — boolean columns from `[TAG]` prefixes
-- `days_to_close`, `builds_to_fix`, `repro_rate` — computed from ECL date and build fields
+- `days_to_close`, `builds_to_fix`, `repro_rate` — computed from ECL date and version fields
 
 ---
 
@@ -1415,7 +1414,7 @@ Groups all bugs by module and computes:
 | `unique_reporters` | Number of distinct testers who have filed bugs here |
 | **`probability_score_auto`** | **Quintile rank of total_bugs across all modules, scored 1–5.** Top 20% most bug-prone = 5, bottom 20% = 1. This is the P in I x P x D. |
 
-Also produces one `risk_register_<version>.csv` per ECL version for per-build analysis.
+Also produces one `risk_register_<version>.csv` per ECL version for per-version analysis.
 
 ---
 
@@ -1441,7 +1440,7 @@ Assigned from a domain knowledge table built by the QA team:
 With **Ollama or OpenAI**, the LLM receives module name, category, bug counts, and regression
 rate, reasons about business impact, and returns a score 1–5 with written justification.
 
-#### P — Probability (1–5): How likely is this module to have bugs in the next build?
+#### P — Probability (1–5): How likely is this module to have bugs in the next version?
 
 This is `probability_score_auto` from Step 2 — the quintile rank of historical bug density.
 It is **never overridden by AI**; it is always purely data-driven from ECL history.
@@ -1472,8 +1471,8 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
 
 | Priority | Score threshold | Testing cadence |
 |----------|----------------|-----------------|
-| P1 — Critical  | > 90  | Every build, every sprint |
-| P2 — High      | 70-90 | Every sprint / major build |
+| P1 — Critical  | > 90  | Every version, every sprint |
+| P2 — High      | 70-90 | Every sprint / major version |
 | P3 — Medium    | 50-69 | Every release candidate |
 | P4 — Low       | < 50  | Full release cycle only |
 
@@ -1491,7 +1490,7 @@ Risk Score = I x P x D        (maximum = 5 x 5 x 5 = 125)
 | **Right detail panel** | Both files joined | Total bugs, critical count, risk score, and full bug list for the selected module. Before clicking a block, shows the top 5 modules by bug count as a quick reference. |
 | **🌞 Sunburst View** (expander below treemap) | Both files | Same data in a nested pie chart. Use it to compare the proportion of bugs across categories — the outer ring is modules, the inner ring is categories. |
 | **📋 Category Summary** (expander below treemap) | Both files | Aggregate table: one row per category showing total modules, total bugs, severity weight, average risk score, and count of P1 modules. Sort by Avg Risk Score to quickly identify the riskiest category. |
-| **🔴 P1 + P2 Modules bar chart** | `risk_register_scored.csv` | All P1 and P2 modules ranked by risk score, highest first. These are the mandatory test-every-build targets. Each bar is coloured by priority. |
+| **🔴 P1 + P2 Modules bar chart** | `risk_register_scored.csv` | All P1 and P2 modules ranked by risk score, highest first. These are the mandatory test-every-version targets. Each bar is coloured by priority. |
 | **Risk Score vs Probability scatter** | `risk_register_scored.csv` | I×P×D score on the Y axis vs historical defect probability rank (1–5) on the X axis. X values are slightly jittered (±0.35) so overlapping dots separate visually — hover for the true integer value. Threshold lines at 50, 70, 90 define the four risk zones. Look for modules in the top-right corner: both high-risk AND historically bug-prone — these are the highest-priority targets. |
 
 > **Tip:** Heuristic scores are a strong starting point but should be reviewed with the team.
@@ -1839,7 +1838,7 @@ elif active_tab == "🔬 Bug Clusters":
         st.markdown("""
 ## 🔬 Bug Clusters — Complete Guide
 
-This tab groups all bugs into **themes** using natural language analysis of their short descriptions.
+This tab groups all bugs into **issue groups** using natural language analysis of their short descriptions.
 Instead of reviewing hundreds of individual bugs, it immediately answers:
 **"What categories of problems keep recurring, and how serious are they?"**
 
@@ -1855,15 +1854,15 @@ labels generated by an LLM (e.g. "subtitle rendering delay"). Either way, think 
 | Metric | What it tells you |
 |--------|------------------|
 | **Total Bugs Analysed** | All bugs in the loaded clustered file |
-| **Distinct Themes Found** | Number of named clusters (the noise/unclustered bucket is excluded) |
-| **Bugs Grouped into Themes** | Count and % of bugs that belong to a named cluster — higher % means the algorithm found strong patterns |
+| **Distinct Issue Groups Found** | Number of named clusters (the noise/unclustered bucket is excluded) |
+| **Bugs Grouped into Issue Groups** | Count and % of bugs that belong to a named cluster — higher % means the algorithm found strong patterns |
 | **Uncategorised Bugs** | Bugs whose descriptions were too short or too unique to match any cluster — normal to have some |
 
 ---
 
 ### 🎨 Colour Coding
 
-Each theme bar in the overview chart is coloured by the **average severity** of the bugs it contains:
+Each issue group bar in the overview chart is coloured by the **average severity** of the bugs it contains:
 
 | Colour | Average severity | Meaning |
 |--------|-----------------|---------|
@@ -1876,21 +1875,21 @@ Each theme bar in the overview chart is coloured by the **average severity** of 
 
 ### 📏 How to Read the Overview Chart
 
-- **Bar length** = number of bugs in that theme. Longer = more bugs share this pattern.
+- **Bar length** = number of bugs in that issue group. Longer = more bugs share this pattern.
 - **Colour** = how severe those bugs are on average (see above).
-- A **short red bar** (few critical bugs on a single theme) may be more urgent than a **long yellow bar** (many minor bugs on a popular theme). Use both dimensions together.
+- A **short red bar** (few critical bugs on a single issue group) may be more urgent than a **long yellow bar** (many minor bugs on a popular issue group). Use both dimensions together.
 
 ---
 
-### 🃏 Theme Detail Cards
+### 🃏 Issue Group Detail Cards
 
 Expand any card to see:
-- **Bug count** — how many bugs belong to this theme
+- **Bug count** — how many bugs belong to this issue group
 - **Avg severity** — 1 (Critical) to 4 (Minor)
-- **Share of clustered bugs** — this theme's proportion of all grouped bugs
-- **Velocity (recent vs prior 2 builds)** — the acceleration ratio; >1.5 = growing, <0.67 = declining
-- **Recurrence rate** — fraction of recent bugs from modules that also appeared in the prior 2-build window (high = same modules keep re-introducing this bug type)
-- **Modules affected** — which modules contribute bugs to this theme
+- **Share of clustered bugs** — this issue group's proportion of all grouped bugs
+- **Velocity (recent vs prior 2 versions)** — the acceleration ratio; >1.5 = growing, <0.67 = declining
+- **Recurrence rate** — fraction of recent bugs from modules that also appeared in the prior 2-version window (high = same modules keep re-introducing this bug type)
+- **Modules affected** — which modules contribute bugs to this issue group
 - **Sample bug descriptions** — up to 6 real ECL examples so you can judge the pattern yourself
 - **Action line** — a plain-English recommendation based on severity, amplified if the velocity or recurrence signals are also firing:
   - 🚨 **Immediate attention** (avg sev ≤ 1.5) — crash-level or data-loss bugs. Escalate to RD.
@@ -1902,32 +1901,32 @@ Expand any card to see:
 
 ### 🚨 Alert Banners (shown before the chart when thresholds are hit)
 
-**🔺 Growing theme alerts** fire when `cluster_velocity_ratio` ≥ 1.5.
-> **Velocity ratio** = (bugs in last 2 builds) ÷ (bugs in prior 2 builds). A ratio of 1.5 means 50% more bugs than the preceding window — a strong signal that something changed recently.
+**🔺 Growing issue group alerts** fire when `cluster_velocity_ratio` ≥ 1.5.
+> **Velocity ratio** = (bugs in last 2 versions) ÷ (bugs in prior 2 versions). A ratio of 1.5 means 50% more bugs than the preceding window — a strong signal that something changed recently.
 
 **🔁 Fix-not-holding alerts** fire when `recurrence_rate` ≥ 0.6.
-> **Recurrence rate** = fraction of recent bugs (last 2 builds) from modules that also contributed to this theme in the prior 2-build window. 60%+ means the same modules keep re-introducing the same type of bug — a root-cause fix, not another patch, is needed.
+> **Recurrence rate** = fraction of recent bugs (last 2 versions) from modules that also contributed to this issue group in the prior 2-version window. 60%+ means the same modules keep re-introducing the same type of bug — a root-cause fix, not another patch, is needed.
 
 ---
 
 ### 📈 Cluster Velocity Chart
 
-Ranks all themes by velocity ratio. The **red dashed threshold line at 1.5×** marks the growing boundary.
+Ranks all issue groups by velocity ratio. The **red dashed threshold line at 1.5×** marks the growing boundary.
 - Bars to the right at 1.5 or beyond need immediate investigative attention regardless of total bug count.
-- Green bars (declining) indicate themes that are resolving — the fix is holding.
+- Green bars (declining) indicate issue groups that are resolving — the fix is holding.
 
 ---
 
 ### 🔀 Module Cluster Entropy Chart
 
-**Shannon entropy** measures how spread out a module's bugs are across different themes.
-The formula: H = −Σ(pᵢ × log₂(pᵢ)) where pᵢ = the fraction of bugs belonging to theme i.
+**Shannon entropy** measures how spread out a module's bugs are across different issue groups.
+The formula: H = −Σ(pᵢ × log₂(pᵢ)) where pᵢ = the fraction of bugs belonging to issue group i.
 
 | Entropy | Meaning | What to do |
 |---------|---------|-----------|
-| **< 1 (✅ Focused)** | Bugs concentrated in one theme — single well-defined failure mode | One root-cause fix likely resolves the majority of bugs |
-| **1–2 (🔶 Spreading)** | Bugs spread across a few themes | Investigate whether the themes share a common component or API |
-| **> 2 (⚠️ Broad instability)** | Bugs across many themes — systemic module instability | Comprehensive regression pass needed; no single fix will adequately cover this |
+| **< 1 (✅ Focused)** | Bugs concentrated in one issue group — single well-defined failure mode | One root-cause fix likely resolves the majority of bugs |
+| **1–2 (🔶 Spreading)** | Bugs spread across a few issue groups | Investigate whether the issue groups share a common component or API |
+| **> 2 (⚠️ Broad instability)** | Bugs across many issue groups — systemic module instability | Comprehensive regression pass needed; no single fix will adequately cover this |
 
 Orange dashed line at 1.0 and red dashed line at 2.0 mark the thresholds on the chart.
 
@@ -1945,19 +1944,19 @@ Each tier has its own overview bar chart and detail cards with velocity and recu
 
 ### 🔍 How to Investigate a Pattern
 
-1. Check alert banners first — growing or fix-not-holding themes are highest priority.
+1. Check alert banners first — growing or fix-not-holding issue groups are highest priority.
 2. Find the largest red/orange bars — combine severity and count.
 3. Open the card and check which modules are affected.
    - **1 module** → isolated bug area. Add it to the current sprint focus.
    - **3+ modules** → shared root cause likely. Investigate common infrastructure (API, SDK version, shared component).
 4. Read the sample descriptions — do they describe the same underlying failure? If yes, this is systematic.
-5. Cross-check with **Tab 7 (Risk Heatmap)** — if the affected modules are P1/P2, the theme is high-priority regardless of bug count.
+5. Cross-check with **Tab 7 (Risk Heatmap)** — if the affected modules are P1/P2, the issue group is high-priority regardless of bug count.
 
 ---
 
-### 📋 Full Theme Table
+### 📋 Full Issue Group Table
 
-The "Full theme table (raw data)" expander at the bottom provides a sortable table with all numeric columns: velocity ratio, trend, recurrence rate. Export or copy to a spreadsheet for offline analysis.
+The "Full issue group table (raw data)" expander at the bottom provides a sortable table with all numeric columns: velocity ratio, trend, recurrence rate. Export or copy to a spreadsheet for offline analysis.
 
 ---
 
@@ -1986,7 +1985,7 @@ v3.0 produces additional output files automatically:
 
 In the sidebar: **Step 3** → set paths to the above files. The module entropy and stratified summaries load automatically from their default paths.
 
-Recommend re-running clustering **every Friday** or whenever a new batch of builds has been parsed.
+Recommend re-running clustering **every Friday** or whenever a new batch of versions has been parsed.
 """)
 
     if cluster_df is None:
@@ -2009,9 +2008,9 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
 
     hm1, hm2, hm3, hm4 = st.columns(4)
     hm1.metric("Total Bugs Analysed", f"{n_total:,}")
-    hm2.metric("Distinct Themes Found", f"{n_clusters}")
-    hm3.metric("Bugs Grouped into Themes", f"{n_clustered:,}",
-               help=f"{n_clustered/n_total*100:.0f}% of all bugs belong to a named theme")
+    hm2.metric("Distinct Issue Groups Found", f"{n_clusters}")
+    hm3.metric("Bugs Grouped into Issue Groups", f"{n_clustered:,}",
+               help=f"{n_clustered/n_total*100:.0f}% of all bugs belong to a named issue group")
     hm4.metric("Uncategorised Bugs", f"{n_unclustered:,}",
                help="Bugs whose descriptions were too short or too unique to cluster")
 
@@ -2079,7 +2078,7 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
             "ℹ️ **Velocity and recurrence metrics are unavailable.** "
             "The cluster summary CSV (`ecl_parsed_cluster_summary.csv`) from `cluster_bugs.py` "
             "was not loaded, and the clustered data has no `Build#` column for inline computation. "
-            "Load the summary CSV in **Sidebar → Step 3** to enable growing-theme alerts, "
+            "Load the summary CSV in **Sidebar → Step 3** to enable growing issue-group alerts, "
             "velocity chart, and recurrence rates."
         )
     elif _velocity_source == "inline_buildhash":
@@ -2129,8 +2128,8 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
         if not _growing.empty:
             for _, _gr in _growing.head(3).iterrows():
                 st.warning(
-                    f"🔺 **Growing theme:** _{_gr['label_short']}_ — "
-                    f"{_gr['cluster_velocity_ratio']:.1f}× increase in recent builds "
+                    f"🔺 **Growing issue group:** _{_gr['label_short']}_ — "
+                    f"{_gr['cluster_velocity_ratio']:.1f}× increase in recent versions "
                     f"({int(_gr['count'])} total bugs, avg sev {_gr['avg_sev']:.1f}). "
                     f"Modules: {_gr['modules']}"
                 )
@@ -2143,13 +2142,13 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
                 )
 
     # ── Overview bar chart ───────────────────────────────────────────────
-    st.subheader("📊 Theme Overview — How Many Bugs per Theme?")
+    st.subheader("📊 Issue Group Overview — How Many Bugs per Issue Group?")
     st.caption(
-        "Each bar is a recurring bug theme. Colour shows average severity. "
-        "Longer bar = more bugs share that theme."
+        "Each bar is a recurring issue group. Colour shows average severity. "
+        "Longer bar = more bugs share that issue group."
     )
 
-    top_n_bar = st.slider("Show top N themes", min_value=5, max_value=min(30, len(summary)),
+    top_n_bar = st.slider("Show top N issue groups", min_value=5, max_value=min(30, len(summary)),
                           value=min(15, len(summary)), key="cluster_bar_n")
     bar_data = summary.head(top_n_bar).copy()
 
@@ -2162,7 +2161,7 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
         color_discrete_map=SEV_BAND_COLORS,
         hover_data={"count": True, "avg_sev": ":.2f", "modules": True,
                     "severity_band": False, "label_short": False},
-        labels={"count": "Number of Bugs", "label_short": "Theme (keywords)",
+        labels={"count": "Number of Bugs", "label_short": "Issue Group (keywords)",
                 "avg_sev": "Avg Severity (1=Critical, 4=Minor)",
                 "modules": "Modules affected"},
         text="count",
@@ -2179,9 +2178,9 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
 
     # ── Per-cluster detail cards ─────────────────────────────────────────
     st.markdown("---")
-    st.subheader("🃏 Theme Detail Cards")
+    st.subheader("🃏 Issue Group Detail Cards")
     st.caption(
-        "Each card shows one recurring bug theme. "
+        "Each card shows one recurring issue group. "
         "Expand a card to see which modules are affected and example bugs."
     )
 
@@ -2209,15 +2208,15 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
 
         if vel_val is not None:
             card_title = (
-                f"{sev_icon} Theme #{rank_n} · **{count} bugs** "
+                f"{sev_icon} Issue Group #{rank_n} · **{count} bugs** "
                 f"· {trend_icon} {trend_val} ({vel_val:.1f}×) · _{label}_"
             )
         else:
-            card_title = f"{sev_icon} Theme #{rank_n} · **{count} bugs** · _{label}_"
+            card_title = f"{sev_icon} Issue Group #{rank_n} · **{count} bugs** · _{label}_"
 
         with st.expander(card_title, expanded=(rank_n == 1)):
             cc1, cc2, cc3 = st.columns(3)
-            cc1.metric("Bugs in theme", count)
+            cc1.metric("Bugs in issue group", count)
             cc2.metric("Avg severity", f"{avg_sv:.1f}",
                        help="1=Critical  2=Major  3=Normal  4=Minor")
             pct = f"{count / n_clustered * 100:.1f}%" if n_clustered else "—"
@@ -2227,13 +2226,13 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
             if vel_val is not None:
                 vc1, vc2, vc3 = st.columns(3)
                 vel_delta_color = "inverse" if trend_val == "declining" else ("off" if trend_val == "stable" else "normal")
-                vc1.metric("Velocity (recent vs prior 2 builds)", f"{vel_val:.2f}×",
+                vc1.metric("Velocity (recent vs prior 2 versions)", f"{vel_val:.2f}×",
                            delta=f"{trend_icon} {trend_val.capitalize()}",
                            delta_color=vel_delta_color,
-                           help="Ratio of bugs in the last 2 builds vs the 2 builds before that. Above 1.5 = growing.")
+                           help="Ratio of bugs in the last 2 versions vs the 2 versions before that. Above 1.5 = growing.")
                 _recur_display = f"{recur_val * 100:.0f}%" if recur_val is not None else "N/A"
                 vc2.metric("Recurrence rate", _recur_display,
-                           help="Fraction of recent bugs from modules that also contributed to this theme in the prior window. High = fix not holding.")
+                           help="Fraction of recent bugs from modules that also contributed to this issue group in the prior window. High = fix not holding.")
                 if recur_val is not None:
                     recur_label = "⚠️ Fix not holding" if recur_val > 0.5 else ("🔶 Moderate" if recur_val > 0.25 else "✅ Low")
                 else:
@@ -2258,7 +2257,7 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
                         })
                     )
                     if not samples.empty:
-                        st.markdown("**Sample bugs in this theme:**")
+                        st.markdown("**Sample bugs in this issue group:**")
                         st.dataframe(samples, hide_index=True, width='stretch')
 
             # Plain-English action — severity-based baseline
@@ -2273,19 +2272,19 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
             # Amplify when velocity or recurrence signals override the severity baseline.
             # Only apply when values come from an authoritative source (not absent).
             if vel_val is not None and trend_val == "growing" and vel_val >= 1.5:
-                action += f"  🔺 **Growing fast ({vel_val:.1f}×)** — prioritise this theme in the next build regardless of total count."
+                action += f"  🔺 **Growing fast ({vel_val:.1f}×)** — prioritise this issue group in the next version regardless of total count."
             if recur_val is not None and recur_val >= 0.5:
                 action += "  🔁 **High recurrence** — same modules keep appearing; underlying root cause may not be resolved."
             st.info(action)
 
     # ── Raw summary table ────────────────────────────────────────────────
-    with st.expander("📋 Full theme table (raw data)"):
+    with st.expander("📋 Full issue group table (raw data)"):
         display_cols_sum = [c for c in ["cluster_label", "count", "avg_sev", "modules",
                                          "severity_band", "cluster_velocity_ratio",
                                          "cluster_trend", "recurrence_rate"]
                             if c in summary.columns]
         disp_names = {
-            "cluster_label": "Theme keywords", "count": "Bug count",
+            "cluster_label": "Issue Group keywords", "count": "Bug count",
             "avg_sev": "Avg severity (1–4)", "modules": "Modules affected",
             "severity_band": "Severity band",
             "cluster_velocity_ratio": "Velocity ratio",
@@ -2298,57 +2297,76 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
     # ── NEW v3.0 — Cluster velocity chart ───────────────────────────────
     if _velocity_available and "cluster_velocity_ratio" in summary.columns and "cluster_trend" in summary.columns:
         st.markdown("---")
-        st.subheader("📈 Cluster Velocity — Which Themes Are Growing?")
+        st.subheader("📈 Cluster Velocity — Which Issue Groups Are Growing?")
         st.caption(
-            "Velocity ratio compares bug count in the most recent 2 builds vs the prior 2 builds. "
-            "**Above 1.5** = theme is growing (🔺 alert). **Below 0.67** = theme is declining (✅ improving). "
-            "Focus testing effort on growing themes."
+            "Velocity ratio compares bug count in the most recent 2 versions vs the prior 2 versions. "
+            "**Above 1.5** = issue group is growing (🔺 alert). **Below 0.67** = issue group is declining (✅ improving). "
+            "Focus testing effort on growing issue groups."
         )
 
         vel_df = summary.copy()
         vel_df["cluster_velocity_ratio"] = pd.to_numeric(
-            vel_df["cluster_velocity_ratio"], errors="coerce").fillna(1.0)
+            vel_df["cluster_velocity_ratio"], errors="coerce")
+        # Drop clusters with undefined velocity (insufficient prior-window history)
+        # so the chart doesn't mislead by showing them as "stable 1.0×".
+        vel_undefined_ct = int(vel_df["cluster_velocity_ratio"].isna().sum())
+        vel_df = vel_df.dropna(subset=["cluster_velocity_ratio"])
+        if vel_df.empty:
+            st.info("No cluster has enough prior-window history to compute a velocity ratio yet. "
+                    "Re-run `cluster_bugs.py` after a few more versions of data are ingested.")
+            _skip_velocity_chart = True
+        else:
+            _skip_velocity_chart = False
         # Show all clusters sorted by velocity descending — most urgent at top
         vel_df = vel_df.sort_values("cluster_velocity_ratio", ascending=False).head(20)
+        if vel_undefined_ct and not _skip_velocity_chart:
+            st.caption(f"_{vel_undefined_ct} cluster(s) hidden — not enough "
+                       f"prior-window history to compute a ratio._")
 
         vel_df["trend_color"] = vel_df["cluster_trend"].map({
-            "growing":   "🔺 Growing",
-            "stable":    "➡️ Stable",
-            "declining": "✅ Declining",
+            "growing":              "🔺 Growing",
+            "stable":               "➡️ Stable",
+            "declining":            "✅ Declining",
+            "insufficient_history": "⏳ New",
         }).fillna("➡️ Stable")
 
         TREND_COLORS = {
             "🔺 Growing":   "#ef4444",
             "➡️ Stable":    "#94a3b8",
             "✅ Declining": "#22c55e",
+            "⏳ New":       "#a3a3a3",
         }
-        fig_vel = px.bar(
-            vel_df,
-            x="cluster_velocity_ratio",
-            y="label_short",
-            orientation="h",
-            color="trend_color",
-            color_discrete_map=TREND_COLORS,
-            hover_data={"cluster_velocity_ratio": ":.2f",
-                        "count": True, "modules": True,
-                        "label_short": False, "trend_color": False},
-            labels={"cluster_velocity_ratio": "Velocity ratio (recent / prior 2 builds)",
-                    "label_short": "Theme",
-                    "count": "Total bugs",
-                    "modules": "Modules"},
-            text="cluster_velocity_ratio",
-        )
-        fig_vel.update_traces(texttemplate="%{text:.2f}×", textposition="outside")
-        fig_vel.add_vline(x=1.0, line_color="gray", line_width=1, line_dash="dash")
-        fig_vel.add_vline(x=1.5, line_color="#ef4444", line_width=1, line_dash="dot",
-                          annotation_text="Growing threshold", annotation_position="top right")
-        fig_vel.update_layout(
-            height=max(320, len(vel_df) * 28),
-            yaxis={"categoryorder": "total ascending"},
-            showlegend=True, legend_title_text="Trend",
-            margin=dict(l=10, r=120, t=20, b=10),
-        )
-        st.plotly_chart(fig_vel, width='stretch')
+        if _skip_velocity_chart:
+            fig_vel = None
+        else:
+            fig_vel = px.bar(
+                vel_df,
+                x="cluster_velocity_ratio",
+                y="label_short",
+                orientation="h",
+                color="trend_color",
+                color_discrete_map=TREND_COLORS,
+                hover_data={"cluster_velocity_ratio": ":.2f",
+                            "count": True, "modules": True,
+                            "label_short": False, "trend_color": False},
+                labels={"cluster_velocity_ratio": "Velocity ratio (recent / prior 2 versions)",
+                        "label_short": "Issue Group",
+                        "count": "Total bugs",
+                        "modules": "Modules"},
+                text="cluster_velocity_ratio",
+            )
+            fig_vel.update_traces(texttemplate="%{text:.2f}×", textposition="outside")
+            fig_vel.add_vline(x=1.0, line_color="gray", line_width=1, line_dash="dash")
+            fig_vel.add_vline(x=1.5, line_color="#ef4444", line_width=1, line_dash="dot",
+                              annotation_text="Growing threshold", annotation_position="top right")
+            fig_vel.update_layout(
+                height=max(320, len(vel_df) * 28),
+                yaxis={"categoryorder": "total ascending"},
+                showlegend=True, legend_title_text="Trend",
+                margin=dict(l=10, r=120, t=20, b=10),
+            )
+        if fig_vel is not None:
+            st.plotly_chart(fig_vel, width='stretch')
 
     # ── NEW v3.0 — Module cluster entropy table ──────────────────────────
     # Use loaded entropy CSV if available; otherwise compute directly from cluster_df
@@ -2369,16 +2387,16 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
 
     if _ent_source_df is not None and not _ent_source_df.empty:
         st.markdown("---")
-        st.subheader("🔀 Module Cluster Entropy — Breadth of Bug Themes")
+        st.subheader("🔀 Module Cluster Entropy — Breadth of Bug Issue Groups")
         with st.expander("ℹ️ What is cluster entropy?", expanded=False):
             st.markdown("""
-**Entropy** measures how spread out a module's bugs are across different themes.
+**Entropy** measures how spread out a module's bugs are across different issue groups.
 
 | Entropy | Meaning | Action |
 |---------|---------|--------|
-| **Low (< 1)** | Bugs concentrated in one theme — focused failure mode | Easy to fix: one root cause to address |
-| **Medium (1–2)** | Bugs spread across a few themes | Review whether themes share a common component |
-| **High (> 2)** | Bugs spread across many themes — broad instability | Module needs comprehensive regression testing |
+| **Low (< 1)** | Bugs concentrated in one issue group — focused failure mode | Easy to fix: one root cause to address |
+| **Medium (1–2)** | Bugs spread across a few issue groups | Review whether issue groups share a common component |
+| **High (> 2)** | Bugs spread across many issue groups — broad instability | Module needs comprehensive regression testing |
 """)
         ent_display = _ent_source_df.copy()
         ent_display["cluster_entropy"] = pd.to_numeric(
@@ -2399,7 +2417,7 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
                 "✅ Focused":           "#22c55e",
             },
             labels={"cluster_entropy": "Entropy (higher = more spread)",
-                    "module": "Module", "stability": "Theme breadth"},
+                    "module": "Module", "stability": "Issue Group breadth"},
             text="cluster_entropy",
         )
         fig_ent.update_traces(texttemplate="%{text:.2f}", textposition="outside")
@@ -2408,7 +2426,7 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
         fig_ent.update_layout(
             height=max(300, min(20, len(ent_display)) * 30),
             yaxis={"categoryorder": "total ascending"},
-            showlegend=True, legend_title_text="Theme breadth",
+            showlegend=True, legend_title_text="Issue Group breadth",
             margin=dict(l=10, r=80, t=10, b=10),
         )
         st.plotly_chart(fig_ent, width='stretch')
@@ -2416,12 +2434,12 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
     # ── NEW v3.0 — Severity-stratified cluster views ─────────────────────
     if cluster_s12_df is not None or cluster_s34_df is not None:
         st.markdown("---")
-        st.subheader("🔬 Severity-Stratified Themes")
+        st.subheader("🔬 Severity-Stratified Issue Groups")
         st.caption(
             "Clusters run separately for S1/S2 (crash/major) and S3/S4 (normal/minor) bugs. "
             "The global view above mixes all severities; these tabs show each tier in isolation."
         )
-        tier_tabs = st.tabs(["🔴 Critical/Major themes (S1–S2)", "🟡 Normal/Minor themes (S3–S4)"])
+        tier_tabs = st.tabs(["🔴 Critical/Major issue groups (S1–S2)", "🟡 Normal/Minor issue groups (S3–S4)"])
 
         for tab_widget, tier_df, tier_name in [
             (tier_tabs[0], cluster_s12_df, "S1/S2"),
@@ -2466,7 +2484,7 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
                     color=_tier_bar_color_col,
                     color_discrete_map=_tier_bar_color_map if _tier_bar_color_map else None,
                     hover_data=_tier_hover,
-                    labels={"count": "Bugs", "label_short": "Theme",
+                    labels={"count": "Bugs", "label_short": "Issue Group",
                             "cluster_trend": "Trend",
                             "cluster_velocity_ratio": "Velocity",
                             "recurrence_rate": "Recurrence"},
@@ -2486,7 +2504,7 @@ Recommend re-running clustering **every Friday** or whenever a new batch of buil
                     st.caption("ℹ️ Velocity/recurrence unavailable for this tier — run `cluster_bugs.py --stratify-severity` to generate stratified summary CSVs.")
 
                 # Detail cards for top 10
-                st.markdown(f"**Theme detail cards — {tier_name} tier**")
+                st.markdown(f"**Issue Group detail cards — {tier_name} tier**")
                 tier_n_clustered = tier_df["count"].sum()
                 for _ti, _tr in tier_df.head(10).iterrows():
                     _cid   = _tr.get("cluster_id", -1)
@@ -2553,7 +2571,7 @@ elif active_tab == "🔮 Defect Forecast":
         st.markdown("""
 ## 🔮 Defect Forecast — Complete Guide
 
-This tab shows you **what is likely to break in the next build** and **what concrete scenarios to test for**, driven by a machine-learning model trained on all historical ECL bug data.
+This tab shows you **what is likely to break in the next version** and **what concrete scenarios to test for**, driven by a machine-learning model trained on all historical ECL bug data.
 
 ---
 
@@ -2561,14 +2579,14 @@ This tab shows you **what is likely to break in the next build** and **what conc
 
 | Metric | What it means |
 |--------|--------------|
-| **🔴 Critical modules** | >20% learned probability of S1 critical bug next build — must be tested every build |
-| **🟠 High-risk modules** | 10–20% learned probability of S1 critical bug next build — test every sprint |
+| **🔴 Critical modules** | >20% learned probability of S1 critical bug next version — must be tested every version |
+| **🟠 High-risk modules** | 10–20% learned probability of S1 critical bug next version — test every sprint |
 | **🎯 Predicted scenarios** | Total count of concrete, testable bug scenario predictions across all modules |
 | **Total modules forecast** | Number of modules for which the model generated a prediction |
 
 ---
 
-### 🎯 What to Test Next Build (Primary Section)
+### 🎯 What to Test This Version (Primary Section)
 
 The top section shows the core output: human-readable bug scenarios grouped by risk level, listed from most to least urgent (Critical → High → Medium). Each scenario directly answers the question: *"What specific thing should I test?"*
 
@@ -2579,7 +2597,7 @@ The top section shows the core output: human-readable bug scenarios grouped by r
 
 **How scenarios are generated (the algorithm):**
 For each high-risk module, `predict_defects.py` runs these steps:
-1. Collects all bug Short Descriptions from the last 5 builds for that module
+1. Collects all bug Short Descriptions from the last 5 versions for that module
 2. Vectorises them using TF-IDF and clusters similar descriptions with `AgglomerativeClustering` (cosine distance threshold)
 3. Picks the most representative description from each cluster as the predicted scenario text
 4. Assigns confidence based on the cluster size (bugs in cluster → High/Medium/Low)
@@ -2587,7 +2605,7 @@ For each high-risk module, `predict_defects.py` runs these steps:
 
 ---
 
-### 📋 AI Risk Briefing — Next Build Focus Summary
+### 📋 AI Risk Briefing — Next Version Focus Summary
 
 A collapsible plain-English executive summary generated by `predict_defects.py`. Lists the top-risk modules with:
 - Why they are at risk (which signals are currently elevated)
@@ -2599,11 +2617,11 @@ Generated with Ollama or Claude when `--provider` is set; a heuristic text summa
 
 ### ⚠️ Severity Escalation Alerts
 
-Shown automatically for modules where bugs are getting **more severe** in recent builds.
+Shown automatically for modules where bugs are getting **more severe** in recent versions.
 
 **How `severity_escalation` is calculated:**
 ```
-severity_escalation = avg_severity(last build) − avg_severity(prior 3 builds)
+severity_escalation = avg_severity(last version) − avg_severity(prior 3 versions)
 ```
 Since severity is numbered 1 (Critical) → 4 (Minor), a **negative value** means severity is worsening toward S1. Modules with `severity_escalation < −0.3` appear here; a value of −0.8 or worse gets the 🚨 icon.
 
@@ -2613,9 +2631,9 @@ This signal can detect instability **before** bug counts spike — a pre-emptive
 
 ### 🕒 Overdue for a Critical Bug
 
-Shown for modules that historically produced S1 (crash-level) bugs regularly, but have been quiet for 5–20 recent builds. These modules are **not** fixed — they may be accumulating risk silently.
+Shown for modules that historically produced S1 (crash-level) bugs regularly, but have been quiet for 5–20 recent versions. These modules are **not** fixed — they may be accumulating risk silently.
 
-**How `builds_since_last_crit` is calculated:** For each module's training history, the feature records how many build slots have elapsed since the most recent row where `critical_count > 0`. If no critical bugs exist at all in history, the value equals the total length of that module's history (maximum caution). Modules quiet for >20 builds are excluded (likely genuinely resolved).
+**How `builds_since_last_crit` is calculated:** For each module's training history, the feature records how many version slots have elapsed since the most recent row where `critical_count > 0`. If no critical bugs exist at all in history, the value equals the total length of that module's history (maximum caution). Modules quiet for >20 versions are excluded (likely genuinely resolved).
 
 ---
 
@@ -2634,7 +2652,7 @@ A stacked bar chart (one bar per module, stacked by category) showing which **ty
 | Translation / Localization | translation, missing string, language, zh-tw, locale |
 | Data / File / Sync issue | corrupt, import/export, sync, cannot save, wrong data |
 
-`historical_pct` = this category's share of bugs in recent builds.
+`historical_pct` = this category's share of bugs in recent versions.
 `expected_next_build` = `historical_pct × predicted_total` — how many bugs of this type are expected.
 
 ---
@@ -2652,11 +2670,11 @@ One card per Critical or High-risk module (top 10). Each card contains:
 | Field | Explanation |
 |-------|-------------|
 | **Risk level** | Composite risk category (Critical/High/Medium/Low) |
-| **Bug categories expected** | Count of distinct QA categories predicted for this module next build |
-| **Actual last build** | Real observed bug count from the most recent build in training data — compare to the forecast for calibration |
+| **Bug categories expected** | Count of distinct QA categories predicted for this module next version |
+| **Actual last version** | Real observed bug count from the most recent version in training data — compare to the forecast for calibration |
 | **Severity trend** | `severity_escalation` — see Alerts section above |
-| **Builds since last critical** | `builds_since_last_crit` — see Overdue section above |
-| **Theme breadth (entropy)** | Shannon entropy of bug-theme distribution. Higher = bugs spread across many themes (broad instability). Lower = concentrated single failure mode. |
+| **Versions since last critical** | `builds_since_last_crit` — see Overdue section above |
+| **Issue Group breadth (entropy)** | Shannon entropy of issue-group distribution. Higher = bugs spread across many issue groups (broad instability). Lower = concentrated single failure mode. |
 | **Leading signal** | The single feature with the highest Pearson correlation to future bug count for this module |
 | **What types of bugs to expect** | Per-category breakdown from `_predictions_by_category.csv` showing historical % and expected count |
 | **Predicted bug scenarios** | Top 3 scenarios from `_predictions_by_scenario.csv` |
@@ -2670,25 +2688,25 @@ One card per Critical or High-risk module (top 10). Each card contains:
 A horizontal bar chart ranking features by **Pearson correlation coefficient (r)** with future bug counts.
 
 **How to read the chart:**
-- **r close to +1 (red bar, right)** — when this signal goes up, more bugs follow in the next build
+- **r close to +1 (red bar, right)** — when this signal goes up, more bugs follow in the next version
 - **r close to −1 (green bar, left)** — when this signal goes up, fewer bugs follow (protective signal)
 - **r near 0** — no consistent predictive relationship
 
-The correlations are computed across all (module, build) rows in the training dataset by comparing each feature column against the `target` (actual bug count in the next build).
+The correlations are computed across all (module, version) rows in the training dataset by comparing each feature column against the `target` (actual bug count in the next version).
 
 **Features ranked here include:**
-- `crit_1/2/3` — critical bug momentum over last 1/2/3 builds
-- `bugs_1/2/3` — total bug count momentum over last 1/2/3 builds
+- `crit_1/2/3` — critical bug momentum over last 1/2/3 versions
+- `bugs_1/2/3` — total bug count momentum over last 1/2/3 versions
 - `sev_1/2/3` — severity-weighted momentum
-- `trend` — last build minus 3 builds ago (upward slope)
+- `trend` — last version minus 3 versions ago (upward slope)
 - `severity_escalation` — worsening severity signal
 - `builds_since_last_crit` — how long since the last S1
-- `crit_ratio` — proportion of S1 bugs in last 3 builds (high ratio = structurally dangerous module)
-- `new_module` — flag for modules first appearing in recent builds (new features)
-- `cross_module_spike` — count of other modules also spiking in the same build (correlated risk)
+- `crit_ratio` — proportion of S1 bugs in last 3 versions (high ratio = structurally dangerous module)
+- `new_module` — flag for modules first appearing in recent versions (new features)
+- `cross_module_spike` — count of other modules also spiking in the same version (correlated risk)
 - `total_historical_bugs` — module maturity / overall activity level
-- `cluster_entropy_2/3` — bug-theme diversity index (when cluster data is loaded)
-- `top_cluster_velocity` — growth rate of the dominant bug theme
+- `cluster_entropy_2/3` — issue-group diversity index (when cluster data is loaded)
+- `top_cluster_velocity` — growth rate of the dominant issue group
 - TF-IDF text features — keyword loadings from recent module descriptions (last 3 versions)
 - Risk features (when loaded) — impact, detectability, probability scores from `ai_risk_scorer.py`
 
@@ -2697,7 +2715,7 @@ The correlations are computed across all (module, build) rows in the training da
 ### 🔧 Advanced / Model Diagnostics (collapsed by default)
 
 - **Predicted Bug Count bar chart** — raw predicted count per module coloured by risk level. Use the slider to control how many modules are shown.
-- **Actual vs Predicted** — side-by-side bars comparing the model's last-build forecast against the real observed count. Useful for building trust in the model's accuracy before acting on it.
+- **Actual vs Predicted** — side-by-side bars comparing the model's last-version forecast against the real observed count. Useful for building trust in the model's accuracy before acting on it.
 - **Module Signals Table** — sortable table of all numeric signals for every module, including both global and stratified forecasts, S1 ratio, and cross-module spike count.
 - **Full Predictions Table** — complete output of `_predictions.csv` with all new features (crit_ratio, new_module, cross_module_spike).
 
@@ -2705,17 +2723,17 @@ The correlations are computed across all (module, build) rows in the training da
 
 ### 🛠️ How the ML Model Works
 
-**Bug count model:** `GradientBoostingRegressor` (scikit-learn, 200 trees, max_depth=4, learning_rate=0.1). Trained to predict bug count in the next build. Two variants: a single global model and a stratified model (separate models for high- and low-activity modules).
+**Bug count model:** `GradientBoostingRegressor` (scikit-learn, 200 trees, max_depth=4, learning_rate=0.1). Trained to predict bug count in the next version. Two variants: a single global model and a stratified model (separate models for high- and low-activity modules).
 
-**Risk classifier:** `GradientBoostingClassifier` (150 trees, max_depth=3) calibrated with isotonic regression. Predicts probability of at least one S1 (Critical) bug next build. This replaces the old hand-tuned composite scoring.
+**Risk classifier:** `GradientBoostingClassifier` (150 trees, max_depth=3) calibrated with isotonic regression. Predicts probability of at least one S1 (Critical) bug next version. This replaces the old hand-tuned composite scoring.
 
 **Training validation:** 3-fold `TimeSeriesSplit` cross-validation (respects time ordering — no data leakage). The CV MAE (Mean Absolute Error) is printed at run time: it tells you how many bugs off the forecast is on average.
 
-**Feature matrix:** Built by `build_features()` in `predict_defects.py`. Each row is a (module, build) pair. Features include rolling window statistics (1/2/3 builds), critical bug ratio, new module flag, cross-module spike count, and rolling TF-IDF text features (last 3 versions). Requires at least **5 builds of history** per module; modules with less are excluded.
+**Feature matrix:** Built by `build_features()` in `predict_defects.py`. Each row is a (module, version) pair. Features include rolling window statistics (1/2/3 versions), critical bug ratio, new module flag, cross-module spike count, and rolling TF-IDF text features (last 3 versions). Requires at least **5 versions of history** per module; modules with less are excluded.
 
 **Two forecast models:** The output includes both a **global model** (one GBR across all modules) and a **stratified model** (separate GBRs for high-activity and low-activity modules). Compare the "Forecast (global)" and "Forecast (stratified)" columns in the Full Predictions Table to see if the stratified model gives better estimates for your modules.
 
-**Risk level assignment:** Risk levels are assigned by a **learned classifier** — a calibrated `GradientBoostingClassifier` trained to predict the probability of an S1 (Critical) bug in the next build. The risk score IS the model's predicted probability (0–100%). S1 bugs are ~3.6% of all bugs, so even 10% predicted probability is a 3× baseline elevation. Falls back to weighted composite scoring if the classifier has too few samples.
+**Risk level assignment:** Risk levels are assigned by a **learned classifier** — a calibrated `GradientBoostingClassifier` trained to predict the probability of an S1 (Critical) bug in the next version. The risk score IS the model's predicted probability (0–100%). S1 bugs are ~3.6% of all bugs, so even 10% predicted probability is a 3× baseline elevation. Falls back to weighted composite scoring if the classifier has too few samples.
 
 Thresholds: Critical > 20%, High 10–20%, Medium 5–10%, Low < 5%. Because these are learned probabilities, most modules will be "Low" when the product is healthy — only modules with genuine S1 risk patterns reach "Critical".
 
@@ -2784,7 +2802,17 @@ Output files saved to `data/predictions/`:
             _ent_source_df = pd.DataFrame(_ent_rows_t9)
 
     pred_df["predicted"] = pd.to_numeric(pred_df["predicted"], errors="coerce").fillna(0)
-    pred_df = pred_df.sort_values("predicted", ascending=False).reset_index(drop=True)
+    # Sort by blended priority_score when present — keeps this tab's ordering
+    # aligned with the Risk Heatmap (heatmap weights 65% of priority_score).
+    if "priority_score" in pred_df.columns and pd.to_numeric(
+            pred_df["priority_score"], errors="coerce").notna().any():
+        pred_df["priority_score"] = pd.to_numeric(
+            pred_df["priority_score"], errors="coerce").fillna(0)
+        pred_df = pred_df.sort_values(
+            ["priority_score", "predicted"], ascending=[False, False]
+        ).reset_index(drop=True)
+    else:
+        pred_df = pred_df.sort_values("predicted", ascending=False).reset_index(drop=True)
 
     FORECAST_COLORS = {
         "Critical": "#ef4444",
@@ -2795,7 +2823,7 @@ Output files saved to `data/predictions/`:
     RISK_ORDER = ["Critical", "High", "Medium", "Low"]
     RISK_ICONS   = {"Critical": "🔴", "High": "🟠", "Medium": "🟡", "Low": "🟢"}
     RISK_ADVICE  = {
-        "Critical": "Test **every build**. Focus on crash scenarios, data loss, and any recently changed functionality.",
+        "Critical": "Test **every version**. Focus on crash scenarios, data loss, and any recently changed functionality.",
         "High":     "Test **every sprint**. Run full regression for this module and check for side effects in related areas.",
         "Medium":   "Include in **release-candidate** testing. Spot-check changed areas.",
         "Low":      "Cover in the full **release cycle** pass. No special urgency.",
@@ -2809,9 +2837,9 @@ Output files saved to `data/predictions/`:
     _scenario_count = len(pred_scenario_df) if pred_scenario_df is not None else 0
     pm1, pm2, pm3, pm4 = st.columns(4)
     pm1.metric("🔴 Critical modules",  int(rl_counts.get("Critical", 0)),
-               help=">20% probability of S1 critical bug next build (learned classifier)")
+               help=">20% probability of S1 critical bug next version (learned classifier)")
     pm2.metric("🟠 High-risk modules", int(rl_counts.get("High", 0)),
-               help="10–20% probability of S1 critical bug next build (learned classifier)")
+               help="10–20% probability of S1 critical bug next version (learned classifier)")
     pm3.metric("🎯 Predicted scenarios", _scenario_count,
                help="Total concrete bug scenario predictions across all modules")
     pm4.metric("Total modules forecast", len(pred_df))
@@ -2836,24 +2864,39 @@ Output files saved to `data/predictions/`:
                 _esc_val = float(_er["severity_escalation"])
                 _esc_icon = "🚨" if _esc_val < -0.8 else "⚠️"
                 st.warning(
-                    f"{_esc_icon} **{_er['module']}** — severity worsening by "
-                    f"{abs(_esc_val):.2f} points toward S1 "
-                    f"({_er['risk_level']} risk)"
+                    f"{_esc_icon} ({_er['risk_level']} risk) **{_er['module']}** — "
+                    f"severity worsening by {abs(_esc_val):.2f} points toward S1"
                 )
 
 
-    # ── "What to Test Next Build" — PRIMARY SECTION ──────────────────────
+    # ── "What to Test This Version" — PRIMARY SECTION ──────────────────────
     st.markdown("---")
-    st.subheader("🎯 What to Test Next Build")
+    st.subheader("🎯 What to Test This Version")
 
     if pred_scenario_df is not None and not pred_scenario_df.empty:
+        _has_scenario_type = "scenario_type" in pred_scenario_df.columns
+        _has_explanation   = "explanation"   in pred_scenario_df.columns
+        _any_synth = bool(_has_scenario_type and
+                          (pred_scenario_df["scenario_type"] == "ai_synthesized").any())
+        _any_hist  = bool(_has_scenario_type and
+                          (pred_scenario_df["scenario_type"] == "historical_pattern").any())
+        _label_mix = []
+        if _any_synth: _label_mix.append("🧠 AI-synthesized scenarios")
+        if _any_hist:  _label_mix.append("📎 Historical patterns at risk of recurrence")
+        _legend = " · ".join(_label_mix) if _label_mix else ""
+
         st.caption(
-            "Concrete bug scenarios predicted for the next build, grouped by risk level. "
+            "Concrete bug scenarios predicted for the next version, grouped by risk level. "
             "Each scenario is grounded in recurring historical patterns. "
             "Only modules with enough historical data to generate specific scenarios are shown here — "
             "see the **AI Risk Briefing** below for a full ranked list of all forecast modules."
+            + (f"\n\n_Shown: {_legend}_" if _legend else "")
         )
         # Group scenarios by risk level
+        _TYPE_BADGES = {
+            "ai_synthesized":     "🧠 AI-synthesized",
+            "historical_pattern": "📎 Historical pattern",
+        }
         for _rl in ["Critical", "High", "Medium"]:
             _rl_scenarios = pred_scenario_df[pred_scenario_df["risk_level"] == _rl]
             if _rl_scenarios.empty:
@@ -2865,7 +2908,9 @@ Output files saved to `data/predictions/`:
                 for _, _sc in _mod_sc.head(3).iterrows():
                     _conf = _CONF_BADGES.get(str(_sc.get("confidence", "medium")), "⬇️ Low conf.")
                     _text = str(_sc.get("scenario_text", ""))
-                    st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{_conf} — {_text}",
+                    _type_badge = _TYPE_BADGES.get(str(_sc.get("scenario_type", "")), "")
+                    _badge_str = f" {_type_badge}" if _type_badge else ""
+                    st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{_conf}{_badge_str} — {_text}",
                                 unsafe_allow_html=True)
             st.markdown("")
     else:
@@ -2918,15 +2963,27 @@ Output files saved to `data/predictions/`:
                 "Translation / Localization":      "#3b82f6",
                 "Data / File / Sync issue":        "#06b6d4",
             }
+            # Stack bottom→top; legend reversed so top of legend = top of bar stack.
+            _CAT_STACK_ORDER = [
+                "Data / File / Sync issue",
+                "Translation / Localization",
+                "UX / Usability problem",
+                "UI / Display problem",
+                "Feature not working as intended",
+                "Crash / Stability",
+            ]
             _mod_order = [m for m in _top_mods if m in _cat_chart["module"].values]
             _cat_chart["module"] = pd.Categorical(
                 _cat_chart["module"], categories=_mod_order, ordered=True)
-            _cat_chart = _cat_chart.sort_values(["module", "expected_next_build"],
-                                                ascending=[True, False])
+            _cat_chart["category"] = pd.Categorical(
+                _cat_chart["category"], categories=_CAT_STACK_ORDER, ordered=True)
+            _cat_chart = _cat_chart.sort_values(["module", "category"],
+                                                ascending=[True, True])
             fig_cat = px.bar(
                 _cat_chart,
                 x="module", y="historical_pct", color="category",
                 color_discrete_map=_CAT_COLORS,
+                category_orders={"category": _CAT_STACK_ORDER},
                 labels={"module": "Module", "historical_pct": "Proportion of recent bugs",
                         "category": "Bug Category"},
                 hover_data={"historical_count": True, "expected_next_build": ":.1f"},
@@ -2939,6 +2996,7 @@ Output files saved to `data/predictions/`:
                 yaxis_tickformat=".0%",
                 showlegend=True,
                 legend_title_text="Bug Category",
+                legend=dict(traceorder="reversed"),
                 margin=dict(t=20, b=10),
             )
             st.plotly_chart(fig_cat, width='stretch')
@@ -2961,10 +3019,10 @@ Output files saved to `data/predictions/`:
                 f"{_sc_icon} **{_sc_mod}** — {_sc_rl} risk · {_sc_count} scenario(s)",
                 expanded=(_sc_rl == "Critical"),
             ):
-                # Show the predicted build number once at the top of the module card
+                # Show the predicted version number once at the top of the module card
                 _pred_build = _sc_mod_data.iloc[0].get("predicted_build")
                 if _pred_build is not None and str(_pred_build) not in ("nan", ""):
-                    st.caption(f"Predicted for build: **{_pred_build}**")
+                    st.caption(f"Predicted for version: **{_pred_build}**")
 
                 for _, _sc_row in _sc_mod_data.iterrows():
                     _rank = int(_sc_row.get("scenario_rank", 0))
@@ -2974,8 +3032,15 @@ Output files saved to `data/predictions/`:
                     _cats = str(_sc_row.get("supporting_categories", ""))
                     _examples = str(_sc_row.get("source_bug_examples", ""))
                     _sc_signal = str(_sc_row.get("leading_signal", ""))
+                    _sc_type = str(_sc_row.get("scenario_type", ""))
+                    _sc_expl = str(_sc_row.get("explanation", ""))
+                    _type_badge = {
+                        "ai_synthesized":     "🧠 AI-synthesized",
+                        "historical_pattern": "📎 Historical pattern",
+                    }.get(_sc_type, "")
+                    _badge_str = f" {_type_badge}" if _type_badge else ""
 
-                    st.markdown(f"**#{_rank}** {_conf_badge} — {_text}")
+                    st.markdown(f"**#{_rank}** {_conf_badge}{_badge_str} — {_text}")
                     _detail_parts = []
                     if _cats and _cats != "nan":
                         _detail_parts.append(f"Categories: {_cats}")
@@ -2985,6 +3050,9 @@ Output files saved to `data/predictions/`:
                         _detail_parts.append(f"Based on: _{_examples[:200]}_")
                     if _detail_parts:
                         st.caption(" · ".join(_detail_parts))
+                    if _sc_expl and _sc_expl not in ("nan", ""):
+                        with st.expander("❓ Why this scenario?", expanded=False):
+                            st.markdown(_sc_expl.replace("\n", "  \n"))
                     st.markdown("")
         st.markdown("---")
 
@@ -3015,21 +3083,40 @@ Output files saved to `data/predictions/`:
             if not _mc.empty:
                 _card_cat_hint = " · ".join(_mc["category"].tolist())
 
+        _quadrant = row.get("heatmap_quadrant")
+        _priority = row.get("priority_score")
+        _mod_vel  = row.get("module_cluster_velocity")
+        _quadrant_tag = ""
+        if _quadrant is not None and pd.notna(_quadrant):
+            _quadrant_tag = f" · Heatmap {str(_quadrant).split('-')[0].strip()}"
+
         if _card_cat_hint:
-            card_header = f"{icon} **{mod}** — {rl} risk · likely: {_card_cat_hint}"
+            card_header = f"{icon} **{mod}** — {rl} risk{_quadrant_tag} · likely: {_card_cat_hint}"
         else:
-            card_header = f"{icon} **{mod}** — {rl} risk"
+            card_header = f"{icon} **{mod}** — {rl} risk{_quadrant_tag}"
         with st.expander(card_header, expanded=(rl == "Critical")):
             # Row 1 — risk + context metrics
             fc1, fc2, fc3 = st.columns(3)
-            fc1.metric("Risk level", rl)
+            if _priority is not None and pd.notna(_priority):
+                fc1.metric("Priority (blended)", f"{float(_priority):.0f}",
+                           help="Blended rank: 65% heatmap risk_score_final + "
+                                "20% ML P(S1) + 15% cluster velocity")
+            else:
+                fc1.metric("Risk level", rl)
             if pred_category_df is not None and not pred_category_df.empty:
                 _mod_cats = pred_category_df[pred_category_df["module"] == mod]
                 fc2.metric("Bug categories expected", f"{len(_mod_cats)}",
-                           help="Number of distinct QA bug categories predicted for next build")
+                           help="Number of distinct QA bug categories predicted for next version")
             else:
                 fc2.metric("Predicted bugs", f"{pred_val:.0f}")
-            if target_v is not None:
+            if _mod_vel is not None and pd.notna(_mod_vel):
+                _vel_f = float(_mod_vel)
+                _vel_icon = "🔺" if _vel_f >= 1.5 else ("✅" if _vel_f <= 0.67 else "➡️")
+                fc3.metric("Cluster velocity", f"{_vel_icon} {_vel_f:.2f}×",
+                           help="Max growth rate across this module's bug clusters "
+                                "(recent 2 versions / prior 2 versions). "
+                                ">1.5× = growing.")
+            elif target_v is not None:
                 fc3.metric("Actual last version", f"{float(target_v):.0f}")
 
             # Row 2 — v3.0 signals
@@ -3058,11 +3145,11 @@ Output files saved to `data/predictions/`:
                 if mod_ent is not None:
                     _ent_label = (
                         "⚠️ Broad instability" if mod_ent > 2.0 else
-                        "🔶 Spreading themes"  if mod_ent > 1.0 else
-                        "✅ Focused theme"
+                        "🔶 Spreading issue groups"  if mod_ent > 1.0 else
+                        "✅ Focused issue group"
                     )
-                    sc3.metric("Theme breadth (entropy)", f"{mod_ent:.2f} — {_ent_label}",
-                               help="High entropy = bugs spread across many themes; low = concentrated failure mode")
+                    sc3.metric("Issue Group breadth (entropy)", f"{mod_ent:.2f} — {_ent_label}",
+                               help="High entropy = bugs spread across many issue groups; low = concentrated failure mode")
 
             st.markdown(f"**Leading signal:** _{lead_sig}_")
 
@@ -3087,7 +3174,7 @@ Output files saved to `data/predictions/`:
             if not _showed_categories and pred_cluster_df is not None and not pred_cluster_df.empty:
                 mod_clusters = pred_cluster_df[pred_cluster_df["module"] == mod].head(6)
                 if not mod_clusters.empty:
-                    st.markdown("**What to expect (by bug theme):**")
+                    st.markdown("**What to expect (by issue group):**")
                     for _, cr in mod_clusters.iterrows():
                         pct_str = f"{cr['historical_pct'] * 100:.0f}%"
                         label   = str(cr.get("cluster_label", f"Cluster {cr['cluster_id']}"))
@@ -3122,7 +3209,7 @@ Output files saved to `data/predictions/`:
         st.subheader("📡 Leading Indicators — What Predicts Future Bugs?")
         st.caption(
             "These are the current bug signals most strongly correlated with future bug counts. "
-            "A high positive value means: 'when this signal is elevated now, more bugs tend to follow next build.'"
+            "A high positive value means: 'when this signal is elevated now, more bugs tend to follow next version.'"
         )
 
         li = pred_leading_df.copy()
@@ -3183,9 +3270,9 @@ Output files saved to `data/predictions/`:
         if _overlap:
             st.info(
                 f"📡 **Tab 8 cross-reference:** {len(_overlap)} high-risk module(s) also have "
-                f"**growing bug themes** in the cluster analysis — "
+                f"**growing issue groups** in the cluster analysis — "
                 f"{', '.join(sorted(_overlap))}. "
-                f"Open **Tab 8 → Bug Clusters** to see which specific themes are accelerating."
+                f"Open **Tab 8 → Bug Clusters** to see which specific issue groups are accelerating."
             )
 
     # ── Advanced / Model Diagnostics ─────────────────────────────────────
@@ -3249,7 +3336,7 @@ Output files saved to `data/predictions/`:
 
         # Actual vs Predicted comparison
         if "target" in pred_df.columns:
-            st.markdown("#### 📈 Actual vs Predicted (last known build)")
+            st.markdown("#### 📈 Actual vs Predicted (last known version)")
             avp = pred_df.head(_adv_top_n)[["module", "target", "predicted", "risk_level"]].copy()
             avp["target"]    = pd.to_numeric(avp["target"],    errors="coerce").fillna(0)
             avp["predicted"] = pd.to_numeric(avp["predicted"], errors="coerce").fillna(0)
@@ -3273,6 +3360,7 @@ Output files saved to `data/predictions/`:
         # Module Signals Table — all numeric signals from predict_defects.py
         _sig_cols = [c for c in [
             "module", "predicted", "predicted_stratified",
+            "priority_score", "heatmap_quadrant", "module_cluster_velocity",
             "composite_risk", "risk_level",
             "severity_escalation", "builds_since_last_crit",
             "crit_ratio", "new_module", "cross_module_spike",
@@ -3291,6 +3379,9 @@ Output files saved to `data/predictions/`:
                 "module": "Module",
                 "predicted": "Forecast (global)",
                 "predicted_stratified": "Forecast (stratified)",
+                "priority_score": "Priority (blended)",
+                "heatmap_quadrant": "Heatmap quadrant",
+                "module_cluster_velocity": "Cluster velocity",
                 "composite_risk": "Risk score",
                 "risk_level": "Risk",
                 "severity_escalation": "Sev. escalation",
@@ -3301,7 +3392,7 @@ Output files saved to `data/predictions/`:
                 "total_historical_bugs": "Total historical bugs",
                 "dominant_bug_type": "Typical bug type",
                 "leading_signal": "Leading signal",
-                "cluster_entropy": "Theme breadth",
+                "cluster_entropy": "Issue Group breadth",
             }
             _sig_df = _sig_df.rename(columns=_col_labels)
             st.dataframe(_sig_df, hide_index=True, width='stretch')
@@ -3310,6 +3401,7 @@ Output files saved to `data/predictions/`:
         st.markdown("#### 📋 Full Predictions Table")
         _all_pred_cols = [c for c in [
             "module", "predicted", "predicted_stratified", "target",
+            "priority_score", "heatmap_quadrant", "module_cluster_velocity",
             "composite_risk", "risk_level",
             "dominant_bug_type", "leading_signal",
             "severity_escalation", "builds_since_last_crit",
@@ -3321,6 +3413,9 @@ Output files saved to `data/predictions/`:
             "predicted": "Forecast (global)",
             "predicted_stratified": "Forecast (stratified)",
             "target": "Actual (last version)",
+            "priority_score": "Priority (blended)",
+            "heatmap_quadrant": "Heatmap quadrant",
+            "module_cluster_velocity": "Cluster velocity",
             "composite_risk": "Risk score",
             "risk_level": "Risk level",
             "dominant_bug_type": "Typical bug type",
@@ -3340,7 +3435,7 @@ Output files saved to `data/predictions/`:
                 pred_cluster_df[["module", "cluster_label", "historical_pct", "predicted_count"]]
                 .rename(columns={
                     "module": "Module",
-                    "cluster_label": "Bug theme",
+                    "cluster_label": "Issue group",
                     "historical_pct": "Historical %",
                     "predicted_count": "Predicted bugs",
                 }),
@@ -3360,15 +3455,20 @@ Output files saved to `data/predictions/`:
                 "non-linear."
             )
             _imp = pred_importance_df.copy()
-            # The importance CSV has the feature name as index or first column
-            if "feature" not in _imp.columns and _imp.index.name:
-                _imp = _imp.reset_index().rename(columns={_imp.index.name: "feature"})
-            elif "feature" not in _imp.columns:
-                _imp = _imp.reset_index()
-                _imp.columns = ["feature", "importance"] if len(_imp.columns) == 2 else _imp.columns
-            imp_col = next((c for c in _imp.columns if c not in ("feature",) and
+            # Legacy CSV (Series.to_csv with no name) loads as ["Unnamed: 0", "0"];
+            # new CSV has an explicit "feature" column.
+            if "feature" not in _imp.columns:
+                unnamed = [c for c in _imp.columns if str(c).startswith("Unnamed")]
+                if unnamed:
+                    _imp = _imp.rename(columns={unnamed[0]: "feature"})
+            if "feature" not in _imp.columns:
+                non_numeric = [c for c in _imp.columns
+                               if not pd.api.types.is_numeric_dtype(_imp[c])]
+                if non_numeric:
+                    _imp = _imp.rename(columns={non_numeric[0]: "feature"})
+            imp_col = next((c for c in _imp.columns if c != "feature" and
                             pd.api.types.is_numeric_dtype(_imp[c])), None)
-            if imp_col:
+            if "feature" in _imp.columns and imp_col:
                 _imp = _imp[["feature", imp_col]].copy()
                 _imp[imp_col] = pd.to_numeric(_imp[imp_col], errors="coerce").fillna(0)
                 _imp = _imp.sort_values(imp_col, ascending=False).head(20)
@@ -3386,9 +3486,9 @@ Output files saved to `data/predictions/`:
                     "trend":  "Upward bug-count trend",
                     "severity_escalation":    "Severity escalation (→S1)",
                     "builds_since_last_crit": "Versions since last critical",
-                    "cluster_entropy_2":      "Bug-theme diversity (last 2 versions)",
-                    "cluster_entropy_3":      "Bug-theme diversity (last 3 versions)",
-                    "top_cluster_velocity":   "Fastest-growing theme velocity",
+                    "cluster_entropy_2":      "Bug-issue group diversity (last 2 versions)",
+                    "cluster_entropy_3":      "Bug-issue group diversity (last 3 versions)",
+                    "top_cluster_velocity":   "Fastest-growing issue group velocity",
                     "crit_ratio":             "S1 bug proportion (last 3 versions)",
                     "new_module":             "New module flag",
                     "cross_module_spike":     "Correlated cross-module spike",

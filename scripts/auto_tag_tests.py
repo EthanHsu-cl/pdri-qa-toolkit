@@ -163,7 +163,7 @@ def generate_skeleton_tests(df: pd.DataFrame,
             f'Category: {category} | Quadrant: {quadrant} | Risk: {risk:.0f} (I:{iv} x P:{pv} x D:{dv})',
         ]
         if themes:
-            lines.append(f'Predicted bug themes (next build):')
+            lines.append(f'Predicted bug themes (next version):')
             for t in themes:
                 lines.append(
                     f'  - {t["cluster_label"]} '
@@ -183,7 +183,7 @@ def generate_skeleton_tests(df: pd.DataFrame,
         ]
         if themes:
             lines.append(f'')
-            lines.append(f'    Predicted themes for next build:')
+            lines.append(f'    Predicted themes for next version:')
             for t in themes:
                 lines.append(
                     f'    - {t["cluster_label"]} '
@@ -294,7 +294,7 @@ def generate_summary(df: pd.DataFrame,
     has_themes = cluster_df is not None and not cluster_df.empty
 
     for ql, desc in [
-        ("P1 - Critical", "Every build"),
+        ("P1 - Critical", "Every version"),
         ("P2 - High",     "Daily"),
         ("P3 - Medium",   "RC only"),
         ("P4 - Low",      "RC if time"),
@@ -410,7 +410,7 @@ def generate_cluster_test_plan(df: pd.DataFrame,
         lines += [
             f"\n---\n",
             f"## {q_icon} {mod}  ({q_val} — risk score {rs_val:.0f})\n",
-            f"**Predicted bugs next build:** {pred_v}  \n",
+            f"**Predicted bugs next version:** {pred_v}  \n",
             f"**Themes to prioritise:**\n",
             f"| # | Predicted bugs | Theme | Scenario |",
             f"|---|---------------|-------|---------|",

@@ -156,15 +156,15 @@ python scripts/cluster_bugs.py data/ecl_parsed.csv \
 
 **What the new columns mean:**
 
-`cluster_velocity_ratio` — ratio of bug count in the most recent 3 builds vs the prior 3 builds for each cluster. Values above 1.5 mean that theme is accelerating and should be prioritised in testing. Values below 0.67 mean the theme is declining (fixes may be holding).
+`cluster_velocity_ratio` — ratio of bug count in the most recent 3 versions vs the prior 3 versions for each cluster. Values above 1.5 mean that theme is accelerating and should be prioritised in testing. Values below 0.67 mean the theme is declining (fixes may be holding).
 
 `cluster_trend` — "growing", "stable", or "declining". A quick filter: sort the summary by `cluster_trend == "growing"` before the weekly team meeting.
 
-`recurrence_rate` — fraction of recent bugs in this cluster whose source module also contributed to the same cluster in the prior build window. A rate above 0.5 means the root cause is not being fixed — escalate to RD.
+`recurrence_rate` — fraction of recent bugs in this cluster whose source module also contributed to the same cluster in the prior version window. A rate above 0.5 means the root cause is not being fixed — escalate to RD.
 
 `cluster_entropy` (per module) — Shannon entropy of a module's cluster distribution. Below 1.0 = all bugs in one theme (easy to target). Above 2.0 = bugs everywhere (needs comprehensive coverage).
 
-Run cadence: every Friday, or immediately after parsing a new build batch.
+Run cadence: every Friday, or immediately after parsing a new version batch.
 
 ---
 
@@ -204,12 +204,12 @@ python scripts/predict_defects.py data/ecl_parsed.csv \
 
 | Feature | What it captures |
 |---------|-----------------|
-| `severity_escalation` | Mean severity in the last build minus mean in the prior 3 builds. Negative = worsening toward S1. Catches modules about to hit a critical before it shows in counts. |
-| `builds_since_last_crit` | How many builds have elapsed since the last critical bug. Modules that haven't had an S1 in a while but have historical S1s are flagged as potentially overdue. |
-| `cluster_entropy_3 / _5` | Bug-theme diversity over the last 3 or 5 builds. Rising entropy = the module is accumulating new *kinds* of failures, not just more of the same. |
+| `severity_escalation` | Mean severity in the last version minus mean in the prior 3 versions. Negative = worsening toward S1. Catches modules about to hit a critical before it shows in counts. |
+| `builds_since_last_crit` | How many versions have elapsed since the last critical bug. Modules that haven't had an S1 in a while but have historical S1s are flagged as potentially overdue. |
+| `cluster_entropy_3 / _5` | Bug-theme diversity over the last 3 or 5 versions. Rising entropy = the module is accumulating new *kinds* of failures, not just more of the same. |
 | `top_cluster_velocity` | Growth rate of the dominant bug theme. Doubles as an early-warning signal for theme-specific regressions. |
 
-Run cadence: after every cluster run (weekly or per build batch).
+Run cadence: after every cluster run (weekly or per version batch).
 
 ---
 
