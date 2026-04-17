@@ -223,6 +223,7 @@ def _ollama_label_cluster(samples: "list[str]", model: str = "gemma4:e2b-it-q4_K
             {"role": "user", "content": user_msg},
         ],
         "stream": False,
+        "keep_alive": "10m",
         "options": {"temperature": 0.2, "num_predict": 300},
     }).encode()
     req = urllib.request.Request(
@@ -230,20 +231,39 @@ def _ollama_label_cluster(samples: "list[str]", model: str = "gemma4:e2b-it-q4_K
         data=payload,
         headers={"Content-Type": "application/json"},
     )
+    preamble_prefixes = (
+        "here", "label:", "label ", "sure", "okay", "ok,", "certainly",
+        "the label", "a concise", "based on",
+    )
     for attempt in range(retries):
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 data = json.loads(resp.read().decode())
                 raw = data.get("message", {}).get("content", "").strip()
-                lines = raw.splitlines()
-                label = lines[0].strip().strip('"\'') if lines else ""
+                label = ""
+                for ln in raw.splitlines():
+                    cleaned = ln.strip().strip('"\'').strip("*#-•· ").strip()
+                    if not cleaned:
+                        continue
+                    if cleaned.lower().startswith(preamble_prefixes):
+                        continue
+                    label = cleaned
+                    break
                 if label:
                     return label
                 if attempt < retries - 1:
                     print(f"  [label] Empty response on attempt {attempt + 1}/{retries} — retrying …",
                           file=sys.stderr)
+                else:
+                    snippet = raw.replace("\n", "\\n")[:200]
+                    print(f"  [label] All {retries} attempts returned empty/unparseable response — "
+                          f"falling back to 'unlabelled'. Last raw content: {snippet!r}",
+                          file=sys.stderr)
         except Exception as e:
             print(f"  [label] Ollama error (attempt {attempt + 1}/{retries}): {e}", file=sys.stderr)
+            if attempt == retries - 1:
+                print(f"  [label] All {retries} attempts failed — falling back to 'unlabelled'.",
+                      file=sys.stderr)
     return "unlabelled"
 
 

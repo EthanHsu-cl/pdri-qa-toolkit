@@ -44,9 +44,9 @@ STAGING="$SCRIPT_DIR/data/staging"
 LOGS="$SCRIPT_DIR/logs"
 LOG_FILE="$LOGS/refresh_$(date +%Y%m%d_%H%M%S).log"
 LOCK_FILE="$SCRIPT_DIR/.pipeline.lock"
-OLLAMA_MODEL="gemma4"
+OLLAMA_MODEL="gemma4:e2b-it-q4_K_M"
 EMBED_MODEL="nomic-embed-text"
-CLUSTER_LABEL_MODEL="llama3.1"
+CLUSTER_LABEL_MODEL="gemma4"
 STREAMLIT_PORT=8501
 export PYTHONUNBUFFERED=1   # force Python to flush stdout line-by-line when piped
 
