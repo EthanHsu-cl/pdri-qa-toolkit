@@ -44,9 +44,9 @@ STAGING="$SCRIPT_DIR/data/staging"
 LOGS="$SCRIPT_DIR/logs"
 LOG_FILE="$LOGS/refresh_$(date +%Y%m%d_%H%M%S).log"
 LOCK_FILE="$SCRIPT_DIR/.pipeline.lock"
-OLLAMA_MODEL="gemma4:e2b-it-q4_K_M"
+OLLAMA_MODEL="gemma4"
 EMBED_MODEL="nomic-embed-text"
-CLUSTER_LABEL_MODEL="gemma4"
+CLUSTER_LABEL_MODEL="llama3.1"
 STREAMLIT_PORT=8501
 export PYTHONUNBUFFERED=1   # force Python to flush stdout line-by-line when piped
 
@@ -58,30 +58,37 @@ WEEKEND_PRODUCTS="pdri:36 phdi:36 pdra:36 phda:36 pdr:36 phd:36 promeo:36 vvg:36
 # ── Flags ─────────────────────────────────────────────────────────────────────
 DRY_RUN=false
 SKIP_OLLAMA=false
+SKIP_OLLAMA_MATCHER=false
+SKIP_EMBEDDING_MATCHER=false
 SKIP_CLUSTER=false
 SKIP_PREDICT=false
 FORCE_RELABEL=false
 OVERRIDE_PRODUCTS=""
 OVERRIDE_DURATION=""
 FORCE_SCHEDULE=""
+OLLAMA_MATCHER_MODEL=""
 
 for arg in "$@"; do
   case $arg in
-    --dry-run)            DRY_RUN=true ;;
-    --skip-ollama)        SKIP_OLLAMA=true ;;
-    --skip-cluster)       SKIP_CLUSTER=true ;;
-    --skip-predict)       SKIP_PREDICT=true ;;
-    --force-relabel)      FORCE_RELABEL=true ;;
-    --weekday)            FORCE_SCHEDULE=weekday ;;
-    --weekend|--full)     FORCE_SCHEDULE=weekend ;;
-    --products=*)         OVERRIDE_PRODUCTS="${arg#*=}" ;;
-    --products)           ;; # value comes in next arg
-    --duration-months=*)  OVERRIDE_DURATION="${arg#*=}" ;;
-    --duration-months)    ;; # value comes in next arg
-    --ollama-model=*)     OLLAMA_MODEL="${arg#*=}" ;;
-    --ollama-model)       ;; # value comes in next arg
-    --embed-model=*)      EMBED_MODEL="${arg#*=}" ;;
-    --embed-model)        ;; # value comes in next arg
+    --dry-run)                  DRY_RUN=true ;;
+    --skip-ollama)              SKIP_OLLAMA=true ;;
+    --skip-ollama-matcher)      SKIP_OLLAMA_MATCHER=true ;;
+    --skip-embedding-matcher)   SKIP_EMBEDDING_MATCHER=true ;;
+    --skip-cluster)             SKIP_CLUSTER=true ;;
+    --skip-predict)             SKIP_PREDICT=true ;;
+    --force-relabel)            FORCE_RELABEL=true ;;
+    --weekday)                  FORCE_SCHEDULE=weekday ;;
+    --weekend|--full)           FORCE_SCHEDULE=weekend ;;
+    --products=*)               OVERRIDE_PRODUCTS="${arg#*=}" ;;
+    --products)                 ;; # value comes in next arg
+    --duration-months=*)        OVERRIDE_DURATION="${arg#*=}" ;;
+    --duration-months)          ;; # value comes in next arg
+    --ollama-model=*)           OLLAMA_MODEL="${arg#*=}" ;;
+    --ollama-model)             ;; # value comes in next arg
+    --ollama-matcher-model=*)   OLLAMA_MATCHER_MODEL="${arg#*=}" ;;
+    --ollama-matcher-model)     ;; # value comes in next arg
+    --embed-model=*)            EMBED_MODEL="${arg#*=}" ;;
+    --embed-model)              ;; # value comes in next arg
     *)
       # Handle --products VALUE and --duration-months VALUE (space-separated)
       ;;
@@ -106,6 +113,12 @@ while [[ $# -gt 0 ]]; do
     --ollama-model)
       if [[ $# -gt 1 && ! "$2" =~ ^-- ]]; then
         OLLAMA_MODEL="$2"
+        shift
+      fi
+      ;;
+    --ollama-matcher-model)
+      if [[ $# -gt 1 && ! "$2" =~ ^-- ]]; then
+        OLLAMA_MATCHER_MODEL="$2"
         shift
       fi
       ;;
@@ -251,6 +264,15 @@ run_product_pipeline() {
     for f in "$DATA_PRODUCT"/module_mappings/versions/*.json; do
       [ -f "$f" ] && cp "$f" "$STAGING_PRODUCT/module_mappings/versions/$(basename "$f")"
     done
+    # Carry over caches so repeated raw strings skip Ollama / re-embedding.
+    if [ -f "$DATA_PRODUCT/module_mappings/ollama_cache.json" ]; then
+      cp "$DATA_PRODUCT/module_mappings/ollama_cache.json" \
+         "$STAGING_PRODUCT/module_mappings/ollama_cache.json"
+    fi
+    if [ -f "$DATA_PRODUCT/module_mappings/canonical_embeddings.json" ]; then
+      cp "$DATA_PRODUCT/module_mappings/canonical_embeddings.json" \
+         "$STAGING_PRODUCT/module_mappings/canonical_embeddings.json"
+    fi
     log "  Seeded staging module_mappings from live data."
   fi
 
@@ -261,6 +283,26 @@ run_product_pipeline() {
     pdr|phd) CHUNK_ARG="--chunk-months 6" ;;
     *)       CHUNK_ARG="" ;;
   esac
+
+  # Enable Ollama semantic matcher in the parser subprocess unless the user opted
+  # out. Env vars propagate through fetch_from_n8n.py's subprocess call.
+  if ! $SKIP_OLLAMA && ! $SKIP_OLLAMA_MATCHER; then
+    export PDRI_OLLAMA_MATCHER=1
+    export PDRI_OLLAMA_MATCHER_MODEL="${OLLAMA_MATCHER_MODEL:-$OLLAMA_MODEL}"
+  else
+    unset PDRI_OLLAMA_MATCHER
+    unset PDRI_OLLAMA_MATCHER_MODEL
+  fi
+
+  # Enable embedding-based canonical retrieval (default on when Ollama matcher
+  # is active). Uses nomic-embed-text for cosine similarity top-K.
+  if ! $SKIP_OLLAMA && ! $SKIP_EMBEDDING_MATCHER; then
+    export PDRI_EMBEDDING_MATCHER=1
+    export PDRI_EMBEDDING_MODEL="$EMBED_MODEL"
+  else
+    unset PDRI_EMBEDDING_MATCHER
+    unset PDRI_EMBEDDING_MODEL
+  fi
 
   run "python scripts/fetch_from_n8n.py \
     --product '$SLUG' \
@@ -277,13 +319,21 @@ run_product_pipeline() {
   [ -f "$STAGING_PRODUCT/version_catalogue.csv" ] && \
     promote "$STAGING_PRODUCT/version_catalogue.csv" "$DATA_PRODUCT/version_catalogue.csv"
 
-  # Promote module mappings (pending/confirmed JSON + permanent store)
+  # Promote module mappings (pending/confirmed JSON + permanent store + LLM cache)
   if [ -d "$STAGING_PRODUCT/module_mappings" ]; then
     if [ -d "$STAGING_PRODUCT/module_mappings/versions" ]; then
       promote_dir "$STAGING_PRODUCT/module_mappings/versions" "$DATA_PRODUCT/module_mappings/versions"
     fi
     if [ -d "$STAGING_PRODUCT/module_mappings/permanent" ]; then
       promote_dir "$STAGING_PRODUCT/module_mappings/permanent" "$DATA_PRODUCT/module_mappings/permanent"
+    fi
+    if [ -f "$STAGING_PRODUCT/module_mappings/ollama_cache.json" ]; then
+      promote "$STAGING_PRODUCT/module_mappings/ollama_cache.json" \
+        "$DATA_PRODUCT/module_mappings/ollama_cache.json"
+    fi
+    if [ -f "$STAGING_PRODUCT/module_mappings/canonical_embeddings.json" ]; then
+      promote "$STAGING_PRODUCT/module_mappings/canonical_embeddings.json" \
+        "$DATA_PRODUCT/module_mappings/canonical_embeddings.json"
     fi
   fi
 
@@ -457,7 +507,7 @@ resolve_product_schedule() {
 
 log "======================================================"
 log "QA Daily Refresh  $(date '+%Y-%m-%d %H:%M:%S')"
-log "dry_run=$DRY_RUN  skip_ollama=$SKIP_OLLAMA  skip_cluster=$SKIP_CLUSTER  skip_predict=$SKIP_PREDICT  force_relabel=$FORCE_RELABEL  force_schedule=$FORCE_SCHEDULE  ollama_model=$OLLAMA_MODEL  embed_model=$EMBED_MODEL  cluster_label_model=$CLUSTER_LABEL_MODEL"
+log "dry_run=$DRY_RUN  skip_ollama=$SKIP_OLLAMA  skip_ollama_matcher=$SKIP_OLLAMA_MATCHER  skip_cluster=$SKIP_CLUSTER  skip_predict=$SKIP_PREDICT  force_relabel=$FORCE_RELABEL  force_schedule=$FORCE_SCHEDULE  ollama_model=$OLLAMA_MODEL  ollama_matcher_model=${OLLAMA_MATCHER_MODEL:-<inherit>}  embed_model=$EMBED_MODEL  cluster_label_model=$CLUSTER_LABEL_MODEL"
 log "======================================================"
 
 # 1. Make sure Streamlit is up before we do anything

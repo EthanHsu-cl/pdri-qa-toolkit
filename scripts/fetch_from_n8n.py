@@ -26,6 +26,7 @@ import urllib.error
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
+from tqdm import tqdm
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -186,7 +187,7 @@ def save_json(records: list[dict], output_path: str) -> dict:
 
     n_new = n_updated = n_unchanged = 0
 
-    for rec in records:
+    for rec in tqdm(records, desc="Merging records", unit="bug", file=sys.stderr):
         code = rec.get("BugCode")
         if not code:
             continue
@@ -309,11 +310,12 @@ def fetch_bugs_chunked(
         remaining -= size
 
     all_records: dict[str, dict] = {}
-    for i, (date_from, date_to) in enumerate(chunks, 1):
-        print(f"  Chunk {i}/{len(chunks)}: {date_from[:10]} → {date_to[:10]}")
+    for date_from, date_to in tqdm(chunks, desc="Fetching chunks", unit="chunk",
+                                    file=sys.stderr):
+        tqdm.write(f"  {date_from[:10]} → {date_to[:10]}", file=sys.stderr)
         payload = {**base_payload, "date_from": date_from, "date_to": date_to}
         records = fetch_bugs(webhook_url, payload, timeout=timeout)
-        print(f"    → {len(records):,} records")
+        tqdm.write(f"    → {len(records):,} records", file=sys.stderr)
         for rec in records:
             code = rec.get("BugCode")
             if code:

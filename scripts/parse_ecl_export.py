@@ -46,13 +46,19 @@ Usage (JSON from n8n webhook — new):
   Or in one step:
   python scripts/fetch_from_n8n.py --then-parse
 """
+import hashlib
+import os
 import re
 import sys
 import json
+import time
+import urllib.request
+import urllib.error
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from typing import Optional
 
@@ -64,6 +70,148 @@ except ImportError:
     FUZZY_AVAILABLE = False
     print("WARNING: rapidfuzz not installed. Run: pip install rapidfuzz")
     print("         Falling back to exact alias matching only.")
+
+# Ollama semantic matcher — re-ranks rapidfuzz top-K candidates with an LLM.
+# Enabled via env var PDRI_OLLAMA_MATCHER=1 or CLI --ollama-matcher.
+OLLAMA_MATCHER_URL = "http://localhost:11434/api/generate"
+OLLAMA_MATCHER_DEFAULT_MODEL = "gemma4"
+OLLAMA_MATCHER_TIMEOUT = 30
+_OLLAMA_MATCHER_MEM_CACHE: dict[str, dict] = {}
+
+# Ollama embedding-based candidate retrieval — replaces rapidfuzz as the
+# primary source of top-K candidates fed to the LLM disambiguator.
+OLLAMA_EMBED_URL = "http://localhost:11434/api/embeddings"
+OLLAMA_EMBED_DEFAULT_MODEL = "nomic-embed-text"
+
+
+class _CanonicalEmbedder:
+    """Lazy singleton: embeds all canonical modules, supports top-K cosine retrieval.
+
+    Initialized once per pipeline run. Falls back gracefully when Ollama is down
+    (``ready`` stays False, callers fall through to rapidfuzz).
+    """
+
+    _instance: "_CanonicalEmbedder | None" = None
+
+    def __init__(self):
+        self._matrix: "np.ndarray | None" = None
+        self._names: list[str] = []
+        self._ready = False
+        self._model = (
+            os.environ.get("PDRI_EMBEDDING_MODEL", "").strip()
+            or OLLAMA_EMBED_DEFAULT_MODEL
+        )
+        self._cache_dir: "Path | None" = None
+
+    @classmethod
+    def get(cls) -> "_CanonicalEmbedder":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    @property
+    def ready(self) -> bool:
+        return self._ready
+
+    def initialize(self, cache_dir: "Path | None" = None):
+        if self._ready:
+            return
+
+        texts, names = [], []
+        for m in sorted(set(_CANONICAL_MODULES)):
+            cat = _MODULE_TO_CATEGORY.get(m.lower(), "")
+            texts.append(f"{m} ({cat})" if cat else m)
+            names.append(m)
+
+        fingerprint = hashlib.sha1(json.dumps(names).encode()).hexdigest()[:16]
+
+        cache_path: "Path | None" = None
+        if cache_dir:
+            self._cache_dir = cache_dir
+            cache_path = cache_dir / "canonical_embeddings.json"
+            if cache_path.exists():
+                try:
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        cached = json.load(f)
+                    if (
+                        cached.get("fingerprint") == fingerprint
+                        and cached.get("model") == self._model
+                        and len(cached.get("vectors", [])) == len(names)
+                    ):
+                        self._matrix = np.array(cached["vectors"], dtype=np.float32)
+                        self._names = cached["names"]
+                        self._ready = True
+                        print(
+                            f"  [embed-matcher] Loaded {len(names)} canonical embeddings from cache.",
+                            file=sys.stderr,
+                        )
+                        return
+                except Exception:
+                    pass
+
+        print(
+            f"  [embed-matcher] Building {len(names)} canonical embeddings ({self._model})...",
+            file=sys.stderr,
+        )
+        vectors = []
+        for text in texts:
+            vec = self._embed(text)
+            if vec is None:
+                print(
+                    "  [embed-matcher] Ollama unreachable — falling back to rapidfuzz.",
+                    file=sys.stderr,
+                )
+                return
+            vectors.append(vec)
+
+        self._matrix = np.array(vectors, dtype=np.float32)
+        self._names = names
+        self._ready = True
+
+        if cache_path:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "fingerprint": fingerprint,
+                        "model": self._model,
+                        "dim": int(self._matrix.shape[1]),
+                        "names": names,
+                        "vectors": self._matrix.tolist(),
+                    },
+                    f,
+                )
+            print(
+                f"  [embed-matcher] Cached {len(names)} embeddings to {cache_path.name}.",
+                file=sys.stderr,
+            )
+
+    def _embed(self, text: str) -> "list[float] | None":
+        payload = json.dumps({"model": self._model, "prompt": text}).encode()
+        req = urllib.request.Request(
+            OLLAMA_EMBED_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read().decode()).get("embedding")
+        except Exception:
+            return None
+
+    def top_k(self, raw: str, k: int = 8) -> "list[tuple[str, float]]":
+        if not self._ready:
+            return []
+        vec = self._embed(raw)
+        if vec is None:
+            return []
+        from sklearn.metrics.pairwise import cosine_similarity
+
+        query = np.array([vec], dtype=np.float32)
+        sims = cosine_similarity(query, self._matrix)[0]
+        top_indices = np.argsort(sims)[::-1][:k]
+        return [(self._names[i], float(sims[i])) for i in top_indices]
+
 
 # ---------------------------------------------------------------------
 # Issue 2 – Status classification
@@ -340,6 +488,66 @@ MODULE_ALIASES.update({
     "Fx":                   "FX",
     "Color filter":         "Color Filter",
     "AI Audio tool":        "AI Audio Tool",
+    # Typos & variants from ECL data
+    "Launcer":              "Launcher",
+    "Luancher":             "Launcher",
+    "Launcher - Shortcut":  "Launcher Shortcut",
+    "Launcher - Top Banner": "Launcher",
+    "Shortcit":             "Shortcut",
+    "Shorcut":              "Shortcut",
+    "Shortut":              "Shortcut",
+    "Sortcut":              "Shortcut",
+    "Shortcuts":            "Shortcut",
+    "Shortcut - Manage":    "Shortcut",
+    "Speech to Tex":        "Speech to Text",
+    "Summner Promotion":    "Summer Promotion",
+    "OBON Prmotion":        "OBON Promotion",
+    "Full Screen Preivew":  "Full Screen Preview",
+    "ChromaKey":            "Chroma Key",
+    "AISticker":            "AI Sticker",
+    "AIColor":              "AI Color",
+    "Add Medi":             "Add Media",
+    "Media library":        "Media",
+    "Fit & Fill":           "Fill",
+    "My Project":           "My Projects",
+    "Tempo Effects":        "Tempo Effect",
+    "TalkingAvatar":        "Talking Avatar",
+    "Social Sign-In":       "Social Sign In",
+    "Log In page":          "Sign In",
+    "Sign in dialog":       "Sign In",
+    "Churn recover":        "Churn Recovery",
+    "Open intro":           "Opening Intro",
+    "Settings Transition":  "Settings",
+    "Maxpanel":             "Mixpanel",
+    "Sticker 's Series":    "Sticker",
+    "Mixtape":              "Mixpanel",
+    "Tools menu":           "Tool Menu",
+    "Main Toolbar":         "Main Tool Menu",
+    "Intro Designer":       "Intro/Outro",
+    "Title Designer":       "Title",
+    "Edit Toolbar":         "Editor",
+    "Halloween Credit System": "Credit System",
+    "Halloween Credits":    "Credit System",
+    "Halloween Credit Page": "Credit System",
+    "Halloween Credit Purchase": "Credit System",
+    "VIP Benefits":         "VIP Benefit page",
+    "VIP Benefit":          "VIP Benefit page",
+    "iStock Premium":       "iStock",
+    "iStock Pro":           "iStock",
+    "Face Beautify":        "Beautify",
+    "APP Store":            "More",
+    "Download Data":        "Export",
+    "Expand":               "AI Expand",
+    "Promote":              "Cross Promote",
+    "Deeplink":              "Launcher",
+    "Result page":          "Export",
+    # Edge-case typos/abbreviations
+    "Speech to text":       "Speech to Text",
+    "Shortcut - AI Anime":  "Shortcut",
+    "Transition - Portrait": "Transition",
+    "Permission Produce":   "Permission",
+    "Opening":              "Opening Intro",
+    "Settings Preferences Delete Date": "Preferences",
 })
 
 # Lowercase shadow for O(1) alias lookup — rebuilt after all updates
@@ -382,6 +590,13 @@ MODULE_CATEGORIES = {
         "AI Avatar",
         "Draw to Image",
         "Image Fusion",
+        "AI Sticker",
+        "AI Video Enhancer",
+        "AI Audio",
+        "AI Audio Denoise",
+        "AI Color",
+        "TalkingAvatar",
+        "TTI",
     ],
     "Editor Core": [
         "Project",
@@ -419,6 +634,14 @@ MODULE_CATEGORIES = {
         "PiP",
         "Drag and Drop",
         "Edit Room",
+        "Canvas",
+        "Crop",
+        "Toolbar",
+        "Main Menu",
+        "Main Tool Menu",
+        "Tool Menu",
+        "Main Toolbar",
+        "Landscape",
     ],
     "Audio": [
         "Audio",
@@ -428,6 +651,7 @@ MODULE_CATEGORIES = {
         "Sound FX",
         "Extract Audio",
         "Text to Speech",
+        "Speech to Text",
         "HQ Audio Denoise",
         "Denoise",
         "Speech Enhancer",
@@ -439,6 +663,13 @@ MODULE_CATEGORIES = {
         "Audio Tool",
         "Meta Sound",
         "My Voice",
+        "AI Audio Tool",
+        "AI Music",
+        "BGM",
+        "Creator Music",
+        "Search Music",
+        "Audio beats Marker",
+        "Timeline audio",
     ],
     "Text & Captions": [
         "Text",
@@ -456,6 +687,9 @@ MODULE_CATEGORIES = {
         "Title",
         "Auto Caption",
         "Intro/Outro",
+        "Title Animation",
+        "Text Animation",
+        "Neon title",
     ],
     "Visual Effects": [
         "Effects",
@@ -474,6 +708,16 @@ MODULE_CATEGORIES = {
         "AI Effect",
         "Magnifier",
         "Blur Tool",
+        "Effect",
+        "Video Effect Layer",
+        "Filter Layer",
+        "Video FX",
+        "FX",
+        "Tempo Effect",
+        "Tempo Effects",
+        "PiP Animation",
+        "Color filter layer",
+        "Decor",
     ],
     "Color & Adjust": [
         "Adjust",
@@ -489,6 +733,7 @@ MODULE_CATEGORIES = {
         "Color Board",
         "Color Selector",
         "HDR",
+        "Adjustment",
     ],
     "Background & Cutout": [
         "Background",
@@ -497,7 +742,9 @@ MODULE_CATEGORIES = {
         "Replace Background",
         "Replace BG",
         "Chroma Key",
+        "ChromaKey",
         "Mask",
+        "Advanced Cutout",
     ],
     "Enhance & Fix": [
         "Enhance",
@@ -530,12 +777,17 @@ MODULE_CATEGORIES = {
         "Share extension",
         "Produce",
         "Preview",
+        "Full Screen Preview",
+        "Import",
     ],
     "UI & Settings": [
         "Settings",
         "Preference",
+        "Preferences",
         "Tutorials & Tips",
         "VIP Benefit page",
+        "VIP Benefits",
+        "VIP Benefit",
         "Trending",
         "Camera",
         "Video",
@@ -562,8 +814,16 @@ MODULE_CATEGORIES = {
         "Mine",
         "Quick Actions",
         "Collage",
+        "Watermark",
+        "Premium",
+        "Home",
+        "Hint",
+        "My Project",
+        "My Projects",
+        "Log Event",
+        "APNG",
     ],
-    "Launcher": ["Launcher", "Launch", "Opening Intro", "Splash", "Opening Tutorial", "Recent Task"],
+    "Launcher": ["Launcher", "Launch", "Opening Intro", "Splash", "Opening Tutorial", "Recent Task", "Launcher Shortcut"],
     "Media Picker": [
         "Add Media",
         "Add Image",
@@ -576,8 +836,15 @@ MODULE_CATEGORIES = {
         "iStock",
         "Photo Picker",
         "Cloud Storage (Media Picker)",
+        "Pixabay",
+        "Getty Image Premium",
+        "Shutterstock",
+        "Media",
+        "Sample Project",
+        "Demo Project",
+        "Demo Video",
     ],
-    "Cloud": ["Cloud Storage", "My Cloud", "Back Up to My Device"],
+    "Cloud": ["Cloud Storage", "My Cloud", "Back Up to My Device", "Cloud"],
     "IAP": [
         "IAP",
         "Pro+",
@@ -592,12 +859,34 @@ MODULE_CATEGORIES = {
         "New Year Sale",
         "Christmas",
         "Churn Recovery",
+        "Subscription",
+        "Credit IAP",
+        "Credit System",
+        "Pro",
+        "IAP page",
+        "Shortcut IAP",
+        "JP IAP",
+        "Summer Promotion",
+        "OBON Promotion",
+        "Cross Promote",
+        "Cross-Promote",
+        "Halloween Sale",
+        "Halloween Interstitial",
+        "Halloween Launcher",
+        "Halloween Credit System",
+        "Halloween Credits",
+        "Halloween Credit Page",
+        "Halloween Credit Purchase",
+        "Christmas & New Year",
+        "Redeem Code",
+        "Try Before Buy",
+        "Gamification",
     ],
-    "Analytics": ["Mixpanel", "Appsflyer", "Flurry Log"],
+    "Analytics": ["Mixpanel", "Appsflyer", "Flurry Log", "Flurry", "Meta", "Log Event"],
     "Sign In": ["Sign In", "Social Sign In", "Account", "User Sign In", "GDPR"],
     "Shortcut": ["Shortcut"],
     "Notification": ["Notification", "Push Notification", "Menu(Notification)"],
-    "QA / Testing": ["Demo", "Setup", "Installer Package", "Third party", "CS", "App icon"],
+    "QA / Testing": ["Demo", "Setup", "Installer Package", "Third party", "CS", "App icon", "Independent Entry", "Shrink mode", "Deeplink"],
 }
 
 _FLAT_OVERRIDES = {
@@ -780,6 +1069,13 @@ _FLAT_OVERRIDES = {
     "Photo Picker": "Media Picker",
 }
 
+# Build canonical module list BEFORE update() which overwrites list values
+# with string category names for flat overrides.
+_CANONICAL_MODULES = list(
+    {m for mods in MODULE_CATEGORIES.values() if isinstance(mods, list) for m in mods}
+    | set(_FLAT_OVERRIDES.keys())
+)
+
 MODULE_CATEGORIES.update(_FLAT_OVERRIDES)
 
 _MODULE_TO_CATEGORY = {}
@@ -789,15 +1085,6 @@ for cat, modules in MODULE_CATEGORIES.items():
             _MODULE_TO_CATEGORY[m.lower()] = cat
     elif isinstance(modules, str):
         _MODULE_TO_CATEGORY[cat.lower()] = modules
-
-_CANONICAL_MODULES = list(
-    {
-        m
-        for mods in MODULE_CATEGORIES.values()
-        if isinstance(mods, list)
-        for m in mods
-    }
-)
 
 KNOWN_TAGS = [
     "EDF",
@@ -866,6 +1153,19 @@ class VersionMappingStore:
 
         self._permanent = self._load_json(self.permanent_path)
         self._confirmed_cache: dict[str, dict] = {}
+        # Persistent Ollama matcher decisions across pipeline runs.
+        self._ollama_disk_cache: dict = self._load_json(
+            self.mapping_dir / "ollama_cache.json"
+        )
+        # Seed the in-process cache from disk so repeated rows in the same run
+        # hit the warm cache even before the LLM is queried once.
+        for k, v in self._ollama_disk_cache.items():
+            _OLLAMA_MATCHER_MEM_CACHE.setdefault(k, v)
+
+        if _embedding_matcher_enabled():
+            embedder = _CanonicalEmbedder.get()
+            if not embedder.ready:
+                embedder.initialize(self.mapping_dir)
 
     def _load_json(self, path: Path) -> dict:
         if path.exists():
@@ -923,6 +1223,139 @@ class VersionMappingStore:
             f"  ✅ Promoted {len(confirmed)} mappings from {version} to permanent store."
         )
 
+    def ollama_cache_path(self) -> Path:
+        return self.mapping_dir / "ollama_cache.json"
+
+    def load_ollama_cache(self) -> dict:
+        return self._load_json(self.ollama_cache_path())
+
+    def save_ollama_cache(self, cache: dict):
+        self._save_json(self.ollama_cache_path(), cache)
+
+
+def _ollama_disambiguate(raw: str, candidates: list[str], model: str) -> Optional[dict]:
+    """Ask a local Ollama model to pick the best canonical match for `raw`
+    from the supplied `candidates`. Returns {"match": str|None, "confidence": float,
+    "reason": str} on success, or None if the call failed / produced invalid JSON.
+
+    Fail-soft: network, JSON, and model errors all return None so the caller
+    can fall back to the rapidfuzz pre-filter's top-1 suggestion.
+    """
+    numbered = "\n".join(f"  {i+1}. {c}" for i, c in enumerate(candidates))
+    prompt = (
+        "You are matching raw bug-report module names to a canonical module list.\n"
+        f'Raw module name: "{raw}"\n'
+        "Candidates (choose one OR return null):\n"
+        f"{numbered}\n\n"
+        'Return STRICT JSON only: {"match": "<exact canonical or null>", '
+        '"confidence": <0-1>, "reason": "<<=10 words>"}\n'
+        "Rules:\n"
+        "- If the raw name is semantically unrelated to all candidates, return null.\n"
+        "- Do NOT match typo-neighbors that mean different things "
+        "(e.g. Decor≠Demo, Hint≠Tint, Mixtape≠Mixpanel, Import≠Export).\n"
+        "- Do NOT drop semantic qualifiers: 'AI Sticker' does NOT match 'Sticker' "
+        "unless 'AI Sticker' is literally in the candidate list.\n"
+        "- When in doubt, return null — a human will review.\n"
+        "- confidence should be >=0.9 only when you are certain; otherwise lower.\n"
+    )
+    payload = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0},
+    }).encode()
+    req = urllib.request.Request(
+        OLLAMA_MATCHER_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=OLLAMA_MATCHER_TIMEOUT)
+        envelope = json.loads(resp.read().decode(errors="replace"))
+        text = envelope.get("response", "").strip()
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError:
+            m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+            if not m:
+                return None
+            obj = json.loads(m.group(0))
+        match = obj.get("match")
+        if match is not None:
+            match = str(match).strip()
+            if match.lower() in ("null", "none", ""):
+                match = None
+            elif match not in candidates:
+                # LLM invented a name; treat as no-match so rapidfuzz top-1 wins.
+                return None
+        try:
+            confidence = float(obj.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return {
+            "match": match,
+            "confidence": max(0.0, min(1.0, confidence)),
+            "reason": str(obj.get("reason", ""))[:120],
+        }
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
+        return None
+    except Exception:
+        return None
+
+
+def _ollama_matcher_enabled() -> bool:
+    val = os.environ.get("PDRI_OLLAMA_MATCHER", "").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
+def _ollama_matcher_model() -> str:
+    return os.environ.get("PDRI_OLLAMA_MATCHER_MODEL", OLLAMA_MATCHER_DEFAULT_MODEL).strip() \
+        or OLLAMA_MATCHER_DEFAULT_MODEL
+
+
+def _embedding_matcher_enabled() -> bool:
+    val = os.environ.get("PDRI_EMBEDDING_MATCHER", "").strip().lower()
+    if val in ("0", "false", "no", "off"):
+        return False
+    return _ollama_matcher_enabled() or val in ("1", "true", "yes", "on")
+
+
+def suggest_canonical(
+    raw: str, cache_dir: "Path | None" = None
+) -> "tuple[str | None, float]":
+    """Suggest a canonical module name for *raw* using embeddings + LLM.
+
+    Public API for the Streamlit "AI Re-suggest blank rows" button.
+    Returns ``(canonical_name_or_None, confidence)``.
+    """
+    embedder = _CanonicalEmbedder.get()
+    if not embedder.ready:
+        embedder.initialize(cache_dir)
+    if not embedder.ready:
+        return (None, 0.0)
+
+    candidates_with_scores = embedder.top_k(raw, k=8)
+    if not candidates_with_scores:
+        return (None, 0.0)
+
+    candidates = [name for name, _ in candidates_with_scores]
+
+    cached = _OLLAMA_MATCHER_MEM_CACHE.get(raw)
+    if cached is not None:
+        pick = cached.get("match")
+        conf = float(cached.get("confidence", 0.0))
+        return (pick, conf)
+
+    result = _ollama_disambiguate(raw, candidates, _ollama_matcher_model())
+    if result is not None:
+        _OLLAMA_MATCHER_MEM_CACHE[raw] = result
+        pick = result.get("match")
+        conf = float(result.get("confidence", 0.0))
+        return (pick, conf)
+
+    return (None, 0.0)
+
 
 def normalize_module(raw: str, version: str = "unknown",
                      store: VersionMappingStore = None,
@@ -952,6 +1385,11 @@ def normalize_module(raw: str, version: str = "unknown",
     stripped = re.sub(r'\s*\([^)]*\)', '', mod).strip()
     if stripped:
         mod = stripped
+    # Dangling open paren/bracket/brace from truncated raw strings
+    # (e.g. "Produce (16", "Shortcut[CHT", "Produce {16").
+    stripped = re.sub(r'\s*[\(\[\{][^\)\]\}]*$', '', mod).strip()
+    if stripped:
+        mod = stripped
 
     # (b) Take first token of comma-separated multi-module strings:
     #     "Text, title, MGT"           -> "Text"
@@ -963,10 +1401,14 @@ def normalize_module(raw: str, version: str = "unknown",
         if first:  # guard against leading-comma edge cases
             mod = first
 
-    # (c) Handle "Parent>Child" and "Parent/Child" notation:
-    #     "Menu>Sign in"               -> "Menu"
-    #     "Audio> GettyImage Music"    -> "Audio"
-    for sep in (">", ):
+    # (c) Handle compound "Parent<sep>Child" notation by taking the first token.
+    #     "Menu>Sign in"                 -> "Menu"
+    #     "Audio> GettyImage Music"      -> "Audio"
+    #     "Filter/Transition"            -> "Filter"
+    #     "Text\\Animation"              -> "Text"
+    #     "Cutout + Fx"                  -> "Cutout"
+    #     "AI Effect/Video FX"           -> "AI Effect"
+    for sep in (">", "/", "\\", "+"):
         if sep in mod:
             first = mod.split(sep)[0].strip()
             if first:
@@ -1008,23 +1450,101 @@ def normalize_module(raw: str, version: str = "unknown",
         if result:
             return result
 
-    # Step 4: Fuzzy match
-    if FUZZY_AVAILABLE and len(mod) >= 4:
-        match, score, _ = process.extractOne(
-            mod, _CANONICAL_MODULES, scorer=fuzz.token_sort_ratio
+    # Step 4: Candidate retrieval → Ollama LLM disambiguation.
+    #
+    # Three tiers:
+    #   (A) Embedding-based (preferred): cosine-similarity against canonical
+    #       embeddings, top-8 fed to _ollama_disambiguate().
+    #   (B) rapidfuzz WRatio fallback: when embeddings are unavailable.
+    #   (C) Raw passthrough: when neither works (mod too short, no candidates).
+    #
+    # LLM confidence gates:
+    #   ≥ 0.85 → auto-confirm
+    #   ≥ 0.3  → pending with populated suggestion (human reviews)
+    #   < 0.3 or null → pending with blank suggestion
+    if len(mod) < 4:
+        return mod
+
+    use_embeddings = _embedding_matcher_enabled()
+    llm_enabled = _ollama_matcher_enabled()
+    candidates: list[str] = []
+
+    # (A) Embedding retrieval
+    if use_embeddings:
+        embedder = _CanonicalEmbedder.get()
+        if not embedder.ready:
+            cache_dir = store.mapping_dir if store is not None else None
+            embedder.initialize(cache_dir)
+        if embedder.ready:
+            embed_hits = embedder.top_k(mod, k=8)
+            if embed_hits:
+                candidates = [name for name, _ in embed_hits]
+
+    # (B) rapidfuzz fallback
+    if not candidates and FUZZY_AVAILABLE:
+        top_k = process.extract(
+            mod, _CANONICAL_MODULES, scorer=fuzz.WRatio, limit=8
         )
-        if score >= fuzzy_threshold:
+        if top_k:
+            candidates = [c for c, _, _ in top_k]
+
+    if not candidates:
+        return mod
+
+    # LLM disambiguation
+    llm_result = None
+    if llm_enabled:
+        llm_result = _OLLAMA_MATCHER_MEM_CACHE.get(mod)
+        if llm_result is None and store is not None:
+            llm_result = getattr(store, "_ollama_disk_cache", {}).get(mod)
+        if llm_result is None:
+            llm_result = _ollama_disambiguate(
+                mod, candidates, _ollama_matcher_model()
+            )
+            if llm_result is not None:
+                _OLLAMA_MATCHER_MEM_CACHE[mod] = llm_result
+                if store is not None and hasattr(store, "_ollama_disk_cache"):
+                    store._ollama_disk_cache[mod] = {
+                        **llm_result,
+                        "model": _ollama_matcher_model(),
+                        "ts": int(time.time()),
+                    }
+
+    if llm_result is not None:
+        pick = llm_result.get("match")
+        conf = float(llm_result.get("confidence", 0.0))
+        if pick and conf >= 0.85:
             if store is not None:
                 confirmed_path = store.versions_dir / f"{version}_confirmed.json"
                 confirmed = store._load_json(confirmed_path)
                 if mod not in confirmed:
-                    confirmed[mod] = match
+                    confirmed[mod] = pick
                     store._save_json(confirmed_path, confirmed)
                     store._confirmed_cache[version] = confirmed
                     store._invalidate_confirmed_cache()
-            return match
-        elif score >= 65 and store is not None:
-            store.add_pending(mod, match, version)
+            return pick
+        if store is not None:
+            suggested = pick or ""
+            store.add_pending(mod, suggested, version)
+        return pick if pick else mod
+
+    # Legacy rapidfuzz-only path (LLM disabled or LLM call failed).
+    if FUZZY_AVAILABLE and candidates:
+        rf_top = process.extractOne(mod, candidates, scorer=fuzz.WRatio)
+        if rf_top:
+            rf_match, rf_score, _ = rf_top
+            if rf_score >= fuzzy_threshold:
+                if store is not None:
+                    confirmed_path = store.versions_dir / f"{version}_confirmed.json"
+                    confirmed = store._load_json(confirmed_path)
+                    if mod not in confirmed:
+                        confirmed[mod] = rf_match
+                        store._save_json(confirmed_path, confirmed)
+                        store._confirmed_cache[version] = confirmed
+                        store._invalidate_confirmed_cache()
+                return rf_match
+            if rf_score >= 65 and store is not None:
+                store.add_pending(mod, rf_match, version)
 
     return mod
 
@@ -1293,7 +1813,8 @@ def parse_ecl_export(
     }
     tag_cols = {t.lower().replace(" ", "_"): [] for t in KNOWN_TAGS}
 
-    for _, row in df.iterrows():
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Parsing bugs",
+                       unit="bug", file=sys.stderr):
         desc = str(row.get(sd_col, ""))
 
         # Change 6: derive version_hint from the dedicated Version column first;
@@ -1428,6 +1949,48 @@ def parse_ecl_export(
     print(f"Unique modules:        {df['parsed_module'].dropna().nunique()}")
     if FUZZY_AVAILABLE:
         print(f"Fuzzy threshold used:  {fuzzy_threshold}%")
+        if _ollama_matcher_enabled():
+            print(f"Ollama matcher:        ON (model={_ollama_matcher_model()})")
+
+    if _ollama_matcher_enabled() and store._ollama_disk_cache:
+        store.save_ollama_cache(store._ollama_disk_cache)
+
+    # ── Backfill blank suggestions in pending files via Ollama ────────────
+    # Previous runs (or low-confidence Ollama results with null match) may
+    # have left pending entries with empty suggestions.  Re-process them
+    # through Ollama now so the Pending Review page always shows a best-guess.
+    if _ollama_matcher_enabled() and FUZZY_AVAILABLE:
+        blank_entries: list[tuple[Path, str, str]] = []  # (file, raw, version)
+        for p in store.versions_dir.glob("*_pending.json"):
+            pdata = store._load_json(p)
+            ver = p.stem.replace("_pending", "")
+            for raw, info in pdata.items():
+                if not info.get("confirmed") and not info.get("suggested"):
+                    blank_entries.append((p, raw, ver))
+
+        if blank_entries:
+            print(f"\nBackfilling {len(blank_entries)} blank suggestion(s) via Ollama...")
+            model = _ollama_matcher_model()
+            backfilled = 0
+            for p, raw, ver in tqdm(blank_entries, desc="Backfilling suggestions",
+                                    unit="entry", file=sys.stderr):
+                top_k = process.extract(
+                    raw, _CANONICAL_MODULES, scorer=fuzz.WRatio, limit=8
+                )
+                if not top_k:
+                    continue
+                candidates = [c for c, _, _ in top_k]
+                result = _ollama_disambiguate(raw, candidates, model)
+                if result and result.get("match"):
+                    pdata = store._load_json(p)
+                    if raw in pdata:
+                        pdata[raw]["suggested"] = result["match"]
+                        store._save_json(p, pdata)
+                        backfilled += 1
+            if backfilled:
+                print(f"  \u2705 Backfilled {backfilled}/{len(blank_entries)} suggestions")
+            else:
+                print(f"  No suggestions found for blank entries")
 
     total_pending = 0
     for p in store.versions_dir.glob("*_pending.json"):
@@ -1513,7 +2076,40 @@ def main():
         default=85,
         help="Fuzzy match confidence threshold 0–100 (default: 85)",
     )
+    parser.add_argument(
+        "--ollama-matcher",
+        action="store_true",
+        help="Enable Ollama semantic re-ranking of fuzzy module suggestions. "
+             "Equivalent to PDRI_OLLAMA_MATCHER=1.",
+    )
+    parser.add_argument(
+        "--ollama-matcher-model",
+        default=None,
+        help=f"Ollama model for the matcher (default: {OLLAMA_MATCHER_DEFAULT_MODEL}). "
+             "Equivalent to PDRI_OLLAMA_MATCHER_MODEL.",
+    )
+    parser.add_argument(
+        "--embedding-matcher",
+        action="store_true",
+        help="Enable embedding-based canonical retrieval (uses nomic-embed-text). "
+             "On by default when --ollama-matcher is set. "
+             "Equivalent to PDRI_EMBEDDING_MATCHER=1.",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        default=None,
+        help=f"Ollama embedding model (default: {OLLAMA_EMBED_DEFAULT_MODEL}). "
+             "Equivalent to PDRI_EMBEDDING_MODEL.",
+    )
     args = parser.parse_args()
+    if args.ollama_matcher:
+        os.environ["PDRI_OLLAMA_MATCHER"] = "1"
+    if args.ollama_matcher_model:
+        os.environ["PDRI_OLLAMA_MATCHER_MODEL"] = args.ollama_matcher_model
+    if args.embedding_matcher:
+        os.environ["PDRI_EMBEDDING_MATCHER"] = "1"
+    if args.embedding_model:
+        os.environ["PDRI_EMBEDDING_MODEL"] = args.embedding_model
     parse_ecl_export(
         args.input,
         args.output,

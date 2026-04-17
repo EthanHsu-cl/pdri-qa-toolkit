@@ -19,7 +19,8 @@
       "Bash(grep -l \"Import\\\\|Export\\\\|Decor\\\\|Demo\\\\|Tint\\\\|Hint\" /Users/ethanhsuqa2/pdri-qa-toolkit/data/products/pdri/module_mappings/versions/*_pending.json)",
       "Bash(grep -r \"Fx effect\\\\|Text\\\\\\\\\\\\\\\\Animation\\\\|Cutout.*Fx\\\\|Produce.*16\\\\|Decor\\\\|AI Sticker\\\\|Mixtape\\\\|Hint\\\\|Filter/Transition\\\\|Settings Transition\" /Users/ethanhsuqa2/pdri-qa-toolkit/data/products/pdri/module_mappings/versions/*_pending.json)",
       "Bash(xargs ls:*)",
-      "Bash(grep -r \"copy\" /Users/ethanhsuqa2/pdri-qa-toolkit/scripts/pages/*.py)"
+      "Bash(grep -r \"copy\" /Users/ethanhsuqa2/pdri-qa-toolkit/scripts/pages/*.py)",
+      "Bash(bash -n refresh_pipeline.sh)"
     ],
     "additionalDirectories": [
       "/tmp"

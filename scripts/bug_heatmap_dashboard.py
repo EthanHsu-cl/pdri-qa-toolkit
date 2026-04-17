@@ -800,8 +800,9 @@ if active_tab == "🗺️ Module × Severity":
 
     with st.expander("📖 How to read this chart", expanded=False):
         st.markdown("""
-**What this shows:** Each row is a module (or category), each column is a severity level.
-Cell colour and number = sum of **severity-weighted** bug counts:
+**One-line summary:** Where are bugs concentrated, and how serious are they? Rows = modules (or product categories), columns = severity. Darker cell = bigger problem.
+
+**Why severity-weighted instead of raw counts:** A module with 2 crashes is more dangerous than a module with 20 cosmetic typos. We multiply each bug by a severity weight so the heatmap prioritises *impact* over *volume*:
 
 | Severity | Weight | Meaning |
 |----------|--------|---------|
@@ -810,21 +811,23 @@ Cell colour and number = sum of **severity-weighted** bug counts:
 | S3 — Normal   | ×2  | Feature impaired, workaround exists |
 | S4 — Minor    | ×1  | Cosmetic, low impact |
 
-Weighting means a module with 2 critical bugs ranks higher than one with 20 minor bugs.
+**Sort order:** Modules with the most S1 (Critical) bugs always appear at the top — ties broken by total weighted count. This makes sure crash-level bugs are never hidden behind a long tail of minor issues.
 
-**Sort order:** Rows are sorted by **S1 (Critical) count descending** first, then by **total weighted count descending**. This guarantees that modules with crash-level bugs always float to the top of the chart regardless of how many minor bugs exist alongside them.
+**View toggle:**
+- **Category** (default) — 20 broad product areas, best for a quick executive overview ("which area is hurting?").
+- **Module (top 30)** — drill into the 30 individual modules with the most weighted bugs, useful once you've spotted a problem area.
 
-**View toggle:** Switch between **Category** (20 broad groups) and **Module (top 30)** (the 30 individual modules with the highest total weighted bug count).
-- Use **Category** first for a quick executive overview of which product area is most problematic.
-- Switch to **Module** to identify the specific sub-feature causing the most bugs — particularly useful when a category is large and bugs are concentrated in one or two spots inside it.
+**`[P1]` / `[P2]` badges** next to module names appear when risk data is loaded (sidebar Step 2). They mark the module's FMEA test priority — see the Risk Heatmap tab for the full I×P×D scoring.
 
-**`[P1]` / `[P2]` badges** appear next to module names when risk data is loaded (sidebar Step 2).
-They show the module's test priority — see the Risk Heatmap tab for full detail.
+**Click any cell** to auto-fill the drill-down table below the chart with every matching bug — ECL link, severity, priority, Short Description — so you can investigate without leaving the dashboard.
 
-**Click any cell** to instantly filter the drill-down table below the chart to that exact module + severity combination. The drill-down table lists every matching bug with its ECL link, severity, priority, and Short Description so you can immediately investigate without leaving the dashboard.
+**Reading tips for your manager:**
+- Dark column on the left (S1) = release-blocking risk in that module.
+- A row that's dark across all severity columns = chronic instability, not a one-off bug.
+- Compare the same module against the [P1]/[P2] badge — a P1 module with a dark row is the highest priority on the dashboard.
 
 ---
-**Where this data comes from:** Bugs are parsed from the ECL Excel export by `parse_ecl_export.py`. Severity is extracted from the ECL `Severity` column and mapped to S1–S4, with weights S1=10, S2=5, S3=2, S4=1 applied at parse time. The `[P1]`/`[P2]` priority badges come from `risk_register_scored.csv` loaded in sidebar Step 2 — produced by the I×P×D scoring pipeline described in the Risk Heatmap tab.
+**Where this data comes from:** Bugs are parsed from the n8n / ECL export by `parse_ecl_export.py`. Severity weights (S1=10, S2=5, S3=2, S4=1) are applied per bug at parse time, then aggregated here per module. **Closed/fixed bugs still appear in this view at full weight** — this tab shows the historical bug load. (The Defect Forecast tab decays closed-bug signal over time; that decay is *not* applied here.) The `[P1]`/`[P2]` badges come from `risk_register_scored.csv` produced by the I×P×D scoring pipeline (see Risk Heatmap tab).
 """)
 
     vl = st.radio("View", ["Category", "Module (top 30)"], horizontal=True, key="t1v")
@@ -938,28 +941,32 @@ elif active_tab == "📅 Version Timeline":
 
     with st.expander("📖 How to read this chart", expanded=False):
         st.markdown("""
-**What this shows:** Severity-weighted bug counts per module (rows) per version (columns).
-Columns are sorted in **ascending version order** — oldest release on the left, most recent on the right — so you can read the history left to right as a timeline.
+**One-line summary:** A history of every module's bug load, version by version. Read it left to right like a timeline — oldest release on the left, newest on the right.
 
-**How to interpret the cells:**
-- A single cell that suddenly darkens in one column = a regression was introduced in that specific release for that module.
-- A row that stays consistently warm across all versions = a **chronic problem** — this module is never stable regardless of release cadence. It likely needs an architectural fix, not just a patch.
-- A column that is uniformly dark across many rows = a **systemically bad release** — a large merge, SDK update, or new feature likely affected many areas at once.
-- A cell that goes dark → light → dark again = a fix was applied and then regressed in a later version. Escalate to RD for a root-cause review.
-- A cell that gradually lightens over time = bugs are being resolved and not reintroduced (healthy trend — ideally what every row looks like toward the end of a release cycle).
+**The four patterns to look for** (and what each one means for your release):
 
-**Version filter:** Use the **version multiselect** in the sidebar to narrow the columns to a specific release window.
-- Default shows the 3 most recent versions — fast for spotting recent regressions.
-- Select all versions to see the full history and identify chronically unstable modules.
+| Pattern in the chart | What it means | Action to suggest |
+|---|---|---|
+| One cell suddenly darkens in a single column | **Regression** introduced in that specific release for that module | Check what changed in that build — recent merge or SDK update |
+| A row stays warm across *every* version | **Chronic instability** — module is never stable regardless of release cadence | Needs an architectural fix, not another patch |
+| One column is dark across *many* rows | **Bad release** — a large merge, SDK update, or new feature destabilised many areas at once | Post-mortem for that build; consider gating future merges of similar size |
+| Dark → light → dark again | **Fix regressed** — the bug came back | Escalate root-cause review with RD |
+| Gradually lightening over time | **Healthy trend** — bugs are being resolved without coming back | Confirm before sign-off |
 
-**View toggle:** Switch between **Category** (broad groups) and **Module (top 25)** (the 25 individual modules with the highest total weighted bug count).
-- **Category** is faster for identifying which product area had the worst release.
-- **Module** pinpoints the exact sub-feature — useful once you know which category to investigate.
+**Version filter:** The sidebar version multiselect controls which columns appear.
+- **Default = 3 most recent versions** — best for spotting fresh regressions in the current release cycle.
+- **Select all versions** to see chronic problem rows that span the full history.
 
-**Severity weighting** is the same as Tab 1: S1×10, S2×5, S3×2, S4×1. A single S1 bug registers darker than many minor ones, keeping critical issues visually prominent.
+**View toggle:**
+- **Category** — quick view of which product area had the worst release.
+- **Module (top 25)** — pinpoint the exact sub-feature, useful once a category is flagged.
+
+**Severity weighting** is the same as Tab 1 (S1×10, S2×5, S3×2, S4×1). A single S1 lights up the cell more than ten S4s — critical bugs stay visually loud.
+
+**For your manager:** Hover any column header to see the version. The chart answers two questions at once: *"Which release was the worst?"* (compare columns) and *"Which module is the most consistent source of pain?"* (compare rows).
 
 ---
-**Where this data comes from:** `parsed_version` is extracted from the ECL `Version` field by `parse_ecl_export.py`. Severity weighting (S1=10, S2=5, S3=2, S4=1) is stored as `severity_weight` per bug at parse time. `compute_risk_scores.py` also produces one `risk_register_<version>.csv` per version so the full I×P×D scoring can be run per-release if needed.
+**Where this data comes from:** `parsed_version` is extracted from the n8n / ECL `Version` field by `parse_ecl_export.py`. Severity weighting is applied per bug at parse time. The pipeline also writes one `risk_register_<version>.csv` per version so per-release I×P×D scoring is available downstream.
 """)
 
     if "parsed_version" in df.columns:
@@ -999,40 +1006,40 @@ elif active_tab == "🏷️ Tag Analysis":
 
     with st.expander("📖 How to read this chart", expanded=False):
         st.markdown("""
-**Tags** are parsed from the `[TAGS]` prefix in each bug's Short Description.
-For example: `PDR-I 16.2.5 - [EDF][UX] AI Storytelling: subtitle misplaced` → tags `edf`, `ux`.
+**One-line summary:** What *kinds* of bugs is each module producing, and how well is automation catching them? Tags answer "what type of failure" — bug counts alone don't.
 
-**Common tags and what they mean:**
+**Where tags come from:** Every bug's Short Description starts with `[TAGS]` set by the QA team. Example: `PDR-I 16.2.5 - [EDF][UX] AI Storytelling: subtitle misplaced` → tags `edf`, `ux`. The parser turns these into boolean columns per bug.
 
-| Tag | Meaning |
-|-----|---------|
-| `Side Effect` | Regression bug — something that worked before broke after a code change |
-| `AT Found` | Caught by automated testing (good signal — AT is working) |
-| `EDF` | Engineering Design Flaw — root cause is an architectural/design issue |
-| `UX` | User experience issue |
-| `MUI` | Multi-UI / platform consistency issue |
+**The five tags that matter most:**
 
-**The main heatmap** (top of the tab) shows the raw count of each tag per module/category. Darker cells = more bugs with that tag in that area.
+| Tag | Meaning | Why your manager should care |
+|-----|---------|----------------------------|
+| `Side Effect` | **Regression** — something that used to work broke after a code change | High side-effect rate = code base is fragile; need stronger regression suite |
+| `AT Found` | Caught by **automated tests** | Good signal — AT is doing its job |
+| `EDF` | **Engineering Design Flaw** — architectural / design root cause | Cannot be patched away; needs RD design review |
+| `UX` | User experience problem | Polish gap — affects perception more than function |
+| `MUI` | Multi-UI / platform consistency issue | Cross-device QA gap |
 
-**Regression Bug Rate (Side Effect %):** A dedicated bar chart below the main heatmap ranks modules by their side-effect rate — the fraction of all their bugs that are regressions.
-- A rate above **30%** means nearly 1 in 3 bugs is a regression — this module needs dedicated regression testing every single version.
-- Computed as: `(bugs tagged [Side Effect]) ÷ (total bugs) × 100`.
+**Three views in this tab:**
 
-**AT Found Rate bar chart:** Ranks modules by what fraction of their bugs were caught by automated testing.
-- 🟢 **≥30%** — strong automation coverage; AT is an effective safety net for this module.
-- 🟡 **10–29%** — partial coverage; automation helps but manual gaps remain.
-- 🔴 **<10%** — automation blind spot; nearly all bugs reach human testers or are missed entirely.
+1. **Main heatmap (top)** — raw tag counts per module/category. Darker = more bugs of that type. Use it to spot which kind of bug dominates each area (e.g. an `EDF`-heavy module needs design review, not just more testing).
 
-**Automation Blind Spots** (bottom of the tab) = modules with 0% AT-found rate. These are the highest-priority candidates for adding new automated tests — every bug in these modules currently relies entirely on manual discovery.
+2. **Regression Bug Rate (Side Effect %)** — bar chart ranking modules by *fraction* of bugs that are regressions, not raw count. Formula: `(bugs tagged [Side Effect]) ÷ (total bugs) × 100`.
+   - **≥30%** = nearly 1 in 3 bugs is a regression. This module **must** be regression-tested every single version.
+
+3. **Automation Coverage (AT Found Rate)** — bar chart ranking modules by *fraction* caught by automated tests:
+   - 🟢 **≥30%** — strong AT safety net.
+   - 🟡 **10–29%** — partial coverage; manual gaps remain.
+   - 🔴 **<10%** — automation blind spot.
+
+**Automation Blind Spots** (bottom of the tab) — explicit list of modules with **0% AT-found rate**. Every bug in these modules currently relies on manual discovery. These are the highest-ROI candidates for new automated tests.
+
+**Manager pitch:** *"Tag analysis lets us tell the difference between a feature that needs more tests (high Side Effect rate) and one that needs a design fix (high EDF count). Same bug count, totally different action."*
 
 ---
-**Where tags come from:** `parse_ecl_export.py` reads `[TAG]` prefixes in each bug's Short Description and creates boolean columns: `tag_side_effect`, `tag_at_found`, `tag_edf`, `tag_ux`, `tag_mui`, etc.
-
-These feed directly into the risk scoring pipeline:
-- `regression_rate` = `side_effect_count / total_bugs` — computed in `compute_risk_scores.py`
-- `automation_catch_rate` = `at_found_count / total_bugs` — also from `compute_risk_scores.py`
-
-Both rates feed into **Detectability (D)** in `ai_risk_scorer.py`: a module with 0% AT coverage gets D+1 (harder to detect), pushing its overall I×P×D risk score up.
+**How this feeds the rest of the dashboard:**
+- `regression_rate` and `automation_catch_rate` feed into **Detectability (D)** in `ai_risk_scorer.py`. A module with 0% AT coverage gets D+1, pushing its I×P×D risk score up — that's why the Risk Heatmap (Tab 7) doesn't only react to bug counts.
+- The forecast (Tab 9) uses `tag_side_effect` history as one of its leading indicators of next-version regressions.
 """)
 
     tc = [c for c in df.columns if c.startswith("tag_")]
@@ -1118,33 +1125,38 @@ elif active_tab == "⚖️ P/S Alignment":
 
     with st.expander("📖 How to read this chart", expanded=True):
         st.markdown("""
-**QA assigns Severity (S1–S4). RD assigns Priority (Fix Now → N/A).**
+**One-line summary:** Are QA and RD agreeing on what's important? QA picks **Severity** (how bad is the bug), RD picks **Priority** (how fast we'll fix it). When they disagree, this chart shows where.
 
-The chart has **RD Priority on the Y axis (rows)** and **QA Severity on the X axis (columns)**.
+**Why this matters:** A bug RD marks "No Matter" but QA marks Critical is either (a) a triage miss that could leak into release, or (b) a sign the team isn't aligned on user impact. Either way, you want to know.
 
-| RD Priority (rows) ↓ \\ QA Severity (columns) → | **S1–S2 (Critical/Major)** | **S3–S4 (Normal/Minor)** |
+**Chart layout:** RD Priority on the rows ↓, QA Severity on the columns →. Cell value = how many bugs sit in that combination.
+
+| RD Priority (rows) ↓ \\ QA Severity (columns) → | **S1–S2 (Critical / Major)** | **S3–S4 (Normal / Minor)** |
 |---|---|---|
-| **Fix Now / Must Fix** | ✅ Aligned | 🟡 **Inverse** — RD fast-tracked something QA rates minor; verify scope with RD |
-| **Better Fix / No Matter** | 🔴 **Mismatch** — high-severity bug deprioritised by RD; escalate | ✅ Aligned |
-| **N/A (not yet triaged)** | 🔴 **Urgent Gap** — critical bug not yet triaged by RD | ⚪ Expected — low-severity bugs often untriaged |
+| **Fix Now / Must Fix** | ✅ Aligned — both teams agree it's urgent | 🟡 **Inverse** — RD fast-tracked something QA rated minor; ask RD what they know that QA doesn't |
+| **Better Fix / No Matter** | 🔴 **Mismatch** — QA flagged a critical bug, RD deprioritised it; **escalate** | ✅ Aligned — both teams agree it's low priority |
+| **N/A (not yet triaged)** | 🔴 **Urgent Gap** — crash-level bug with no RD decision yet | ⚪ Expected — low-severity bugs often wait for triage |
 
-**Priority N/A** means RD has not assigned a priority yet. Bugs on the **diagonal** (top-left and bottom-right) are well-aligned. Bugs in the **top-right or bottom-left** cells are mismatches worth investigating.
+The **diagonal cells** are healthy alignment. The **off-diagonal cells** are where the conversation needs to happen.
 
 ---
 ### 📊 The Three Mismatch Metrics (below the chart)
 
 | Metric | Definition | What to do |
 |--------|-----------|-----------|
-| **🔴 Critical Mismatch** | S1 or S2 bugs with RD Priority 4 (No Matter) or N/A | Escalate directly to RD — a confirmed crash or major functional failure must not be deprioritised without a written justification |
-| **🟡 Inverse Mismatch** | S3 or S4 bugs that RD has marked Fix Now or Must Fix | Verify scope: RD may know about a wider business impact that QA's severity rating didn't capture. If the higher priority is justified, update the severity. If not, discuss recalibration with RD. |
-| **⚪ Untriaged Critical** | S1 or S2 bugs where RD has not set any priority (N/A) | The most urgent gap — a crash- or data-loss-level bug with no triage decision is an uncontrolled release risk. Ping RD for a priority decision immediately. |
+| **🔴 Critical Mismatch** | S1 or S2 bugs with RD Priority 4 (No Matter) or N/A | Escalate to RD — a confirmed crash or major failure must not be deprioritised without written justification |
+| **🟡 Inverse Mismatch** | S3 or S4 bugs RD marked Fix Now or Must Fix | Verify scope. RD may know about wider business impact that QA's rating missed. Either re-rate the severity up or recalibrate with RD |
+| **⚪ Untriaged Critical** | S1 or S2 bugs where RD priority is still N/A | The most urgent gap — a critical bug with no triage decision is an uncontrolled release risk. Ping RD now |
 
-**Critical Mismatch drill-down** (auto-expands when mismatches exist): lists every S1/S2 bug with a low or missing priority, with ECL links for direct follow-up.
+**Critical Mismatch drill-down** auto-expands when mismatches exist — lists every offending bug with its ECL link so you can follow up immediately.
+
+**Manager pitch:** *"This tab is the health check for QA↔RD alignment. Every Critical Mismatch is a triage decision that needs a meeting. Untriaged Critical is the worst signal — it means a crash-level bug is sitting in the queue with nobody owning the call."*
 
 ---
 **Where this data comes from:**
-- `priority_label` — mapped from the ECL `Priority` column by `parse_ecl_export.py` using the priority label map (1 = Fix Now → 2 = Must Fix → 3 = Better Fix → 4 = No Matter → 5 = N/A)
-- `severity_num` — extracted from the ECL `Severity` column and mapped S1=1 (Critical) → S4=4 (Minor)
+- `priority_label` — mapped from the ECL `Priority` column by `parse_ecl_export.py` (1 = Fix Now → 5 = N/A).
+- `severity_num` — mapped S1=1 (Critical) → S4=4 (Minor) at parse time.
+- This tab uses the **current sidebar filter** (version, status, product) — change filters to see alignment for a specific release window.
 """)
 
     if "priority_label" in df.columns and "severity_num" in df.columns:
@@ -1205,21 +1217,30 @@ elif active_tab == "👥 Team Coverage":
 
     with st.expander("📖 How to read this chart", expanded=False):
         st.markdown("""
-**What this shows:** How many bugs each tester (row) has filed per module category (column). A darker cell = more bugs filed by that tester in that category — a proxy for hands-on test experience in that area.
+**One-line summary:** Who on the QA team is exercising which product area? Rows = testers, columns = product category. Darker cell = more bugs that tester has filed there — a proxy for how much hands-on time they've spent in that area.
 
-**Important caveat:** This counts bugs *filed*, not simply bugs *tested*. A thorough tester who actively investigates will naturally file more bugs. A light cell does not necessarily mean low coverage — the module may have genuinely been stable or another tester already opened duplicates. Treat this as a rough experience signal, not an exact coverage map.
+**Important caveat (read this before drawing conclusions):** This counts bugs *filed*, not bugs *tested*. A thorough tester who actively investigates will naturally file more bugs. A light cell can mean three different things:
+1. The tester didn't cover that area (real coverage gap), **or**
+2. The area was genuinely stable when they tested it, **or**
+3. Another tester filed the duplicates first.
 
-**Knowledge Silos** (flagged below the chart) = a category where only **one** tester has ever filed bugs.
-This is a **bus-factor risk**: if that person is unavailable — on holiday, leaves the team, or is reassigned — that entire area of the product has zero team members with direct hands-on experience. In a release crunch, this creates an undetected blind spot.
-
-**How to act on silos:**
-- **Pair the sole expert** with a second tester for 1–2 sprints of shadowed testing — the fastest, cheapest knowledge transfer.
-- **Document test runbooks** for silo categories: what to test, where the known edge cases are, which failure modes recur most often. If the expert leaves, the runbook preserves the knowledge.
-- **Cross-train during low-pressure sprints** — not mid-sprint before a release. The right time to address bus-factor risk is before it becomes urgent.
-- **Prioritise silo categories that also appear in the P1 list (Risk Heatmap tab)** — these are the most dangerous combination: high risk AND single point of failure for testing.
+So treat this as a **rough experience signal**, not a precise coverage map. The most useful pattern is the *opposite*: rows that are dark across many columns = experienced generalists, columns that are dark across many rows = areas everyone touches.
 
 ---
-**Where this data comes from:** `Creator` is read directly from the ECL `Creator` field by `parse_ecl_export.py`. `module_category` is the normalised category assigned at parse time. Only bugs in the current sidebar filter (version, status, product) are counted — change filters to compare coverage across different release windows.
+### 🚨 Knowledge Silos (flagged below the chart)
+
+A **silo** = a product category where only **one** tester has ever filed bugs. This is a **bus-factor risk**: if that person is unavailable (holiday, leave, reassignment), the entire area has *zero* team members with direct hands-on experience. In a release crunch, this is the kind of blind spot that lets a critical bug slip through.
+
+**How to act on silos** (rough order of cost vs. value):
+- **Pair the sole expert** with a second tester for 1–2 sprints of shadowed testing. Cheapest, fastest knowledge transfer.
+- **Document test runbooks** for silo categories: what to test, known edge cases, recurring failure modes. The runbook preserves knowledge even if the expert leaves.
+- **Cross-train during low-pressure sprints** — *not* mid-sprint before a release. Address bus-factor risk before it becomes urgent.
+- **Prioritise silos that also appear in the P1 list (Risk Heatmap tab)** — high-risk *and* single-point-of-failure is the most dangerous combination on the dashboard.
+
+**Manager pitch:** *"This isn't a performance scorecard for testers — it's a coverage map for the product. Light columns + a P1 badge = critical area without backup expertise."*
+
+---
+**Where this data comes from:** `Creator` and `module_category` are extracted by `parse_ecl_export.py` from the n8n / ECL export. The chart uses the current sidebar filter (version, status, product) — change filters to compare coverage across different release windows or products.
 """)
 
     if "Creator" in df.columns and "module_category" in df.columns:
@@ -1251,38 +1272,46 @@ elif active_tab == "📊 KPI Dashboard":
 
     with st.expander("📖 What these KPIs mean", expanded=False):
         st.markdown("""
-| KPI | What it measures | Why it matters |
+**One-line summary:** The single page to glance at before a release. Each metric answers one yes/no question — "are we shipping this?".
+
+| KPI | What it measures | Why it matters / target |
 |-----|-----------------|----------------|
-| **Total Bugs** | All bugs matching the current sidebar filters (version, status, product) | Filtered baseline — change sidebar version/status filters to slice by release or bug state |
-| **Critical Bugs (S1)** | Count of Severity-1 (crash / data loss) bugs in the current filter | Any S1 in the release candidate is a potential showstopper. Zero S1s is the minimum gate criterion before releasing. |
-| **Avg Days to Close** | Mean calendar days from bug `Create Date` to `Closed Date` | Measures RD fix velocity. Rising trend = backlog is accumulating faster than it is being resolved. Compare across releases to detect if fix rate is deteriorating. |
-| **Regression Bug Rate** | % of bugs tagged `[Side Effect]` in their Short Description | Side-effect bugs are regressions — features that previously worked and broke after a code change. A rate above 20% indicates insufficient regression test coverage for the complexity of changes being made. |
-| **Active vs Inactive** | Active = Open / In-Progress; Inactive = Closed / NAB / Won't Fix | Active count = live unresolved risk in the current filter. |
-| **P1 Modules** | Modules with I×P×D risk score > 90 (from loaded risk register) | Every P1 module must be tested every single version — no exceptions. |
-| **P2 Modules** | Modules with I×P×D risk score 70–90 | Also test every version alongside P1. |
-| **Avg Risk Score** | Mean I×P×D risk score across all modules in the current filter | Overall risk health signal. A rising trend = cumulative risk is growing. A declining trend = risk is being managed and reduced. |
+| **Total Bugs** | All bugs matching the current sidebar filters (version, status, product) | Baseline — sets the scale for everything else on this page |
+| **Critical Bugs (S1)** | Count of Severity-1 (crash / data loss) bugs in the current filter | **Release gate.** Any S1 in the release candidate is a potential showstopper — zero S1s is the minimum bar |
+| **Avg Days to Close** | Mean calendar days from `Create Date` → `Closed Date` (open bugs excluded) | Measures RD fix velocity. **Rising trend = backlog is growing faster than it's being burned down**. Compare across releases for trend |
+| **Regression Bug Rate** | % of bugs tagged `[Side Effect]` | Regressions = features that previously worked and broke. **Above 20% = insufficient regression coverage** for the rate of change |
+| **Active Bugs** | Open + In-Progress in the current filter | Live unresolved risk. The number you actually have to act on |
+| **Inactive Bugs** | Closed + NAB + Won't Fix + duplicates | Resolved or dismissed. Counted separately because closed/fixed bugs **decay** in the prediction model (still informative, but not live risk) |
+| **P1 Modules** | Modules with I×P×D risk score > 90 | **Test every version, no exceptions.** This is the must-cover list |
+| **P2 Modules** | Modules with I×P×D risk score 70–90 | Test every version alongside P1 |
+| **Avg Risk Score** | Mean I×P×D across all modules in the current filter | Health barometer. Rising over consecutive releases = cumulative risk growing |
 
 ---
 ### 📈 Weekly Bug Trend
 
-Counts how many bugs were **created per calendar week** by resampling the `Create Date` field into 7-day buckets. The line chart lets you see whether bug creation is accelerating, stable, or declining.
+Counts bugs **created per calendar week** (resampling `Create Date` into 7-day buckets).
 
-Healthy patterns:
-- **Declining trend late in a release cycle** — RD is closing bugs faster than new ones are being found. A good sign before RC sign-off.
-- **Flat trend mid-cycle** — Normal steady state during active development.
-- **Spike mid-cycle** — Often signals a large merge, SDK update, or new feature drop that introduced regressions. Cross-reference with Tab 2 (Version Timeline) to pinpoint which module spiked.
-- **Spike late in cycle** — Warning: regression testing uncovered a deep problem. Consider delaying release until the spike resolves.
+**What healthy looks like vs. what to escalate:**
+
+| Pattern | Stage of cycle | Read it as |
+|---|---|---|
+| **Declining** | Late cycle | ✅ Healthy — RD closing faster than QA is finding. Good sign before RC sign-off |
+| **Flat** | Mid cycle | ✅ Steady state during active development |
+| **Spike** | Mid cycle | ⚠️ Often a large merge, SDK update, or new feature drop. Cross-reference Tab 2 (Version Timeline) to find which module spiked |
+| **Spike** | Late cycle | 🚨 Regression testing uncovered something deep. Consider delaying release until the spike resolves |
 
 ### 🥧 Severity Distribution
 
-Pie chart of all currently filtered bugs broken down by severity. A healthy end-of-cycle snapshot should show a large S3/S4 slice. A large S1 or S2 slice at release time is a risk signal requiring immediate RD escalation.
+Pie chart of currently filtered bugs by severity. **Healthy end-of-cycle snapshot = mostly S3/S4** (the dangerous bugs have been resolved). **A large S1/S2 slice at release time = immediate RD escalation.**
+
+**Manager pitch:** *"This tab is the four-second pre-release glance. If S1 isn't zero, if regression rate is above 20%, or if Avg Days to Close is climbing release-over-release, we have a release-readiness conversation. Everything else here is context."*
 
 ---
 **Where these numbers come from:**
-- Bug counts, severity, and weekly trend: `ecl_parsed.csv` from `parse_ecl_export.py`
-- P1/P2 module counts and Avg Risk Score: `risk_register_scored.csv` from `ai_risk_scorer.py`
-- Regression Bug Rate: mean of the `tag_side_effect` boolean column, parsed from `[Side Effect]` tags in ECL
-- Avg Days to Close: computed at parse time from `Create Date` and `Closed Date` in the ECL export
+- Bug counts, severity, weekly trend: `ecl_parsed.csv` from `parse_ecl_export.py` / `fetch_from_n8n.py`.
+- Active/Inactive split: `status_active` boolean from the parser. Inactive = `Close`, `NAB`, `Won't Fix`, `Need More Info`, `Not Reproducible`, `New Feature`, `External Issue`, `HQQA Close`, `FAE Close`.
+- P1/P2 module counts and Avg Risk Score: `risk_register_scored.csv` from `ai_risk_scorer.py`.
+- Regression Bug Rate: mean of `tag_side_effect` parsed from `[Side Effect]` tags.
 """)
 
     c1, c2, c3, c4 = st.columns(4)
@@ -1377,23 +1406,39 @@ elif active_tab == "🔥 Risk Heatmap":
 
     with st.expander("📖 How the Risk Score works — full pipeline explained", expanded=False):
         st.markdown("""
-The risk scores shown in this tab are produced by a **3-step pipeline** run before launching the
-dashboard. Here is exactly what each step does and how every number was calculated.
+**One-line summary:** Every module on the treemap has a single number — the **Risk Score (0–125)** — that combines three things into one priority signal: *how much it hurts when it breaks*, *how often it breaks historically*, and *how easily we'd catch the bug before release*. This is a standard FMEA approach (Failure Mode and Effects Analysis) borrowed from manufacturing QA.
+
+**The formula in one line:**
+> **Risk Score = Impact × Probability × Detectability** (each scored 1–5, max = 125)
+
+| Risk Score | Priority | What it means for testing |
+|---|---|---|
+| **> 90** | 🔴 **P1 — Critical** | Test every version, no exceptions |
+| **70–90** | 🟠 **P2 — High** | Test every sprint / major version |
+| **50–69** | 🟡 **P3 — Medium** | Test every release candidate |
+| **< 50** | 🟢 **P4 — Low** | Full release cycle pass only |
+
+**Manager pitch:** *"Bug counts alone are misleading — a module with 50 cosmetic bugs is less risky than a module with 2 hidden crashes that no automated test would catch. The Risk Score combines all three dimensions into one number so we can rank modules consistently."*
 
 ---
 
-### Step 1 — Parse ECL bugs → `ecl_parsed.csv`
-**Script:** `parse_ecl_export.py`
+### How the score is computed (3-stage pipeline)
 
-Reads the raw ECL Excel export and extracts structured fields from each bug's Short Description.
+The risk scores in this tab are produced before the dashboard launches. Each stage is a script that writes a CSV consumed by the next.
+
+### Step 1 — Parse bugs → `ecl_parsed.csv`
+**Script:** `parse_ecl_export.py` (input from `fetch_from_n8n.py`)
+
+Reads the raw n8n / ECL bug export and extracts structured fields from each bug's Short Description.
 Example: `PDR-I 16.2.5 - [EDF][UX] AI Storytelling: subtitle misplaced`
 
 Key outputs per bug row:
-- `parsed_module` — normalised module name (64 typo aliases resolved, e.g. *HQ Auido Denoise* → *HQ Audio Denoise*)
-- `module_category` — one of 20 top-level categories (222 flat overrides + partial matching)
+- `parsed_module` — normalised module name (typo aliases resolved, e.g. *HQ Auido Denoise* → *HQ Audio Denoise*)
+- `module_category` — one of 20 top-level categories (with flat overrides + partial matching)
 - `severity_num` / `severity_weight` — S1=10 pts, S2=5 pts, S3=2 pts, S4=1 pt
 - `tag_side_effect`, `tag_at_found`, `tag_edf`, `tag_ux` etc. — boolean columns from `[TAG]` prefixes
 - `days_to_close`, `builds_to_fix`, `repro_rate` — computed from ECL date and version fields
+- `status_active` / `status_weight` — open=1.0, closed=0.5, invalid (NAB / Won't Fix / etc.)=0.0. Lets the prediction model treat fixed bugs as a faded signal instead of pretending they never happened
 
 ---
 
@@ -1838,14 +1883,13 @@ elif active_tab == "🔬 Bug Clusters":
         st.markdown("""
 ## 🔬 Bug Clusters — Complete Guide
 
-This tab groups all bugs into **issue groups** using natural language analysis of their short descriptions.
-Instead of reviewing hundreds of individual bugs, it immediately answers:
-**"What categories of problems keep recurring, and how serious are they?"**
+**One-line summary:** Instead of reading hundreds of individual bug titles, this tab groups them into **issue groups** by their language similarity. Each issue group is a *recurring type of complaint* — a pattern, not a single bug. The tab answers: *"What categories of problems keep coming back, and how serious are they?"*
 
-Each cluster is named by the 2–3 keywords that appear most often together in the bugs it contains
-(e.g. `ai storytelling | subtitle | timing`). When run with Ollama, the names are richer plain-English
-labels generated by an LLM (e.g. "subtitle rendering delay"). Either way, think of each cluster as a
-*recurring complaint type* — not a single bug, but a pattern of bugs.
+**Why this matters for your manager:** A long bug list looks scary but isn't actionable. *"We have 12 different subtitle bugs across 3 modules"* is — that's one root cause, one fix conversation, one regression test plan.
+
+**How issue groups are named:**
+- Default (TF-IDF mode): the 2–3 keywords that appear most often together (e.g. `ai storytelling | subtitle | timing`).
+- With Ollama (recommended): a plain-English label generated by an LLM (e.g. *"subtitle rendering delay"*). Labels use the dedicated `--label-model` (default `gemma4`) — separate from the embedding model — and have a 3-attempt retry to avoid empty labels from quantised models.
 
 ---
 
@@ -1968,24 +2012,30 @@ Run the clustering script, then point the sidebar to the output files:
 # Default (TF-IDF, fast, no Ollama required):
 python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv
 
-# With severity stratification (v3.0 — adds S1/S2 and S3/S4 sub-clusters):
+# With severity stratification (adds S1/S2 and S3/S4 sub-clusters):
 python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv \\
   --stratify-severity
 
-# Ollama mode (richer labels, recommended when RAM is available):
+# Ollama mode with separate label & embed models (recommended):
 python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv \\
-  --provider ollama --model qwen3:7b --stratify-severity
+  --provider ollama --label-model gemma4 --embed-model mxbai-embed-large \\
+  --stratify-severity
+
+# Re-label only (skip embedding — fast iteration on label quality):
+python scripts/cluster_bugs.py data/ecl_parsed.csv data/ecl_parsed_clustered.csv --relabel
 ```
 
-v3.0 produces additional output files automatically:
-- `clusters/ecl_parsed_cluster_summary.csv` — includes velocity, trend, recurrence
-- `clusters/ecl_parsed_module_entropy.csv` — per-module Shannon entropy
-- `clusters/ecl_parsed_cluster_summary_s12.csv` — critical/major tier (requires `--stratify-severity`)
-- `clusters/ecl_parsed_cluster_summary_s34.csv` — normal/minor tier (requires `--stratify-severity`)
+**Pipeline shortcuts** (`refresh_pipeline.sh`):
+- Default uses `CLUSTER_LABEL_MODEL=gemma4` (separate from `OLLAMA_MODEL` used elsewhere).
+- `./refresh_pipeline.sh --force-relabel` re-runs labelling and forces predictions to rebuild afterward (so Tab 9 picks up the new labels).
 
-In the sidebar: **Step 3** → set paths to the above files. The module entropy and stratified summaries load automatically from their default paths.
+**Output files** (auto-loaded from `data/products/<slug>/clusters/`):
+- `ecl_parsed_clustered.csv` — every bug tagged with its `cluster_id` and `cluster_label`.
+- `ecl_parsed_cluster_summary.csv` — per-cluster: count, modules, avg severity, **velocity (last 2 vs prior 2 versions)**, trend, recurrence.
+- `ecl_parsed_module_entropy.csv` — per-module Shannon entropy (focused vs spreading vs broad).
+- `ecl_parsed_cluster_summary_s12.csv` / `_s34.csv` — critical/major and normal/minor tiers (requires `--stratify-severity`).
 
-Recommend re-running clustering **every Friday** or whenever a new batch of versions has been parsed.
+**Recommended cadence:** re-run **every Friday** or after each new batch of versions is parsed. The pipeline does this automatically via the weekday/weekend schedule.
 """)
 
     if cluster_df is None:
@@ -2571,7 +2621,9 @@ elif active_tab == "🔮 Defect Forecast":
         st.markdown("""
 ## 🔮 Defect Forecast — Complete Guide
 
-This tab shows you **what is likely to break in the next version** and **what concrete scenarios to test for**, driven by a machine-learning model trained on all historical ECL bug data.
+**One-line summary:** *"Where will the next version break, and what specifically should we test?"* A machine-learning model trained on every historical bug answers both questions in one tab.
+
+**Manager pitch:** *"This is the only tab that looks forward instead of backward. Tabs 1–8 describe what already happened — this one ranks modules by their probability of producing a Critical bug in the next version, then converts that into a concrete test list."*
 
 ---
 
@@ -2579,36 +2631,46 @@ This tab shows you **what is likely to break in the next version** and **what co
 
 | Metric | What it means |
 |--------|--------------|
-| **🔴 Critical modules** | >20% learned probability of S1 critical bug next version — must be tested every version |
-| **🟠 High-risk modules** | 10–20% learned probability of S1 critical bug next version — test every sprint |
-| **🎯 Predicted scenarios** | Total count of concrete, testable bug scenario predictions across all modules |
-| **Total modules forecast** | Number of modules for which the model generated a prediction |
+| **🔴 Critical modules** | >20% learned probability of an S1 critical bug next version — must be tested every version |
+| **🟠 High-risk modules** | 10–20% probability of an S1 critical bug next version — test every sprint |
+| **🎯 Predicted scenarios** | Total concrete, testable bug scenario predictions across all modules |
+| **Total modules forecast** | Number of modules with enough history (≥5 versions) for the model to produce a prediction |
 
 ---
 
 ### 🎯 What to Test This Version (Primary Section)
 
-The top section shows the core output: human-readable bug scenarios grouped by risk level, listed from most to least urgent (Critical → High → Medium). Each scenario directly answers the question: *"What specific thing should I test?"*
+Human-readable bug scenarios grouped by risk level, listed from most to least urgent (Critical → High → Medium). Each scenario answers: *"What specific thing should I test?"*
 
-**Confidence levels** are based on how many times a similar bug has recurred in history:
-- **🟢 High** — 3 or more recurring bugs with similar descriptions (well-established recurring pattern)
-- **🟡 Medium** — 2 similar bugs (emerging pattern, include in testing)
-- **🔵 Low** — 1 occurrence (speculative, add to exploratory pass for Critical/High modules)
+**Confidence levels** are based on how many similar bugs have recurred in history:
+- **⬆️ High** — 3+ recurring bugs with similar descriptions (well-established pattern)
+- **↔️ Medium** — 2 similar bugs (emerging pattern, include in testing)
+- **⬇️ Low** — 1 occurrence (speculative; add to exploratory pass for Critical/High modules)
 
-**How scenarios are generated (the algorithm):**
-For each high-risk module, `predict_defects.py` runs these steps:
-1. Collects all bug Short Descriptions from the last 5 versions for that module
-2. Vectorises them using TF-IDF and clusters similar descriptions with `AgglomerativeClustering` (cosine distance threshold)
-3. Picks the most representative description from each cluster as the predicted scenario text
-4. Assigns confidence based on the cluster size (bugs in cluster → High/Medium/Low)
-5. When running with `--provider ollama` or `--provider claude`, an AI model receives the clusters and historical context to produce more specific, actionable scenario text grounded in real patterns
+**Quadrant-aware scenario selection (new):** Scenarios are no longer ranked purely by ML score. Every **P1** module (and **P2** by default) is *always* included in the "What to Test" list as long as it has enough history — even if the model thinks risk is currently low. This keeps the test list aligned with the FMEA Risk Heatmap (Tab 7) so a P1 core module never silently disappears from coverage during a quiet stretch. Quadrant scoring uses these multipliers:
+
+| Quadrant | Bonus weight |
+|---|---|
+| P1 — Critical | 1.00 (always included) |
+| P2 — High | 0.60 |
+| P3 — Medium | 0.20 |
+| P4 — Low | 0.00 |
+
+The list is hard-capped at 20 modules so it stays actionable.
+
+**How scenarios are generated:**
+1. Collect all bug Short Descriptions from the last 5 versions for each high-risk module.
+2. Vectorise with TF-IDF and cluster similar descriptions with `AgglomerativeClustering` (cosine distance threshold).
+3. Pick the most representative description from each cluster as the scenario text.
+4. Assign confidence based on cluster size.
+5. With `--provider ollama` / `--provider claude`, the AI receives the clusters and quadrant metadata, then produces more specific, actionable scenario text grounded in the real patterns.
 
 ---
 
 ### 📋 AI Risk Briefing — Next Version Focus Summary
 
 A collapsible plain-English executive summary generated by `predict_defects.py`. Lists the top-risk modules with:
-- Why they are at risk (which signals are currently elevated)
+- Why they're at risk (which signals are currently elevated)
 - What specifically to test based on historical patterns
 
 Generated with Ollama or Claude when `--provider` is set; a heuristic text summary is produced even without AI.
@@ -2617,23 +2679,15 @@ Generated with Ollama or Claude when `--provider` is set; a heuristic text summa
 
 ### ⚠️ Severity Escalation Alerts
 
-Shown automatically for modules where bugs are getting **more severe** in recent versions.
+Shown automatically for modules where bugs are getting **more severe** over recent versions.
 
-**How `severity_escalation` is calculated:**
+**Formula:**
 ```
 severity_escalation = avg_severity(last version) − avg_severity(prior 3 versions)
 ```
-Since severity is numbered 1 (Critical) → 4 (Minor), a **negative value** means severity is worsening toward S1. Modules with `severity_escalation < −0.3` appear here; a value of −0.8 or worse gets the 🚨 icon.
+Severity is numbered 1 (Critical) → 4 (Minor), so a **negative value means severity is worsening toward S1**. Modules with `severity_escalation < −0.3` appear here; `< −0.8` gets the 🚨 icon. Sorted by risk level so Critical modules surface first.
 
-This signal can detect instability **before** bug counts spike — a pre-emptive warning that regression testing should be intensified immediately.
-
----
-
-### 🕒 Overdue for a Critical Bug
-
-Shown for modules that historically produced S1 (crash-level) bugs regularly, but have been quiet for 5–20 recent versions. These modules are **not** fixed — they may be accumulating risk silently.
-
-**How `builds_since_last_crit` is calculated:** For each module's training history, the feature records how many version slots have elapsed since the most recent row where `critical_count > 0`. If no critical bugs exist at all in history, the value equals the total length of that module's history (maximum caution). Modules quiet for >20 versions are excluded (likely genuinely resolved).
+This signal can detect instability **before** raw bug counts spike — a pre-emptive warning that regression testing should be intensified immediately.
 
 ---
 
@@ -2673,7 +2727,7 @@ One card per Critical or High-risk module (top 10). Each card contains:
 | **Bug categories expected** | Count of distinct QA categories predicted for this module next version |
 | **Actual last version** | Real observed bug count from the most recent version in training data — compare to the forecast for calibration |
 | **Severity trend** | `severity_escalation` — see Alerts section above |
-| **Versions since last critical** | `builds_since_last_crit` — see Overdue section above |
+| **Versions since last critical** | `builds_since_last_crit` — number of versions elapsed since this module last produced an S1. Combined with `stable_mature` so the model can tell silent-but-quiet P1 cores apart from genuinely unknown new modules |
 | **Issue Group breadth (entropy)** | Shannon entropy of issue-group distribution. Higher = bugs spread across many issue groups (broad instability). Lower = concentrated single failure mode. |
 | **Leading signal** | The single feature with the highest Pearson correlation to future bug count for this module |
 | **What types of bugs to expect** | Per-category breakdown from `_predictions_by_category.csv` showing historical % and expected count |
@@ -2697,14 +2751,17 @@ The correlations are computed across all (module, version) rows in the training 
 **Features ranked here include:**
 - `crit_1/2/3` — critical bug momentum over last 1/2/3 versions
 - `bugs_1/2/3` — total bug count momentum over last 1/2/3 versions
-- `sev_1/2/3` — severity-weighted momentum
+- `sev_1/2/3` — severity-weighted momentum (uses **status-weighted** counts so closed bugs decay over time)
 - `trend` — last version minus 3 versions ago (upward slope)
-- `severity_escalation` — worsening severity signal
-- `builds_since_last_crit` — how long since the last S1
+- `severity_escalation` — worsening severity signal (avg severity tilting toward S1)
+- `builds_since_last_crit` — versions elapsed since the last S1 in this module
 - `crit_ratio` — proportion of S1 bugs in last 3 versions (high ratio = structurally dangerous module)
 - `new_module` — flag for modules first appearing in recent versions (new features)
 - `cross_module_spike` — count of other modules also spiking in the same version (correlated risk)
 - `total_historical_bugs` — module maturity / overall activity level
+- `stable_mature` (new) — flag for modules with ≥10 versions of history AND ≥8 versions since the last S1 AND no recent bug volume. Lets the classifier distinguish *genuinely calm core modules* from *unknown new ones*
+- `impact_bug_ratio` (new) — bug count divided by FMEA Impact score; high values = the module is producing bugs at a rate disproportionate to how impactful it is
+- `impact_weighted_spike` (new) — the cross-module spike signal weighted by FMEA impact
 - `cluster_entropy_2/3` — issue-group diversity index (when cluster data is loaded)
 - `top_cluster_velocity` — growth rate of the dominant issue group
 - TF-IDF text features — keyword loadings from recent module descriptions (last 3 versions)
@@ -2723,19 +2780,28 @@ The correlations are computed across all (module, version) rows in the training 
 
 ### 🛠️ How the ML Model Works
 
-**Bug count model:** `GradientBoostingRegressor` (scikit-learn, 200 trees, max_depth=4, learning_rate=0.1). Trained to predict bug count in the next version. Two variants: a single global model and a stratified model (separate models for high- and low-activity modules).
+**Bug count model:** `GradientBoostingRegressor` (scikit-learn, 200 trees, max_depth=4, learning_rate=0.1). Predicts bug count in the next version. Output includes both a **global model** (one GBR across all modules) and a **stratified model** (separate GBRs for high- and low-activity modules) — compare the "Forecast (global)" vs "Forecast (stratified)" columns in the Full Predictions Table to see which behaves better for your modules.
 
-**Risk classifier:** `GradientBoostingClassifier` (150 trees, max_depth=3) calibrated with isotonic regression. Predicts probability of at least one S1 (Critical) bug next version. This replaces the old hand-tuned composite scoring.
+**Risk classifier:** `GradientBoostingClassifier` (150 trees, max_depth=3) calibrated with isotonic regression. Predicts the probability of at least one S1 (Critical) bug next version. The risk score IS that probability (0–100%). Replaces the old hand-tuned composite scoring. Falls back to weighted composite if the classifier has too few samples.
+
+**Status weighting (important):** Bugs are not all weighted equally in training:
+- **Open bugs → weight 1.0** (full live signal)
+- **Invalid bugs (NAB / Won't Fix / Not a Bug / etc.) → weight 0.0** (excluded entirely; they were never real defects)
+- **Closed/fixed bugs → weight 0.5, decaying linearly to 0.1 over 12 versions** (the fix lands → still a regression candidate next version → signal fades as more clean versions pass; never zero so a long-settled module still carries a faint echo of its bug history)
+
+This means re-running the pipeline after a release closes out bugs gives the model a *softer* version of history, not a cliff drop — so quiet P1 cores stay flagged correctly.
 
 **Training validation:** 3-fold `TimeSeriesSplit` cross-validation (respects time ordering — no data leakage). The CV MAE (Mean Absolute Error) is printed at run time: it tells you how many bugs off the forecast is on average.
 
-**Feature matrix:** Built by `build_features()` in `predict_defects.py`. Each row is a (module, version) pair. Features include rolling window statistics (1/2/3 versions), critical bug ratio, new module flag, cross-module spike count, and rolling TF-IDF text features (last 3 versions). Requires at least **5 versions of history** per module; modules with less are excluded.
+**Feature matrix:** Built by `build_features()` in `predict_defects.py`. Each row is a (module, version) pair. Features include rolling window stats (1/2/3 versions), critical bug ratio, new module flag, cross-module spike count, rolling TF-IDF text features, and impact-aware features (`stable_mature`, `impact_bug_ratio`, `impact_weighted_spike`) when FMEA data is loaded. Requires at least **5 versions of history** per module; modules with less are excluded.
 
-**Two forecast models:** The output includes both a **global model** (one GBR across all modules) and a **stratified model** (separate GBRs for high-activity and low-activity modules). Compare the "Forecast (global)" and "Forecast (stratified)" columns in the Full Predictions Table to see if the stratified model gives better estimates for your modules.
+**Risk level thresholds:**
+- **Critical > 20%** probability of S1 next version
+- **High 10–20%**
+- **Medium 5–10%**
+- **Low < 5%**
 
-**Risk level assignment:** Risk levels are assigned by a **learned classifier** — a calibrated `GradientBoostingClassifier` trained to predict the probability of an S1 (Critical) bug in the next version. The risk score IS the model's predicted probability (0–100%). S1 bugs are ~3.6% of all bugs, so even 10% predicted probability is a 3× baseline elevation. Falls back to weighted composite scoring if the classifier has too few samples.
-
-Thresholds: Critical > 20%, High 10–20%, Medium 5–10%, Low < 5%. Because these are learned probabilities, most modules will be "Low" when the product is healthy — only modules with genuine S1 risk patterns reach "Critical".
+S1 bugs are ~3.6% of all bugs in history, so a 10% prediction is already ~3× baseline elevation. Because these are *learned* probabilities, most modules will be "Low" when the product is healthy — only modules with genuine S1 risk patterns reach Critical.
 
 ---
 
@@ -2749,29 +2815,31 @@ python scripts/predict_defects.py data/ecl_parsed.csv
 python scripts/predict_defects.py data/ecl_parsed.csv \\
   --cluster-csv data/clusters/ecl_parsed_clustered.csv
 
-# Full AI-powered scenarios:
+# Full AI-powered scenarios + I×P×D risk features:
 python scripts/predict_defects.py data/ecl_parsed.csv \\
   --cluster-csv data/clusters/ecl_parsed_clustered.csv \\
-  --provider ollama --model llama3.1
-
-# Also load I×P×D risk features:
-python scripts/predict_defects.py data/ecl_parsed.csv \\
-  --scored-csv data/risk_register_scored.csv
+  --scored-csv data/risk_register_scored.csv \\
+  --provider ollama --model gemma4
 ```
 
-Output files saved to `data/predictions/`:
+**Pipeline shortcuts** (`refresh_pipeline.sh`):
+- Default Friday refresh runs cluster + predict together so Tabs 8 and 9 stay in sync.
+- `./refresh_pipeline.sh --force-relabel` re-labels clusters AND forces predictions to rebuild (so the new cluster labels propagate into the scenarios).
+- `./refresh_pipeline.sh --skip-predict` skips this stage when you only need clustering.
+
+**Output files** (auto-loaded from `data/products/<slug>/predictions/`):
 
 | File | Contents |
 |------|---------|
-| `_predictions.csv` | Main forecast — predicted count, risk level, all signals |
+| `_predictions.csv` | Main forecast — predicted count, risk level, all signals, quadrant, priority_score |
 | `_predictions_by_category.csv` | Per-module per-category historical % and expected count |
-| `_predictions_by_scenario.csv` | Concrete bug scenario predictions with confidence |
+| `_predictions_by_scenario.csv` | Concrete bug scenario predictions with confidence (quadrant-aware selection) |
 | `_predictions_by_cluster.csv` | Per-module per-cluster breakdown (requires `--cluster-csv`) |
 | `_predictions_importance.csv` | Feature importance ranking from the trained model |
 | `_predictions_leading_indicators.csv` | Pearson r correlation of each feature with future bugs |
 | `_predictions_focus_summary.txt` | Plain-English risk briefing text |
 
-**Recommend re-running every Friday** alongside `cluster_bugs.py` so Tabs 8 and 9 stay in sync.
+**Recommended cadence:** re-run **every Friday** alongside `cluster_bugs.py` so Tabs 8 and 9 stay aligned.
 """)
 
     if pred_df is None:

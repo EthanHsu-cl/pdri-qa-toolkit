@@ -9,10 +9,26 @@ Standalone page for fuzzy module mappings:
 """
 
 import json
+import sys
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+
+# scripts/ is the parent of scripts/pages/; add it so we can import the
+# canonical module list from the parser without duplicating it here.
+_SCRIPTS_DIR = Path(__file__).resolve().parents[1]
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+try:
+    from parse_ecl_export import (
+        _CANONICAL_MODULES, MODULE_ALIASES, suggest_canonical,
+    )
+    CANONICAL_OPTIONS = sorted(set(_CANONICAL_MODULES) | set(MODULE_ALIASES.values()))
+    _HAS_SUGGEST = True
+except Exception:
+    CANONICAL_OPTIONS = []
+    _HAS_SUGGEST = False
 
 st.set_page_config(
     page_title="Pending Module Review",
@@ -100,6 +116,7 @@ for product_slug, versions_dir in mapping_dirs.items():
                     "Version": version,
                     "Raw Module": raw,
                     "Suggested Canonical": suggested,
+                    "New Canonical (override)": "",
                 }
             )
 
@@ -183,8 +200,111 @@ Each row in the table represents one unconfirmed fuzzy match:
 df_pending = pd.DataFrame(pending_rows)
 df_pending["__row_id"] = range(len(df_pending))  # stable ID 0..N-1
 
+# --- AI Re-suggest + Copy / Download toolbar ---
+blank_count = sum(
+    1 for r in pending_rows
+    if not str(r.get("Suggested Canonical", "")).strip()
+)
+
+import streamlit.components.v1 as components
+
+col_ai, col_copy, col_dl = st.columns(3)
+
+with col_ai:
+    _ai_disabled = not _HAS_SUGGEST or blank_count == 0
+    _ai_label = f"AI Re-suggest ({blank_count} blank)" if blank_count else "All rows have suggestions"
+    ai_clicked = st.button(
+        _ai_label, type="primary", disabled=_ai_disabled,
+        help="Use Ollama embeddings + LLM to fill blank Suggested Canonical values.",
+        use_container_width=True,
+    )
+
+_display_cols = ["Product", "Version", "Raw Module", "Suggested Canonical"]
+_tsv_payload = df_pending[_display_cols].to_csv(sep="\t", index=False)
+_csv_payload = df_pending[_display_cols].to_csv(index=False)
+
+with col_copy:
+    copy_clicked = st.button(
+        "Copy table (TSV)",
+        use_container_width=True,
+        help="Copy the pending table as TSV to your clipboard.",
+    )
+    if copy_clicked:
+        components.html(
+            f"""<script>
+                navigator.clipboard.writeText({json.dumps(_tsv_payload)});
+            </script>""",
+            height=0,
+        )
+        st.toast("Copied table to clipboard", icon="📋")
+
+with col_dl:
+    st.download_button(
+        "Download CSV", _csv_payload,
+        "pending_mappings.csv", "text/csv",
+        use_container_width=True,
+    )
+
+# --- Run AI Re-suggest if clicked ---
+if ai_clicked:
+    progress = st.progress(0, text="Re-suggesting blank rows...")
+    updated_count = 0
+    blank_rows = [
+        (i, r) for i, r in enumerate(pending_rows)
+        if not str(r.get("Suggested Canonical", "")).strip()
+    ]
+    for step, (idx, row) in enumerate(blank_rows):
+        product = row["Product"]
+        version = row["Version"]
+        raw = row["Raw Module"]
+        cache_dir = mapping_dirs.get(product)
+        if cache_dir is not None:
+            cache_dir = cache_dir.parent
+        pick, conf = suggest_canonical(raw, cache_dir=cache_dir)
+        if pick:
+            versions_dir = mapping_dirs.get(product)
+            if versions_dir:
+                p_path = versions_dir / f"{version}_pending.json"
+                pdata = _load_json(p_path)
+                if raw in pdata:
+                    pdata[raw]["suggested"] = pick
+                    _save_json(p_path, pdata)
+                    updated_count += 1
+        progress.progress((step + 1) / len(blank_rows),
+                          text=f"Re-suggesting... {step + 1}/{len(blank_rows)}")
+    progress.empty()
+    if updated_count:
+        st.success(f"Updated {updated_count} suggestions. Refreshing...")
+        st.rerun()
+    else:
+        st.info("No new suggestions found (Ollama may be offline or all are genuinely unmatched).")
+
+# --- Column config ---
+if CANONICAL_OPTIONS:
+    _column_config = {
+        "Suggested Canonical": st.column_config.SelectboxColumn(
+            "Suggested Canonical",
+            options=CANONICAL_OPTIONS,
+            required=False,
+            help="Pick the canonical module. Empty = decide later.",
+        ),
+        "New Canonical (override)": st.column_config.TextColumn(
+            "New Canonical (override)",
+            help="If the correct canonical isn't in the dropdown, type it here — takes priority on promote.",
+        ),
+    }
+else:
+    _column_config = None
+    st.warning(
+        "Could not load the canonical module list from parse_ecl_export.py — "
+        "'Suggested Canonical' shown as plain text. Check the import path."
+    )
+
 edited = st.data_editor(
     df_pending,
+    column_config=_column_config,
+    column_order=["Product", "Version", "Raw Module", "Suggested Canonical",
+                   "New Canonical (override)"],
     use_container_width=True,
     hide_index=True,
     num_rows="fixed",
@@ -288,7 +408,10 @@ with col_promote:
                 product = str(row["Product"])
                 version = str(row["Version"])
                 raw = str(row["Raw Module"])
-                canonical = str(row["Suggested Canonical"]).strip()
+                # Override column wins when non-empty (user typed a canonical
+                # that isn't in the dropdown). Otherwise take the dropdown pick.
+                override = str(row.get("New Canonical (override)", "")).strip()
+                canonical = override or str(row["Suggested Canonical"]).strip()
                 if not canonical:
                     continue
                 updated.setdefault(product, {}).setdefault(version, {})[raw] = canonical
