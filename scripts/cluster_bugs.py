@@ -239,7 +239,16 @@ def _ollama_label_cluster(samples: "list[str]", model: str = "gemma4:e2b-it-q4_K
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 data = json.loads(resp.read().decode())
-                raw = data.get("message", {}).get("content", "").strip()
+                msg = data.get("message", {})
+                raw = msg.get("content", "").strip()
+                # Some reasoning-enabled models (e.g. gemma4) emit the actual
+                # answer in a "thinking" field and leave "content" empty.
+                if not raw:
+                    raw = msg.get("thinking", "").strip()
+                if not raw and attempt == 0:
+                    print(f"  [label] DEBUG response keys: {list(data.keys())}, "
+                          f"message keys: {list(msg.keys())}",
+                          file=sys.stderr)
                 label = ""
                 for ln in raw.splitlines():
                     cleaned = ln.strip().strip('"\'').strip("*#-•· ").strip()
@@ -257,13 +266,43 @@ def _ollama_label_cluster(samples: "list[str]", model: str = "gemma4:e2b-it-q4_K
                 else:
                     snippet = raw.replace("\n", "\\n")[:200]
                     print(f"  [label] All {retries} attempts returned empty/unparseable response — "
-                          f"falling back to 'unlabelled'. Last raw content: {snippet!r}",
+                          f"trying /api/generate fallback. Last raw content: {snippet!r}",
                           file=sys.stderr)
         except Exception as e:
             print(f"  [label] Ollama error (attempt {attempt + 1}/{retries}): {e}", file=sys.stderr)
             if attempt == retries - 1:
-                print(f"  [label] All {retries} attempts failed — falling back to 'unlabelled'.",
+                print(f"  [label] All {retries} attempts failed — trying /api/generate fallback.",
                       file=sys.stderr)
+
+    # /api/generate fallback — simpler endpoint that works when /api/chat returns empty
+    try:
+        gen_prompt = (
+            f"Bug descriptions:\n{joined}\n\n"
+            "Respond with ONLY a 3-6 word label describing the common theme:"
+        )
+        gen_payload = json.dumps({
+            "model": model,
+            "prompt": gen_prompt,
+            "stream": False,
+            "options": {"temperature": 0.3, "num_predict": 50},
+        }).encode()
+        gen_req = urllib.request.Request(
+            f"{OLLAMA_BASE}/api/generate",
+            data=gen_payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(gen_req, timeout=60) as resp:
+            gdata = json.loads(resp.read().decode())
+            fallback_raw = gdata.get("response", "").strip()
+            for ln in fallback_raw.splitlines():
+                cleaned = ln.strip().strip('"\'').strip("*#-•· ").strip()
+                if cleaned and not cleaned.lower().startswith(preamble_prefixes):
+                    print(f"  [label] /api/generate fallback succeeded: {cleaned!r}", file=sys.stderr)
+                    return cleaned
+            print(f"  [label] /api/generate fallback also returned empty.", file=sys.stderr)
+    except Exception as e:
+        print(f"  [label] /api/generate fallback failed: {e}", file=sys.stderr)
+
     return "unlabelled"
 
 

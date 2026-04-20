@@ -157,6 +157,12 @@ _prev_product_state_key = st.session_state.get("_last_product_state_key")
 if _prev_product_state_key != _product_state_key:
     _prev_slug = None if _prev_product_state_key == "__legacy__" else _prev_product_state_key
     _new_slug = None if _product_state_key == "__legacy__" else _product_state_key
+    # Preserve the currently selected navigation tab across the product
+    # switch. Without this explicit re-write, the radio can desync after
+    # `st.rerun()`: the sidebar keeps visually showing the previous tab
+    # while `active_tab` evaluates to the default (index 0), rendering
+    # Module × Severity instead of the user's selected tab.
+    _preserved_active_tab = st.session_state.get("active_tab")
     # Explicitly set every product-scoped widget key to the new product's
     # defaults.  Simply popping keys is unreliable: Streamlit's client-side
     # widget state can re-inject old values on the next rerun.  By writing
@@ -183,6 +189,11 @@ if _prev_product_state_key != _product_state_key:
         "Data source paths were reset to this product's defaults."
     )
     st.session_state["_last_product_state_key"] = _product_state_key
+    # Re-write the preserved navigation tab after the pops above, so the
+    # radio renders on the selected tab after the rerun (see comment near
+    # `_preserved_active_tab` for why this is necessary).
+    if _preserved_active_tab:
+        st.session_state["active_tab"] = _preserved_active_tab
     # Force a clean rerun so widgets pick up the new session state values.
     st.rerun()
 
@@ -3114,8 +3125,6 @@ python scripts/predict_defects.py data/ecl_parsed.csv \\
                         _detail_parts.append(f"Categories: {_cats}")
                     if _sc_signal and _sc_signal not in ("nan", ""):
                         _detail_parts.append(f"Signal: _{_sc_signal}_")
-                    if _examples and _examples != "nan" and len(_examples) > 5:
-                        _detail_parts.append(f"Based on: _{_examples[:200]}_")
                     if _detail_parts:
                         st.caption(" · ".join(_detail_parts))
                     if _sc_expl and _sc_expl not in ("nan", ""):

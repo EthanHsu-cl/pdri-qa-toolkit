@@ -1490,7 +1490,7 @@ def _generate_scenarios_ai_ollama(
         f"Predict 3-5 specific bug scenarios likely to occur next version.\n"
         f"Each must be a concrete, testable statement like real bug titles.\n"
         f"Do NOT write vague summaries. Do NOT mention counts.\n"
-        f'Return ONLY a JSON array: [{{"scenario": "...", "confidence": "high|medium|low", "based_on": "...", "explanation": "1-2 sentences on why this scenario is likely, grounded in the descriptions and signal above"}}]'
+        f'Return ONLY a JSON array: [{{"scenario": "...", "confidence": "high|medium|low", "based_on": "...", "explanation": "**Why likely:** [reason grounded in the patterns and signal above, referencing specific descriptions if relevant]. **Steps to reproduce:** [concrete trigger steps or conditions that cause this bug]. **What to verify:** [expected vs actual behavior — what should happen and what goes wrong instead]."}}]'
     )
 
     payload = json.dumps({
@@ -1498,7 +1498,7 @@ def _generate_scenarios_ai_ollama(
         "prompt": prompt,
         "stream": False,
         "format": "json",
-        "options": {"temperature": 0.3, "num_predict": 1100},
+        "options": {"temperature": 0.3, "num_predict": 2000},
     }).encode()
     req = urllib.request.Request(
         f"{OLLAMA_BASE}/api/generate",
@@ -1510,22 +1510,32 @@ def _generate_scenarios_ai_ollama(
             raw = json.loads(resp.read().decode())
             text = raw.get("response", "").strip()
             # Try parsing as JSON directly
+            def _normalize_scenarios(lst: list) -> list:
+                """Ensure every element is a dict with at least a 'scenario' key."""
+                result = []
+                for item in lst:
+                    if isinstance(item, dict):
+                        result.append(item)
+                    elif isinstance(item, str) and item.strip():
+                        result.append({"scenario": item.strip(), "confidence": "medium", "based_on": "", "explanation": ""})
+                return result
+
             try:
                 parsed = json.loads(text)
                 if isinstance(parsed, list):
-                    return parsed
+                    return _normalize_scenarios(parsed)
                 # Some models wrap in a dict
                 if isinstance(parsed, dict):
                     for key in ("scenarios", "predictions", "bugs", "results"):
                         if key in parsed and isinstance(parsed[key], list):
-                            return parsed[key]
+                            return _normalize_scenarios(parsed[key])
             except json.JSONDecodeError:
                 pass
             # Fallback: extract JSON array from text
             match = re.search(r'\[.*\]', text, re.DOTALL)
             if match:
                 try:
-                    return json.loads(match.group())
+                    return _normalize_scenarios(json.loads(match.group()))
                 except json.JSONDecodeError:
                     pass
     except Exception:
@@ -1565,12 +1575,12 @@ def _generate_scenarios_ai_claude(
         f"Predict 3-5 specific bug scenarios likely to occur next version.\n"
         f"Each must be a concrete, testable statement like real bug titles.\n"
         f"Do NOT write vague summaries. Do NOT mention counts.\n"
-        f'Return ONLY a JSON array: [{{"scenario": "...", "confidence": "high|medium|low", "based_on": "...", "explanation": "1-2 sentences on why this scenario is likely, grounded in the descriptions and signal above"}}]'
+        f'Return ONLY a JSON array: [{{"scenario": "...", "confidence": "high|medium|low", "based_on": "...", "explanation": "**Why likely:** [reason grounded in the patterns and signal above, referencing specific descriptions if relevant]. **Steps to reproduce:** [concrete trigger steps or conditions that cause this bug]. **What to verify:** [expected vs actual behavior — what should happen and what goes wrong instead]."}}]'
     )
 
     payload = json.dumps({
         "model": "claude-sonnet-4-20250514",
-        "max_tokens": 1200,
+        "max_tokens": 2000,
         "messages": [{"role": "user", "content": prompt}],
     }).encode()
     req = urllib.request.Request(
@@ -1618,7 +1628,7 @@ def _build_scenario_explanation(
     and forward-looking risk. Used to populate the `explanation` column on
     `ecl_parsed_predictions_by_scenario.csv`."""
 
-    # ── 1. Pattern evidence ──────────────────────────────────────────────
+    # ── Gather raw signals ───────────────────────────────────────────────
     member_rows = scenario.get("member_row_indices") or []
     source_count = int(scenario.get("source_count", 0) or 0)
     critical_hits = 0
@@ -1636,71 +1646,47 @@ def _build_scenario_explanation(
         except Exception:
             pass
 
-    pattern_bits = [f"{source_count or 1} similar bug(s) in this module"]
-    if critical_hits:
-        pattern_bits.append(f"{critical_hits} Critical/S1")
-    if most_recent_build is not None:
-        pattern_bits.append(f"most recent build {most_recent_build}")
-    pattern_evidence = "Pattern evidence: " + "; ".join(pattern_bits) + "."
-
-    # ── 2. Module selection rationale ────────────────────────────────────
-    rs = mod_row.get("risk_score_final")
-    quadrant = mod_row.get("heatmap_quadrant") or mod_row.get("quadrant")
-    predicted = mod_row.get("predicted")
-    leading = mod_row.get("leading_signal") or ""
-    priority = mod_row.get("priority_score")
-
-    module_bits = [f"module='{module}'"]
-    if rs is not None and pd.notna(rs):
-        module_bits.append(f"risk_score_final={float(rs):.0f}")
-    if quadrant and pd.notna(quadrant):
-        module_bits.append(f"heatmap quadrant {quadrant}")
-    if priority is not None and pd.notna(priority):
-        module_bits.append(f"blended priority={float(priority):.1f}")
-    if predicted is not None and pd.notna(predicted):
-        module_bits.append(f"predicted next build={float(predicted):.1f} bug(s)")
-    if leading:
-        module_bits.append(f"leading signal: {leading}")
-    module_selection = "Module selected: " + ", ".join(module_bits) + "."
-
-    # ── 3. Cluster representation logic ──────────────────────────────────
-    top_terms = scenario.get("cluster_top_terms") or []
-    if scenario_type == "historical_pattern":
-        cluster_repr = (
-            f"Cluster representation: chosen as centroid-closest description "
-            f"among {source_count or 1} bugs sharing theme"
-        )
-        if top_terms:
-            cluster_repr += f" (top terms: {', '.join(top_terms[:5])})."
-        else:
-            cluster_repr += "."
-    else:
-        cluster_repr = (
-            "Cluster representation: AI-synthesized from "
-            f"{source_count or 'the recent'} bug description(s)"
-        )
-        if top_terms:
-            cluster_repr += f" sharing terms ({', '.join(top_terms[:5])})."
-        else:
-            cluster_repr += "."
-
-    # ── 4. Forward-looking risk rationale ────────────────────────────────
+    leading = str(mod_row.get("leading_signal") or "")
     reg_rate = mod_row.get("regression_rate")
     open_count = mod_row.get("open_count")
     vel = mod_row.get("module_cluster_velocity")
-    forward_bits = []
-    if reg_rate is not None and pd.notna(reg_rate):
-        forward_bits.append(f"regression rate {float(reg_rate) * 100:.0f}%")
+    top_terms = scenario.get("cluster_top_terms") or []
+    scenario_text = str(scenario.get("scenario_text", ""))
+
+    # ── Why likely ───────────────────────────────────────────────────────
+    why_parts = [f"This pattern appeared in {source_count or 1} similar bug(s) in {module}."]
+    if critical_hits:
+        why_parts.append(f"{critical_hits} of those were Critical/S1 severity.")
+    if most_recent_build:
+        why_parts.append(f"Most recently seen in build {most_recent_build}.")
+    if leading:
+        why_parts.append(f"Strongest signal: {leading}.")
+    if reg_rate is not None and pd.notna(reg_rate) and float(reg_rate) > 0:
+        why_parts.append(f"Regression rate: {float(reg_rate) * 100:.0f}%.")
     if open_count is not None and pd.notna(open_count) and float(open_count) > 0:
-        forward_bits.append(f"{int(open_count)} related bug(s) still Open")
+        why_parts.append(f"{int(open_count)} related bug(s) still open.")
     if vel is not None and pd.notna(vel):
         tag = "growing" if float(vel) >= 1.5 else ("declining" if float(vel) <= 0.67 else "stable")
-        forward_bits.append(f"cluster velocity {float(vel):.2f}× ({tag})")
-    if not forward_bits:
-        forward_bits.append("watch recent builds for recurrence")
-    forward_risk = "Forward-looking risk: " + "; ".join(forward_bits) + "."
+        why_parts.append(f"Cluster velocity is {tag} ({float(vel):.2f}×).")
+    why_likely = "**Why likely:** " + " ".join(why_parts)
 
-    return "\n".join([pattern_evidence, module_selection, cluster_repr, forward_risk])
+    # ── Steps to reproduce ───────────────────────────────────────────────
+    if top_terms:
+        keyword_hint = f" involving {', '.join(top_terms[:3])}"
+    else:
+        keyword_hint = ""
+    steps = (
+        f"**Steps to reproduce:** Navigate to the {module} area{keyword_hint}. "
+        f"Perform the action described in the scenario and observe the result."
+    )
+
+    # ── What to verify ───────────────────────────────────────────────────
+    verify = (
+        f"**What to verify:** Confirm that {scenario_text.rstrip('.')} behaves as expected. "
+        f"Check for incorrect UI state, missing feedback, or unexpected errors."
+    )
+
+    return "\n".join([why_likely, steps, verify])
 
 
 def generate_bug_scenarios(
@@ -1859,6 +1845,8 @@ def generate_bug_scenarios(
                 })
         else:
             for i, s in enumerate(scenarios[:SCENARIOS_PER_MODULE]):
+                if isinstance(s, str):
+                    s = {"scenario": s, "confidence": "medium", "based_on": "", "explanation": ""}
                 scenario_text = s.get("scenario", s.get("scenario_text", ""))
                 confidence = s.get("confidence", "medium")
                 if confidence not in ("high", "medium", "low"):
@@ -2306,21 +2294,7 @@ def main():
 
         # Use learned probability as the primary risk score (0–100)
         preds["composite_risk"] = (preds["risk_proba"] * 100).round(2)
-
-        # Thresholds on calibrated probability of S1 (critical) bug.
-        # S1 bugs are ~3.6% of all bugs, so even a 10% predicted
-        # probability represents a 3× baseline elevation.
-        #   >20% chance of S1 = Critical (6× baseline)
-        #   10–20% = High (3× baseline)
-        #   5–10% = Medium (above baseline)
-        #   <5% = Low (near or below baseline)
-        preds["risk_level"] = pd.cut(
-            preds["composite_risk"],
-            bins=[-1, 5, 10, 20, float("inf")],
-            labels=["Low", "Medium", "High", "Critical"],
-        )
         risk_method = "learned classifier (P(S1 critical bug))"
-        risk_thresholds = "Critical >20% | High 10–20% | Medium 5–10% | Low <5%"
     else:
         # Fallback to weighted composite when classifier cannot train
         print("  Falling back to weighted composite scoring.")
@@ -2344,13 +2318,7 @@ def main():
             0.10 * norm_trend
         )
         preds["composite_risk"] = (raw_composite * 100).round(2)
-        preds["risk_level"] = pd.cut(
-            preds["composite_risk"],
-            bins=[-1, 25, 50, 75, float("inf")],
-            labels=["Low", "Medium", "High", "Critical"],
-        )
         risk_method = "weighted composite (fallback)"
-        risk_thresholds = "Critical >75 | High 50–75 | Medium 25–50 | Low <25"
 
     # ── Blended priority_score — aligns Forecast ranking with Heatmap/Clusters ──
     # The Risk Heatmap sorts by risk_score_final (I×P×D). The forecast's own
@@ -2416,9 +2384,33 @@ def main():
     ) * 100
     preds["priority_score"] = preds["priority_score"].round(2)
 
+    # ── risk_level from priority_score percentile thresholds ──────────────────
+    # priority_score blends FMEA (50%), quadrant tier (25%), ML (15%), and
+    # cluster velocity (10%). Using per-product relative percentiles prevents
+    # the ML's compressed probability range (products with few S1 bugs) from
+    # locking all modules into Medium/Low. When ML evidence is thin, FMEA
+    # domain risk carries the classification.
+    # Percentile bands: Critical = top 10%, High = 70–90th, Medium = 40–70th,
+    # Low = bottom 40%.
+    _ps = preds["priority_score"]
+    _p40 = float(_ps.quantile(0.40))
+    _p70 = float(_ps.quantile(0.70))
+    _p90 = float(_ps.quantile(0.90))
+    _rl = pd.Series("Low", index=preds.index, dtype=str)
+    _rl[_ps >= _p40] = "Medium"
+    _rl[_ps >= _p70] = "High"
+    _rl[_ps >= _p90] = "Critical"
+    preds["risk_level"] = _rl
+    risk_thresholds = (
+        f"Critical ≥p90 (≥{_p90:.1f}) | High ≥p70 (≥{_p70:.1f}) | "
+        f"Medium ≥p40 (≥{_p40:.1f}) | Low <{_p40:.1f}  [per-product priority_score percentiles]"
+    )
+
     # Log the breakdown
     rl_counts = preds["risk_level"].value_counts()
     print(f"\n  Risk scoring method: {risk_method}")
+    print(f"    ML composite_risk range: {preds['composite_risk'].min():.1f}–{preds['composite_risk'].max():.1f}")
+    print(f"    risk_level source: priority_score percentiles")
     print(f"    Thresholds — {risk_thresholds}")
     for lvl in ["Critical", "High", "Medium", "Low"]:
         print(f"    {lvl}: {rl_counts.get(lvl, 0)} module(s)")
