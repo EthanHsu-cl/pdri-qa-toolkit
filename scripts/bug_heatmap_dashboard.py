@@ -97,6 +97,7 @@ Usage:
   streamlit run scripts/bug_heatmap_dashboard.py \\
     --server.address 0.0.0.0 --server.port 8501
 """
+import json
 import os
 import streamlit as st
 import pandas as pd
@@ -253,6 +254,7 @@ TAB_NAMES = [
     "🔥 Risk Heatmap",
     "🔬 Bug Clusters",
     "🔮 Defect Forecast",
+    "🎯 Release Pulse",
 ]
 
 SEV_OPTIONS = ["All", "1-Critical", "2-Major", "3-Normal", "4-Minor"]
@@ -3088,6 +3090,32 @@ python scripts/predict_defects.py data/ecl_parsed.csv \\
             "Expand each module to see all predicted scenarios with confidence levels, "
             "supporting categories, and source bug examples."
         )
+
+        # Build a description → (BugCode, BugCode_display) lookup once per session.
+        # source_bug_examples stores Short Description text joined with " | ".
+        # We reverse-map those descriptions back to BugCodes so we can link to ECL.
+        _DESC_LOOKUP_KEY = "__t9_desc_to_bugcode"
+        if _DESC_LOOKUP_KEY not in st.session_state:
+            _raw_fp = st.session_state.get("fp_bugs", "")
+            _desc_to_bc: dict[str, str] = {}
+            if _raw_fp and Path(_raw_fp).exists():
+                _raw_df = load_csv(_raw_fp)
+                _d_col = next(
+                    (c for c in ("Short Description", "parsed_description") if c in _raw_df.columns),
+                    None,
+                )
+                _bc_col = next(
+                    (c for c in _raw_df.columns if "bugcode" in c.lower()), None
+                )
+                if _d_col and _bc_col:
+                    _desc_to_bc = {
+                        str(d): str(bc)
+                        for d, bc in zip(_raw_df[_d_col], _raw_df[_bc_col])
+                        if pd.notna(d) and pd.notna(bc)
+                    }
+            st.session_state[_DESC_LOOKUP_KEY] = _desc_to_bc
+        _desc_lookup: dict[str, str] = st.session_state[_DESC_LOOKUP_KEY]
+
         _scenario_modules = pred_scenario_df["module"].unique()
         for _sc_mod in _scenario_modules:
             _sc_mod_data = pred_scenario_df[pred_scenario_df["module"] == _sc_mod]
@@ -3130,6 +3158,27 @@ python scripts/predict_defects.py data/ecl_parsed.csv \\
                     if _sc_expl and _sc_expl not in ("nan", ""):
                         with st.expander("❓ Why this scenario?", expanded=False):
                             st.markdown(_sc_expl.replace("\n", "  \n"))
+                    # Source bugs — look up BugCodes from description text
+                    if _examples and _examples not in ("nan", ""):
+                        _ex_descs = [d.strip() for d in _examples.split(" | ") if d.strip()]
+                        if _ex_descs:
+                            _ex_rows = []
+                            for _ed in _ex_descs:
+                                _bc = _desc_lookup.get(_ed)
+                                if _bc and _bc not in ("nan", ""):
+                                    _ex_rows.append((_bc, _ed,
+                                        ECL_BUG_URL.format(bug_code=_bc)))
+                                else:
+                                    _ex_rows.append((None, _ed, None))
+                            _link_count = sum(1 for r in _ex_rows if r[0])
+                            _lbl = (f"🐛 Source bugs — {_link_count} linked"
+                                    if _link_count else f"🐛 Source bugs ({len(_ex_rows)})")
+                            with st.expander(_lbl, expanded=False):
+                                for _bc, _ed, _url in _ex_rows:
+                                    if _url:
+                                        st.markdown(f"- [{_bc}]({_url}) — {_ed}")
+                                    else:
+                                        st.markdown(f"- _{_ed}_")
                     st.markdown("")
         st.markdown("---")
 
@@ -3588,3 +3637,447 @@ python scripts/predict_defects.py data/ecl_parsed.csv \\
                     margin=dict(l=10, r=60, t=10, b=10),
                 )
                 st.plotly_chart(fig_imp, width='stretch')
+
+
+# =====================================================================
+# TAB 10 – Release Pulse  (in-progress bugs → combined prediction view)
+# =====================================================================
+
+elif active_tab == "🎯 Release Pulse":
+    import re as _re
+    import requests as _requests
+
+    _P_RISK_ICONS  = {"Critical": "🔴", "High": "🟠", "Medium": "🟡", "Low": "🟢"}
+    _P_CONF_BADGES = {"high": "⬆️ High conf.", "medium": "↔️ Med. conf.", "low": "⬇️ Low conf."}
+    _OLLAMA_BASE   = "http://localhost:11434"
+
+    st.header("🎯 Release Pulse — What to Test Right Now")
+
+    with st.expander("📖 How to read this tab", expanded=False):
+        st.markdown("""
+**One-line summary:** *"Which modules have in-flight bugs this version, and what should QA verify — combining live signals with ML predictions?"*
+
+**TRCreated** — Bug is in Technical Review (actively being implemented / fixed).
+**RDResolved** — Requirements/Design resolved; fix applied, awaiting QA sign-off.
+
+These statuses mark work **not yet QA-verified** for the current version.
+The tab always reads the full unfiltered dataset — sidebar Status/Severity filters do not affect it.
+
+**Why this is a better signal than historical data alone:**
+TRCreated/RDResolved bugs tell you exactly *what is being changed right now*, so regression risk is immediate and concrete. This tab blends:
+1. **In-flight signal** — modules actively being touched (TRCreated/RDResolved counts)
+2. **ML predictions** — historical scenarios from the Defect Forecast (Tab 9), if loaded
+3. **FMEA risk** — long-term risk quadrant from the Risk Heatmap (Tab 7)
+4. **Ollama synthesis** — combines all three into targeted, version-specific test recommendations
+
+**Risk levels** — derived from ML classifier probability (same as Tab 9) when forecast data is loaded; otherwise estimated from FMEA risk score:
+
+| Risk | ML P(S1) | FMEA fallback |
+|------|----------|---------------|
+| Critical | >20% | risk_score > 0.7 |
+| High | 10–20% | risk_score > 0.4 |
+| Medium | 5–10% | risk_score > 0.2 |
+| Low | <5% | otherwise |
+
+Modules with TRCreated bugs are boosted one tier — active implementation increases regression risk.
+**AI recommendations** are cached per version — click once, re-renders are instant.
+""")
+
+    # ── Load unfiltered bug data ───────────────────────────────────────────
+    _pulse_fp = st.session_state.get("fp_bugs", "")
+    if not _pulse_fp or not Path(_pulse_fp).exists():
+        st.warning("Bug data not loaded. Configure Step 1 in the sidebar first.")
+        st.stop()
+
+    df_raw_pulse = load_csv(_pulse_fp)
+    if "Create Date" in df_raw_pulse.columns:
+        df_raw_pulse["Create Date"] = pd.to_datetime(df_raw_pulse["Create Date"], errors="coerce")
+    if "parsed_module" in df_raw_pulse.columns:
+        df_raw_pulse["parsed_module"] = df_raw_pulse["parsed_module"].apply(
+            lambda x: normalise_module(x) if pd.notna(x) else x
+        )
+
+    PULSE_STATUSES = {"TRCreated", "RDResolved"}
+
+    # ── Find newest version ────────────────────────────────────────────────
+    if "parsed_version" not in df_raw_pulse.columns or "Create Date" not in df_raw_pulse.columns:
+        st.error("Bug data missing `parsed_version` or `Create Date` columns.")
+        st.stop()
+
+    _ver_dates = (
+        df_raw_pulse.dropna(subset=["parsed_version", "Create Date"])
+        .groupby("parsed_version")["Create Date"].max()
+    )
+    if _ver_dates.empty:
+        st.warning("No version/date data found.")
+        st.stop()
+    newest_version = str(_ver_dates.idxmax())
+
+    # ── Filter pulse bugs ──────────────────────────────────────────────────
+    _desc_col = "Short Description" if "Short Description" in df_raw_pulse.columns else "parsed_description"
+    df_pulse = df_raw_pulse[
+        df_raw_pulse["Status"].isin(PULSE_STATUSES) &
+        (df_raw_pulse["parsed_version"] == newest_version)
+    ].copy()
+
+    # ── Merge risk scores ──────────────────────────────────────────────────
+    if risk_available and "parsed_module" in df_pulse.columns:
+        _rc = [c for c in ["parsed_module", "quadrant", "risk_score_final",
+                            "impact_score", "detectability_score"]
+               if c in risk_df_dedup.columns]
+        df_pulse = df_pulse.merge(risk_df_dedup[_rc], on="parsed_module", how="left")
+    df_pulse["quadrant"]        = df_pulse.get("quadrant",        pd.Series()).fillna("Unknown")
+    df_pulse["risk_score_final"] = pd.to_numeric(
+        df_pulse.get("risk_score_final", pd.Series()), errors="coerce"
+    ).fillna(0.0)
+
+    # ── Build per-module summary ───────────────────────────────────────────
+    _pulse_grp = (
+        df_pulse.groupby("parsed_module")
+        .agg(
+            quadrant       =("quadrant",        "first"),
+            risk_score     =("risk_score_final", "first"),
+            trc_count      =("Status", lambda s: (s == "TRCreated").sum()),
+            rdr_count      =("Status", lambda s: (s == "RDResolved").sum()),
+            total          =("Status",           "count"),
+            sample_descs   =(_desc_col, lambda x: list(x.dropna().head(10))),
+        )
+        .reset_index()
+        .sort_values(["risk_score", "total"], ascending=[False, False])
+    )
+
+    # ── Derive risk level ──────────────────────────────────────────────────
+    # Prefer ML predictions from pred_df (Tab 9 model); fall back to FMEA score.
+    # Boost one tier for modules with TRCreated bugs (active implementation risk).
+    _RISK_ORDER = ["Low", "Medium", "High", "Critical"]
+
+    def _boost_risk(level: str, trc: int) -> str:
+        if trc == 0:
+            return level
+        idx = _RISK_ORDER.index(level) if level in _RISK_ORDER else 0
+        return _RISK_ORDER[min(idx + 1, len(_RISK_ORDER) - 1)]
+
+    def _score_to_risk(score: float) -> str:
+        if score > 0.7:  return "Critical"
+        if score > 0.4:  return "High"
+        if score > 0.2:  return "Medium"
+        return "Low"
+
+    _pred_rl_map: dict[str, str] = {}
+    _pred_leading_map: dict[str, str] = {}
+    if pred_df is not None and "module" in pred_df.columns and "risk_level" in pred_df.columns:
+        for _, _pr in pred_df.iterrows():
+            _pred_rl_map[str(_pr["module"])] = str(_pr["risk_level"])
+            if "leading_signal" in pred_df.columns:
+                _pred_leading_map[str(_pr["module"])] = str(_pr.get("leading_signal", ""))
+
+    def _module_risk(mod: str, score: float, trc: int) -> str:
+        base = _pred_rl_map.get(mod, _score_to_risk(score))
+        return _boost_risk(base, trc)
+
+    _pulse_grp["risk_level"] = _pulse_grp.apply(
+        lambda r: _module_risk(r["parsed_module"], r["risk_score"], int(r["trc_count"])), axis=1
+    )
+    _pulse_grp = _pulse_grp.sort_values(
+        ["risk_level", "risk_score", "total"],
+        key=lambda c: c.map(_RISK_ORDER.index) if c.name == "risk_level" else c,
+        ascending=[False, False, False],
+    )
+
+    # ── Headline metrics ───────────────────────────────────────────────────
+    _n_trc      = int(df_pulse["Status"].eq("TRCreated").sum())
+    _n_rdr      = int(df_pulse["Status"].eq("RDResolved").sum())
+    _n_mods     = int(_pulse_grp["parsed_module"].nunique())
+    _n_critical = int((_pulse_grp["risk_level"] == "Critical").sum())
+
+    st.markdown(f"#### Version **{newest_version}** — in-progress bugs")
+    _m1, _m2, _m3, _m4 = st.columns(4)
+    _m1.metric("TRCreated",        _n_trc,
+               help="Bugs in Technical Review — actively being implemented")
+    _m2.metric("RDResolved",       _n_rdr,
+               help="Bugs resolved at RD level — fix applied, not yet QA-verified")
+    _m3.metric("Modules affected", _n_mods)
+    _m4.metric("🔴 Critical modules", _n_critical,
+               help="Modules where risk_level=Critical (ML or FMEA) and/or active TRCreated bugs")
+
+    if df_pulse.empty:
+        st.info(f"No TRCreated or RDResolved bugs found for version **{newest_version}**.")
+        st.stop()
+
+    # ── "What to Test Right Now" — primary section ─────────────────────────
+    st.markdown("---")
+    st.subheader("🎯 What to Test Right Now")
+
+    # Gather historical scenarios from pred_scenario_df for modules in pulse
+    _pulse_mods_set = set(_pulse_grp["parsed_module"])
+    _hist_sc: dict[str, list[dict]] = {}   # module → list of scenario dicts
+    if pred_scenario_df is not None and not pred_scenario_df.empty:
+        _sc_mod_col = "module" if "module" in pred_scenario_df.columns else None
+        if _sc_mod_col:
+            for _mod, _msc in pred_scenario_df.groupby(_sc_mod_col):
+                if _mod in _pulse_mods_set:
+                    _hist_sc[_mod] = _msc.to_dict("records")
+
+    _has_hist = bool(_hist_sc)
+    _legend_parts = []
+    if _has_hist:         _legend_parts.append("📎 Historical pattern (from Defect Forecast)")
+    _legend_parts.append("🔄 In-flight context (live TRCreated/RDResolved bugs)")
+    st.caption(
+        "Scenarios grouped by risk level — highest urgency first. "
+        "Historical patterns are pre-computed by the ML model (Tab 9); "
+        "in-flight scenarios are generated on-demand from active bugs."
+        + f"\n\n_{' · '.join(_legend_parts)}_"
+    )
+
+    # Display historical scenarios grouped by risk level (same layout as Tab 9)
+    for _rl in ["Critical", "High", "Medium", "Low"]:
+        _rl_mods = _pulse_grp[_pulse_grp["risk_level"] == _rl]
+        if _rl_mods.empty:
+            continue
+        _rl_icon = _P_RISK_ICONS.get(_rl, "⚪")
+        st.markdown(f"#### {_rl_icon} {_rl} Risk")
+        for _, _mr in _rl_mods.iterrows():
+            _mod = _mr["parsed_module"]
+            _trc = int(_mr["trc_count"])
+            _rdr = int(_mr["rdr_count"])
+            _badge = f"TRCreated: {_trc} · RDResolved: {_rdr}"
+            st.markdown(f"**{_mod}** — _{_badge}_")
+            # Historical scenarios from ML model
+            for _hs in _hist_sc.get(_mod, [])[:3]:
+                _hconf  = _P_CONF_BADGES.get(str(_hs.get("confidence", "medium")), "⬇️ Low conf.")
+                _htext  = str(_hs.get("scenario_text", ""))
+                st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{_hconf} 📎 Historical — {_htext}",
+                            unsafe_allow_html=True)
+            # In-flight preview: top bug description as a stub until AI runs
+            _samples = _mr["sample_descs"][:2]
+            for _sd in _samples:
+                st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;🔄 In-flight — {_sd}",
+                            unsafe_allow_html=True)
+        st.markdown("")
+
+    # ── Module breakdown table ─────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### Module Breakdown")
+    _display_grp = _pulse_grp[["parsed_module", "risk_level", "quadrant", "risk_score",
+                                "trc_count", "rdr_count", "total"]].rename(columns={
+        "parsed_module": "Module", "risk_level": "Risk Level",
+        "quadrant": "FMEA Quadrant", "risk_score": "Risk Score",
+        "trc_count": "TRCreated", "rdr_count": "RDResolved", "total": "Total",
+    })
+    st.dataframe(
+        _display_grp,
+        hide_index=True,
+        column_config={"Risk Score": st.column_config.NumberColumn(format="%.3f")},
+        width="stretch",
+    )
+
+    # ── Raw bug list ───────────────────────────────────────────────────────
+    _show_cols = [c for c in ["BugCode", "Status", _desc_col, "severity_label",
+                               "Handler", "parsed_module", "quadrant"]
+                  if c in df_pulse.columns]
+    with st.expander(f"📋 All {len(df_pulse)} in-progress bugs", expanded=False):
+        st.dataframe(df_pulse[_show_cols], hide_index=True, width="stretch")
+
+    # ── Ollama synthesis ───────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🤖 AI-Synthesized Test Scenarios")
+
+    _cache_key = f"pulse_ai_scenarios_{newest_version}"
+
+    def _ollama_reachable() -> bool:
+        try:
+            r = _requests.get(f"{_OLLAMA_BASE}/api/tags", timeout=2.0)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def _call_ollama_pulse_scenarios(
+        module: str, quadrant: str, risk_level: str, risk_score: float,
+        leading_signal: str, inflight_descs: list[str],
+        hist_scenarios: list[str], version: str,
+    ) -> list[dict]:
+        _inflight_bullets = "\n".join(f"- {d}" for d in inflight_descs[:12])
+        _hist_bullets = (
+            "\n".join(f"- {s}" for s in hist_scenarios[:5])
+            if hist_scenarios else "  (no historical predictions loaded)"
+        )
+        _prompt = (
+            f"You are a QA lead reviewing bugs currently in active development for a video editing iOS app.\n\n"
+            f"Version: {version}\n"
+            f"Module: {module}\n"
+            f"ML-predicted risk level: {risk_level}\n"
+            f"FMEA quadrant: {quadrant} (risk score: {risk_score:.3f})\n"
+            f"Strongest historical signal: {leading_signal or 'N/A'}\n\n"
+            f"Active in-progress bugs (TRCreated / RDResolved — not yet QA-verified):\n"
+            f"{_inflight_bullets}\n\n"
+            f"ML-predicted historical risk patterns for this module:\n"
+            f"{_hist_bullets}\n\n"
+            f"Given the current in-flight changes AND the historical risk patterns above, "
+            f"predict 3-5 specific bug scenarios QA should test. Focus on:\n"
+            f"1. Regressions introduced by the in-flight changes\n"
+            f"2. Edge cases around the active bug fixes\n"
+            f"3. Interaction effects with the known historical risk areas\n\n"
+            f"Each scenario must be a concrete, testable statement (like a real bug title). "
+            f"Do NOT write vague summaries. Do NOT mention counts.\n"
+            f"Return ONLY a JSON array:\n"
+            f'[{{"scenario": "...", "confidence": "high|medium|low", '
+            f'"based_on": "in_flight|historical|both", '
+            f'"explanation": "**Why likely:** [reason]. **Steps to reproduce:** [steps]. '
+            f'**What to verify:** [expected vs actual]."}}]'
+        )
+        try:
+            resp = _requests.post(
+                f"{_OLLAMA_BASE}/api/generate",
+                json={
+                    "model": "gemma4",
+                    "prompt": _prompt,
+                    "stream": False,
+                    "format": "json",
+                    "options": {"temperature": 0.3, "num_predict": 2000},
+                },
+                timeout=120,
+            )
+            resp.raise_for_status()
+            raw = resp.json().get("response", "[]")
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return parsed
+            # Sometimes model wraps in a dict
+            for key in ("scenarios", "results", "predictions"):
+                if key in parsed and isinstance(parsed[key], list):
+                    return parsed[key]
+            return []
+        except Exception:
+            try:
+                m = _re.search(r'\[.*\]', raw, _re.DOTALL)
+                if m:
+                    return json.loads(m.group())
+            except Exception:
+                pass
+            return []
+
+    _ollama_up = _ollama_reachable()
+
+    if _ollama_up:
+        if not st.session_state.get(_cache_key):
+            _top_mods = _pulse_grp.head(10)
+            _ai_sc: dict[str, list[dict]] = {}
+            _prog = st.progress(0, text="Generating scenarios…")
+            for _i, (_idx, _mr) in enumerate((_top_mods.iterrows()), 1):
+                _mod = _mr["parsed_module"]
+                _hist_txts = [str(s.get("scenario_text", ""))
+                              for s in _hist_sc.get(_mod, [])]
+                _ai_sc[_mod] = _call_ollama_pulse_scenarios(
+                    module=_mod,
+                    quadrant=str(_mr["quadrant"]),
+                    risk_level=str(_mr["risk_level"]),
+                    risk_score=float(_mr["risk_score"]),
+                    leading_signal=_pred_leading_map.get(_mod, ""),
+                    inflight_descs=list(_mr["sample_descs"]),
+                    hist_scenarios=_hist_txts,
+                    version=newest_version,
+                )
+                _prog.progress(_i / len(_top_mods),
+                               text=f"Processing {_mod} ({_i}/{len(_top_mods)})…")
+            _prog.empty()
+            st.session_state[_cache_key] = _ai_sc
+
+        _ai_cached = st.session_state.get(_cache_key, {})
+        if _ai_cached:
+            st.caption("AI scenarios cached for this version — click **Clear cache** to regenerate.")
+            if st.button("🗑️ Clear cache", key="pulse_clear_cache"):
+                st.session_state.pop(_cache_key, None)
+                st.rerun()
+            st.markdown("---")
+            # Display per-module cards (matching Tab 9 expanded card style)
+            for _rl in ["Critical", "High", "Medium", "Low"]:
+                _rl_mods = _pulse_grp[_pulse_grp["risk_level"] == _rl]
+                for _, _mr in _rl_mods.iterrows():
+                    _mod = _mr["parsed_module"]
+                    if _mod not in _ai_cached:
+                        continue
+                    _rl_icon   = _P_RISK_ICONS.get(_rl, "⚪")
+                    _scenarios = _ai_cached[_mod]
+                    _trc       = int(_mr["trc_count"])
+                    _rdr       = int(_mr["rdr_count"])
+                    _leading   = _pred_leading_map.get(_mod, "")
+                    with st.expander(
+                        f"{_rl_icon} **{_mod}** — {_rl} risk · "
+                        f"TRCreated: {_trc} · RDResolved: {_rdr} · "
+                        f"{len(_scenarios)} scenario(s)",
+                        expanded=_rl in ("Critical", "High"),
+                    ):
+                        _c1, _c2, _c3 = st.columns(3)
+                        _c1.metric("FMEA Quadrant",  str(_mr["quadrant"]))
+                        _c2.metric("Risk Score",     f"{_mr['risk_score']:.3f}")
+                        _c3.metric("In-flight bugs", _trc + _rdr)
+                        if _leading:
+                            st.caption(f"**Strongest signal:** {_leading}")
+
+                        if _scenarios:
+                            st.markdown("**Predicted scenarios:**")
+                            for _sc_i, _sc in enumerate(_scenarios, 1):
+                                _conf_badge = _P_CONF_BADGES.get(
+                                    str(_sc.get("confidence", "medium")), "⬇️ Low conf."
+                                )
+                                _based_on   = str(_sc.get("based_on", ""))
+                                _src_badge  = {
+                                    "in_flight":  "🔄 In-flight",
+                                    "historical": "📎 Historical",
+                                    "both":       "🔄📎 Combined",
+                                }.get(_based_on, "🔄 In-flight")
+                                _stext      = str(_sc.get("scenario", ""))
+                                _expl       = str(_sc.get("explanation", ""))
+                                st.markdown(
+                                    f"&nbsp;&nbsp;**#{_sc_i}** {_conf_badge} {_src_badge} — {_stext}",
+                                    unsafe_allow_html=True,
+                                )
+                                if _expl:
+                                    with st.expander("❓ Why this scenario?", expanded=False):
+                                        st.markdown(_expl)
+                        else:
+                            st.caption("No structured scenarios returned for this module.")
+
+                        # Show historical ML scenarios alongside for comparison
+                        _hs_list = _hist_sc.get(_mod, [])
+                        if _hs_list:
+                            st.markdown("**Historical risk patterns (from Defect Forecast ML):**")
+                            for _hs in _hs_list[:3]:
+                                _hc = _P_CONF_BADGES.get(
+                                    str(_hs.get("confidence", "medium")), "⬇️ Low conf."
+                                )
+                                st.markdown(
+                                    f"&nbsp;&nbsp;{_hc} 📎 — {_hs.get('scenario_text', '')}",
+                                    unsafe_allow_html=True,
+                                )
+    else:
+        # ── Heuristic fallback ─────────────────────────────────────────────
+        st.caption(
+            "Ollama is not reachable — showing heuristic summary. "
+            "Start Ollama (`ollama serve`) and refresh to enable AI scenario generation."
+        )
+        for _, _mr in _pulse_grp.head(10).iterrows():
+            _mod   = _mr["parsed_module"]
+            _rl    = str(_mr["risk_level"])
+            _q     = str(_mr["quadrant"])
+            _rs    = float(_mr["risk_score"])
+            _trc   = int(_mr["trc_count"])
+            _rdr   = int(_mr["rdr_count"])
+            _icon  = _P_RISK_ICONS.get(_rl, "⚪")
+            with st.expander(
+                f"{_icon} **{_mod}** — {_rl} risk · {_q} · TRCreated: {_trc} · RDResolved: {_rdr}",
+                expanded=_rl in ("Critical", "High"),
+            ):
+                st.markdown("**In-flight bugs (up to 5):**")
+                for _b in _mr["sample_descs"][:5]:
+                    st.markdown(f"- {_b}")
+                _hs_list = _hist_sc.get(_mod, [])
+                if _hs_list:
+                    st.markdown("**Historical ML scenarios:**")
+                    for _hs in _hs_list[:3]:
+                        _hc = _P_CONF_BADGES.get(str(_hs.get("confidence", "medium")), "⬇️ Low conf.")
+                        st.markdown(f"- {_hc} — {_hs.get('scenario_text', '')}")
+                st.caption(
+                    f"Risk: **{_rl}** ({_q}, score {_rs:.3f}) — "
+                    f"{'prioritise every sprint' if _rl in ('Critical', 'High') else 'include in regression pass'}."
+                )

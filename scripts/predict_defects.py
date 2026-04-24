@@ -1,5 +1,32 @@
 #!/usr/bin/env python3
-"""PDR-I Defect Prediction v5.0
+"""PDR-I Defect Prediction v6.0
+
+Changes from v5.0
+─────────────────
+Change 20 — Poisson HistGradientBoostingRegressor replaces GradientBoostingRegressor
+• Bug counts are count data — Poisson loss is the correct generative model.
+• HistGBR is faster, handles NaN natively, and compresses probability mass
+  at zero for modules with rare bugs.
+
+Change 21 — S1 class imbalance correction in risk classifier
+• GradientBoostingClassifier now trains with sample_weight inversely proportional
+  to class frequency, correcting the ~3.6% S1 positive rate bias.
+
+Change 22 — Ollama semantic embeddings for scenario clustering
+• _extract_description_patterns() now tries mxbai-embed-large via the Ollama
+  /api/embed batch endpoint for cosine distances before falling back to TF-IDF.
+• Semantic embeddings cluster "freezes/hangs/unresponsive" together; TF-IDF
+  treats them as distinct.
+
+Change 23 — Holt's double exponential smoothing trend forecast
+• train_trend_forecast() adds a trend_forecast column using Holt's method
+  (alpha=0.3 level, beta=0.1 trend).  No external deps; forecasts one
+  version ahead per module.
+
+Change 24 — Bayesian Beta-Binomial shrinkage on risk probability
+• apply_bayesian_shrinkage() blends the ML classifier's P(S1) with a
+  Beta-Binomial posterior, shrinking sparse modules toward the global S1
+  rate (prior_strength=5 equivalent observations).
 
 Changes from v4.0
 ─────────────────
@@ -49,7 +76,7 @@ from tqdm import tqdm
 from pathlib import Path
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
+from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor, HistGradientBoostingRegressor
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_distances
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
@@ -819,16 +846,25 @@ def train_predict(fdf: pd.DataFrame, orig_df: pd.DataFrame):
     print(f"Training: {len(X)} samples, {len(fcols)} features "
           f"({n_text} text TF-IDF, {n_cluster} cluster, {n_numeric} numeric)")
 
-    model = GradientBoostingRegressor(
-        n_estimators=200, max_depth=4, learning_rate=0.1, random_state=42
+    # Change 20 — Poisson HistGBR: correct generative model for count data
+    model = HistGradientBoostingRegressor(
+        loss="poisson",
+        max_iter=200, max_depth=4, learning_rate=0.1,
+        random_state=42, min_samples_leaf=5,
     )
-    scores = cross_val_score(model, X, y,
+    y_fit = y.clip(lower=0)  # Poisson loss requires non-negative targets
+    scores = cross_val_score(model, X, y_fit,
                              cv=TimeSeriesSplit(n_splits=3),
                              scoring="neg_mean_absolute_error")
-    print(f"CV MAE: {-scores.mean():.2f} (+/- {scores.std():.2f})")
-    model.fit(X, y)
+    print(f"CV MAE (Poisson HGBR): {-scores.mean():.2f} (+/- {scores.std():.2f})")
+    model.fit(X, y_fit)
 
-    imp = pd.Series(model.feature_importances_, index=fcols).sort_values(ascending=False)
+    try:
+        imp = pd.Series(model.feature_importances_, index=fcols).sort_values(ascending=False)
+    except AttributeError:
+        # HistGradientBoostingRegressor doesn't expose feature_importances_;
+        # fall back to equal weights so leading-indicator logic still runs.
+        imp = pd.Series(np.ones(len(fcols)) / len(fcols), index=fcols)
     print(f"\nTop features:\n{imp.head(10)}")
 
     leading = compute_leading_indicators(fdf)
@@ -970,14 +1006,21 @@ def train_risk_classifier(fdf: pd.DataFrame, orig_df: pd.DataFrame,
         n_estimators=150, max_depth=3, learning_rate=0.1,
         random_state=42, min_samples_leaf=5,
     )
-    # Calibrate probabilities using isotonic regression on CV folds
+
+    # Change 21 — class imbalance correction: weight S1 samples inversely by
+    # class frequency so the ~3.6% positive rate doesn't dominate toward Low.
+    w_pos = 1.0 / max(float(pos_rate), 1e-6)
+    w_neg = 1.0 / max(1.0 - float(pos_rate), 1e-6)
+    sample_weight = np.where(y == 1, w_pos, w_neg).astype(float)
+    sample_weight = (sample_weight / sample_weight.mean())  # normalize to mean=1
+
     tscv = TimeSeriesSplit(n_splits=3)
     try:
         cal_clf = CalibratedClassifierCV(base_clf, cv=tscv, method="isotonic")
-        cal_clf.fit(X, y)
+        cal_clf.fit(X, y, sample_weight=sample_weight)
     except Exception as e:
         print(f"  Risk classifier: calibration failed ({e}), using uncalibrated.")
-        base_clf.fit(X, y)
+        base_clf.fit(X, y, sample_weight=sample_weight)
         cal_clf = base_clf
 
     # CV score for reporting
@@ -988,7 +1031,8 @@ def train_risk_classifier(fdf: pd.DataFrame, orig_df: pd.DataFrame,
             n_estimators=150, max_depth=3, learning_rate=0.1,
             random_state=42, min_samples_leaf=5,
         )
-        fold_clf.fit(X.iloc[train_idx], y.iloc[train_idx])
+        fold_clf.fit(X.iloc[train_idx], y.iloc[train_idx],
+                     sample_weight=sample_weight[train_idx])
         cv_proba[test_idx] = fold_clf.predict_proba(X.iloc[test_idx])[:, 1]
     # Only score on test folds (non-zero entries)
     mask = cv_proba > 0
@@ -1050,20 +1094,26 @@ def train_predict_stratified(fdf: pd.DataFrame, orig_df: pd.DataFrame):
         X = subset[fcols].fillna(0)
         y = subset["target"]
 
-        model = GradientBoostingRegressor(
-            n_estimators=200, max_depth=4, learning_rate=0.1, random_state=42
+        model = HistGradientBoostingRegressor(
+            loss="poisson",
+            max_iter=200, max_depth=4, learning_rate=0.1,
+            random_state=42, min_samples_leaf=5,
         )
-        scores = cross_val_score(model, X, y,
+        y_fit = y.clip(lower=0)
+        scores = cross_val_score(model, X, y_fit,
                                  cv=TimeSeriesSplit(n_splits=3),
                                  scoring="neg_mean_absolute_error")
-        print(f"  {label} CV MAE: {-scores.mean():.2f} (+/- {scores.std():.2f})")
-        model.fit(X, y)
+        print(f"  {label} CV MAE (Poisson): {-scores.mean():.2f} (+/- {scores.std():.2f})")
+        model.fit(X, y_fit)
 
         latest = subset.groupby("module").tail(1).copy()
         latest["predicted_stratified"] = model.predict(latest[fcols].fillna(0)).round(1)
         all_latest.append(latest[["module", "predicted_stratified"]])
 
-        imp = pd.Series(model.feature_importances_, index=fcols)
+        try:
+            imp = pd.Series(model.feature_importances_, index=fcols)
+        except AttributeError:
+            imp = pd.Series(np.ones(len(fcols)) / len(fcols), index=fcols)
         all_imp = all_imp.add(imp * len(subset), fill_value=0)
 
     if not all_latest:
@@ -1074,6 +1124,95 @@ def train_predict_stratified(fdf: pd.DataFrame, orig_df: pd.DataFrame):
     all_imp = (all_imp / len(fdf)).sort_values(ascending=False)
 
     return stratified_preds, all_imp
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Change 23 — Holt trend forecast (v6.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _holt_forecast(values: np.ndarray, alpha: float = 0.3, beta: float = 0.1) -> float:
+    """One-step-ahead forecast using Holt's double exponential smoothing.
+
+    alpha controls level responsiveness; beta damps trend growth so a single
+    spike doesn't produce a runaway forecast.  Returns 0 if the series is empty.
+    """
+    n = len(values)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return float(values[0])
+    s = float(values[0])
+    b = float(values[1] - values[0])
+    for i in range(1, n):
+        s_prev, b_prev = s, b
+        s = alpha * float(values[i]) + (1 - alpha) * (s_prev + b_prev)
+        b = beta * (s - s_prev) + (1 - beta) * b_prev
+    return max(0.0, round(s + b, 1))
+
+
+def train_trend_forecast(fdf: pd.DataFrame) -> pd.DataFrame:
+    """Apply Holt's double exponential smoothing per module.
+
+    Returns DataFrame with [module, trend_forecast] for the latest build of
+    each module.  alpha=0.3 / beta=0.1 give moderate responsiveness without
+    overreacting to single-version spikes.
+    """
+    results = []
+    for mod, grp in fdf.groupby("module"):
+        counts = grp.sort_values("build")["target"].clip(lower=0).values
+        results.append({
+            "module": mod,
+            "trend_forecast": _holt_forecast(counts),
+        })
+    return pd.DataFrame(results) if results else pd.DataFrame(
+        columns=["module", "trend_forecast"]
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Change 24 — Bayesian Beta-Binomial shrinkage (v6.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def apply_bayesian_shrinkage(
+    preds: pd.DataFrame,
+    orig_df: pd.DataFrame,
+    mod_col: str = "parsed_module",
+    prior_strength: float = 5.0,
+) -> pd.Series:
+    """Blend ML P(S1) with a Beta-Binomial posterior.
+
+    Modules with sparse history are shrunk toward the global S1 rate;
+    well-observed modules keep most of their ML estimate.
+
+    prior_strength=5.0 means each module starts with 5 "virtual" observations
+    at the global rate before any real data is counted.
+
+    Returns a Series of adjusted probabilities indexed by preds.index.
+    """
+    if "risk_proba" not in preds.columns or "severity_num" not in orig_df.columns:
+        return preds.get("risk_proba", pd.Series(0.0, index=preds.index))
+
+    sev = pd.to_numeric(orig_df["severity_num"], errors="coerce")
+    global_s1_rate = float((sev == 1).mean()) if len(sev) > 0 else 0.05
+    s1_counts   = (orig_df[sev == 1]).groupby(mod_col).size()
+    total_counts = orig_df.groupby(mod_col).size()
+
+    alpha_prior = global_s1_rate * prior_strength
+    beta_prior  = (1.0 - global_s1_rate) * prior_strength
+
+    adjusted = []
+    for _, row in preds.iterrows():
+        mod     = row["module"]
+        ml_p    = float(row["risk_proba"])
+        n_s1    = int(s1_counts.get(mod, 0))
+        n_total = int(total_counts.get(mod, 0))
+        # Posterior mean: (alpha_prior + n_s1) / (alpha_prior + beta_prior + n_total)
+        posterior = (alpha_prior + n_s1) / (alpha_prior + beta_prior + max(n_total, 1))
+        # Weight ML estimate by data volume; shrink toward posterior when sparse
+        trust = n_total / (n_total + prior_strength)
+        adjusted.append(round(trust * ml_p + (1.0 - trust) * posterior, 4))
+
+    return pd.Series(adjusted, index=preds.index)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1278,6 +1417,62 @@ def _sample_descriptions(orig_df, module, mod_col="parsed_module",
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Change 22 — Ollama semantic embedding helper (v6.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_ollama_embeddings(
+    texts: list,
+    model: str = "mxbai-embed-large",
+) -> "np.ndarray | None":
+    """Fetch embeddings for a list of texts from Ollama.
+
+    Tries the batch /api/embed endpoint (Ollama >=0.3) first, then falls back
+    to individual /api/embeddings calls.  Returns an (N, D) float32 array, or
+    None if Ollama is unreachable or the model isn't available.
+    """
+    if not ollama_is_reachable() or not texts:
+        return None
+
+    # Batch endpoint (preferred — single round-trip)
+    try:
+        payload = json.dumps({"model": model, "input": texts}).encode()
+        req = urllib.request.Request(
+            f"{OLLAMA_BASE}/api/embed",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode())
+            if "embeddings" in data and len(data["embeddings"]) == len(texts):
+                return np.array(data["embeddings"], dtype=np.float32)
+    except Exception:
+        pass
+
+    # Per-text fallback
+    embeddings = []
+    for text in texts:
+        try:
+            payload = json.dumps({"model": model, "prompt": text}).encode()
+            req = urllib.request.Request(
+                f"{OLLAMA_BASE}/api/embeddings",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode())
+                if "embedding" in data:
+                    embeddings.append(data["embedding"])
+                else:
+                    return None
+        except Exception:
+            return None
+
+    if len(embeddings) == len(texts):
+        return np.array(embeddings, dtype=np.float32)
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Change 18 — Scenario generation pipeline (v5.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1345,27 +1540,35 @@ def _extract_description_patterns(
             }]
         return []
 
-    # Build TF-IDF matrix
-    try:
-        vec = TfidfVectorizer(
-            max_features=100, stop_words="english",
-            ngram_range=(1, 2), min_df=1, max_df=0.95, sublinear_tf=True,
-        )
-        X = vec.fit_transform(unique_descs)
-    except ValueError:
-        return [{
-            "scenario_text": unique_descs[0],
-            "confidence": "low",
-            "source_count": 1,
-            "source_examples": unique_descs[0],
-            "cluster_top_terms": [],
-            "member_row_indices": [desc_rows[0]] if desc_rows else [],
-        }]
+    # Build distance matrix — try Ollama semantic embeddings first (Change 22),
+    # fall back to TF-IDF when Ollama is unavailable.
+    X_tfidf = None
+    feature_names: list = []
 
-    feature_names = list(vec.get_feature_names_out())
-
-    # Cosine distance matrix
-    dist_matrix = cosine_distances(X)
+    emb = _get_ollama_embeddings(unique_descs)
+    if emb is not None and len(emb) == len(unique_descs):
+        norms = np.linalg.norm(emb, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        dist_matrix = cosine_distances(emb / norms)
+    else:
+        # TF-IDF fallback
+        try:
+            vec = TfidfVectorizer(
+                max_features=100, stop_words="english",
+                ngram_range=(1, 2), min_df=1, max_df=0.95, sublinear_tf=True,
+            )
+            X_tfidf = vec.fit_transform(unique_descs)
+            feature_names = list(vec.get_feature_names_out())
+        except ValueError:
+            return [{
+                "scenario_text": unique_descs[0],
+                "confidence": "low",
+                "source_count": 1,
+                "source_examples": unique_descs[0],
+                "cluster_top_terms": [],
+                "member_row_indices": [desc_rows[0]] if desc_rows else [],
+            }]
+        dist_matrix = cosine_distances(X_tfidf)
 
     # Cluster
     n_samples = len(unique_descs)
@@ -1434,13 +1637,14 @@ def _extract_description_patterns(
         examples = [d for d in member_descs if d != representative][:3]
         example_str = " | ".join(examples) if examples else representative
 
-        # Cluster top terms — aggregate TF-IDF over cluster members and pick top features
+        # Cluster top terms — only available on the TF-IDF path
         top_terms: list = []
         try:
-            sub_tfidf = X[member_indices].toarray().mean(axis=0)
-            if sub_tfidf.size > 0:
-                order = sub_tfidf.argsort()[::-1]
-                top_terms = [feature_names[i] for i in order[:5] if sub_tfidf[i] > 0]
+            if X_tfidf is not None and feature_names:
+                sub_tfidf = X_tfidf[member_indices].toarray().mean(axis=0)
+                if sub_tfidf.size > 0:
+                    order = sub_tfidf.argsort()[::-1]
+                    top_terms = [feature_names[i] for i in order[:5] if sub_tfidf[i] > 0]
         except Exception:
             top_terms = []
 
@@ -2281,6 +2485,21 @@ def main():
         preds["predicted_stratified"] = preds["predicted"]
         print("  Stratified training could not run — using global model only.")
 
+    # ── Change 23 — Holt trend forecast ───────────────────────────────────────
+    print("\n" + "─" * 78)
+    print(" TREND FORECAST (Holt double exponential smoothing, alpha=0.3 beta=0.1)")
+    print("─" * 78)
+    trend_result = train_trend_forecast(fdf)
+    if not trend_result.empty:
+        preds = preds.merge(trend_result, on="module", how="left")
+        preds["trend_forecast"] = preds["trend_forecast"].fillna(preds["predicted"])
+        r = trend_result["trend_forecast"]
+        print(f"  Trend forecast: {r.min():.1f}–{r.max():.1f} "
+              f"(mean {r.mean():.1f}) across {len(trend_result)} modules.")
+    else:
+        preds["trend_forecast"] = preds["predicted"]
+        print("  Trend forecast could not run.")
+
     # ── Change 19 — Learned risk classifier (replaces hand-tuned composite) ─
     print("\n" + "─" * 78)
     print(" RISK CLASSIFIER (learned probability of S1 critical bug next version)")
@@ -2292,9 +2511,15 @@ def main():
         preds = preds.merge(risk_proba, on="module", how="left")
         preds["risk_proba"] = preds["risk_proba"].fillna(0.0)
 
+        # Change 24 — Bayesian shrinkage: blend ML output with Beta-Binomial
+        # posterior to stabilise sparse modules toward the global S1 rate.
+        preds["risk_proba"] = apply_bayesian_shrinkage(preds, orig_df)
+        print(f"  Bayesian shrinkage applied — range: "
+              f"{preds['risk_proba'].min():.3f}–{preds['risk_proba'].max():.3f}")
+
         # Use learned probability as the primary risk score (0–100)
         preds["composite_risk"] = (preds["risk_proba"] * 100).round(2)
-        risk_method = "learned classifier (P(S1 critical bug))"
+        risk_method = "learned classifier + Bayesian shrinkage (P(S1 critical bug))"
     else:
         # Fallback to weighted composite when classifier cannot train
         print("  Falling back to weighted composite scoring.")
@@ -2422,7 +2647,7 @@ def main():
     print(f" {risk_thresholds}")
     print("─" * 78)
     display_cols = ["module", "target", "predicted", "predicted_stratified",
-                    "priority_score", "composite_risk", "risk_level",
+                    "trend_forecast", "priority_score", "composite_risk", "risk_level",
                     "heatmap_quadrant", "module_cluster_velocity",
                     "dominant_bug_type", "leading_signal"]
     display_cols = [c for c in display_cols if c in preds.columns]
