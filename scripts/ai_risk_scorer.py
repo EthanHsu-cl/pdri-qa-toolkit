@@ -78,26 +78,37 @@ def score_heuristic(row):
 
 def score_ollama(row, model="gemma4"):
     mod = row.get("module", "Unknown")
+    crit = float(row.get('critical_count', 0) or 0)
+    total = float(row.get('total_bugs', 0) or 0)
+    crit_share = (crit / total) if total > 0 else 0.0
     prompt = (
-        "You are a QA risk analyst using FMEA scoring.\n"
+        "You are a QA risk analyst producing FMEA static-impact scores.\n"
         "Return ONLY a JSON object, no extra text.\n"
         'Schema: {"impact": int (1-5), "detectability": int (1-5), "reasoning": string}\n\n'
-        "SCALES (read carefully — higher = worse for BOTH):\n"
-        "  impact: 1=cosmetic/minor, 3=feature-level disruption, 5=blocks core workflow "
-        "(export, project save, crash on launch, data loss).\n"
-        "  detectability: 5=HARD to catch (AutomationCatchRate near 0, low reproducibility, "
-        "escapes to production), 3=partial coverage, 1=EASY to catch (AutomationCatchRate high, "
-        "deterministic repro, caught pre-release). High automation coverage => LOW detectability.\n"
-        "Rubric anchors:\n"
-        "  AutomationCatchRate >= 0.5  => detectability 1-2\n"
-        "  AutomationCatchRate 0.1-0.5 => detectability 2-3\n"
-        "  AutomationCatchRate <  0.1  => detectability 4-5 (especially if Critical>=5 or RegressionRate>0.1)\n"
-        "  Critical >= 10 OR module touches export/project/AI generation => impact >= 4\n\n"
+        "PURPOSE: Your score answers 'IF this module fails, how bad would it be, and how "
+        "hard would the failure be to catch?' This is a STATIC severity score — recency / "
+        "trend is handled separately downstream. The COUNTS BELOW ARE LIFETIME AGGREGATES, "
+        "not recent activity. Score the module's intrinsic risk, not whether it's currently noisy.\n\n"
+        "SCALES (higher = worse for BOTH):\n"
+        "  impact: 1=cosmetic only · 2=minor friction · 3=feature-level disruption · "
+        "4=major workflow breakage (lost work, broken core feature) · "
+        "5=blocks core workflow (export fails, project save corrupts, crash on launch, data loss).\n"
+        "  detectability: 1=EASY to catch (high automation coverage, deterministic repro) · "
+        "3=partial coverage · 5=HARD to catch (no automation, flaky/intermittent, escapes to production).\n"
+        "  → AutomationCatchRate is the strongest detectability signal. High automation = LOW detectability.\n\n"
+        "RUBRIC ANCHORS:\n"
+        "  AutomationCatchRate >= 0.5         → detectability 1-2\n"
+        "  AutomationCatchRate 0.1–0.5        → detectability 2-3\n"
+        "  AutomationCatchRate <  0.1         → detectability 4-5 (especially if CriticalShare>=0.10 or RegressionRate>0.10)\n"
+        "  Module is core workflow (export, produce, project save/load, crash/launch path) → impact >= 4\n"
+        "  Critical share (Critical/TotalBugs) >= 0.15 → impact at least 4 (this module produces a lot of severe bugs proportionally)\n"
+        "  Critical share < 0.05 AND module is non-core (settings, tutorials, more) → impact <= 2\n\n"
         f"Module: {mod}\n"
         f"Category: {row.get('category', '')}\n"
-        f"TotalBugs: {row.get('total_bugs', 0)}\n"
-        f"Critical: {row.get('critical_count', 0)}\n"
-        f"Major: {row.get('major_count', 0)}\n"
+        f"TotalBugs (lifetime): {int(total)}\n"
+        f"Critical (lifetime): {int(crit)}\n"
+        f"Major (lifetime): {int(row.get('major_count', 0) or 0)}\n"
+        f"CriticalShare: {crit_share:.3f}  (Critical / TotalBugs)\n"
         f"RegressionRate: {row.get('regression_rate', 0):.3f}\n"
         f"AutomationCatchRate: {row.get('automation_catch_rate', 0):.3f}\n"
     )
@@ -141,16 +152,23 @@ def score_openai(row):
     if not api_key:
         return score_heuristic(row)
     mod = row.get("module","Unknown")
+    crit = float(row.get('critical_count', 0) or 0)
+    total = float(row.get('total_bugs', 0) or 0)
+    crit_share = (crit / total) if total > 0 else 0.0
     msgs = [
         {"role":"system","content":(
-            "You are a QA risk analyst using FMEA scoring. Return only JSON. "
-            "impact 1-5 (5=blocks core workflow). "
+            "You produce FMEA static-impact scores. Counts given are LIFETIME aggregates, "
+            "not recent activity — recency is handled downstream. Score the module's "
+            "intrinsic risk: IF it fails, how bad and how hard to catch?\n"
+            "impact 1-5 (5=blocks core workflow: export, save, crash on launch, data loss). "
             "detectability 1-5: 5=HARD to catch (low AutomationCatchRate, escapes to prod), "
-            "1=EASY to catch (high AutomationCatchRate). High coverage => LOW detectability."
+            "1=EASY to catch (high AutomationCatchRate). High coverage → LOW detectability. "
+            "CriticalShare>=0.15 → impact ≥4. Return only JSON."
         )},
         {"role":"user","content":(
-            f"Module:{mod} Bugs:{row.get('total_bugs',0)} Crit:{row.get('critical_count',0)} "
-            f"Major:{row.get('major_count',0)} "
+            f"Module:{mod} BugsLifetime:{int(total)} CritLifetime:{int(crit)} "
+            f"Major:{int(row.get('major_count',0) or 0)} "
+            f"CriticalShare:{crit_share:.3f} "
             f"RegressionRate:{row.get('regression_rate',0):.3f} "
             f"AutomationCatchRate:{row.get('automation_catch_rate',0):.3f}\n"
             'Return JSON: {"impact":<1-5>,"detectability":<1-5>,"reasoning":"..."}'

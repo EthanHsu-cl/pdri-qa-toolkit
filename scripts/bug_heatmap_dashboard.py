@@ -2950,6 +2950,21 @@ python scripts/predict_defects.py data/ecl_parsed.csv \\
                 )
 
 
+    # ── Top Sub-Feature Risks — sortable bug-type × module ranking ─────────
+    if (pred_category_df is not None and not pred_category_df.empty
+            and "risk_score" in pred_category_df.columns):
+        st.markdown("---")
+        st.subheader("🎯 Top Sub-Feature Risks — Where Each Feature Will Break")
+        st.caption("Per (module × bug type) ranking. risk_score combines historical "
+                   "frequency × severity × recency. example_bug_codes link to source bugs.")
+        _top_sub = pred_category_df.sort_values("risk_score", ascending=False).head(25).copy()
+        _sub_cols = [c for c in [
+            "module", "category", "risk_score", "expected_next_build",
+            "expected_s1", "expected_s2", "expected_s3plus",
+            "confidence", "example_bug_codes", "latest_bug_build",
+        ] if c in _top_sub.columns]
+        st.dataframe(_top_sub[_sub_cols], hide_index=True, width='stretch')
+
     # ── "What to Test This Version" — PRIMARY SECTION ──────────────────────
     st.markdown("---")
     st.subheader("🎯 What to Test This Version")
@@ -2989,7 +3004,10 @@ python scripts/predict_defects.py data/ecl_parsed.csv \\
                 for _, _sc in _mod_sc.head(3).iterrows():
                     _conf = _CONF_BADGES.get(str(_sc.get("confidence", "medium")), "⬇️ Low conf.")
                     _text = str(_sc.get("scenario_text", ""))
-                    _type_badge = _TYPE_BADGES.get(str(_sc.get("scenario_type", "")), "")
+                    # Per-row type badge only when there's a mix; otherwise the
+                    # top-of-section legend already conveys the source.
+                    _type_badge = (_TYPE_BADGES.get(str(_sc.get("scenario_type", "")), "")
+                                   if (_any_synth and _any_hist) else "")
                     _badge_str = f" {_type_badge}" if _type_badge else ""
                     st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{_conf}{_badge_str} — {_text}",
                                 unsafe_allow_html=True)
@@ -3083,6 +3101,35 @@ python scripts/predict_defects.py data/ecl_parsed.csv \\
             st.plotly_chart(fig_cat, width='stretch')
         st.markdown("---")
 
+    # Build description ↔ BugCode lookups once per session.
+    # `_desc_lookup`     : description → BugCode (used to backfill missing codes)
+    # `_bc_to_desc`      : BugCode → description (preferred source of truth when
+    #                      rendering source bugs — protects against stale
+    #                      prediction CSVs where source_bug_examples may not be
+    #                      aligned with source_bug_codes)
+    _DESC_LOOKUP_KEY = "__t9_desc_to_bugcode"
+    _BC_LOOKUP_KEY   = "__t9_bugcode_to_desc"
+    if _DESC_LOOKUP_KEY not in st.session_state or _BC_LOOKUP_KEY not in st.session_state:
+        _raw_fp = st.session_state.get("fp_bugs", "")
+        _desc_to_bc: dict[str, str] = {}
+        _bc_to_desc: dict[str, str] = {}
+        if _raw_fp and Path(_raw_fp).exists():
+            _raw_df = load_csv(_raw_fp)
+            _bc_col = next(
+                (c for c in _raw_df.columns if "bugcode" in c.lower()), None
+            )
+            if _bc_col:
+                for _d_col in ("Short Description", "parsed_description"):
+                    if _d_col in _raw_df.columns:
+                        for _d, _bc in zip(_raw_df[_d_col], _raw_df[_bc_col]):
+                            if pd.notna(_d) and pd.notna(_bc) and str(_d).strip():
+                                _desc_to_bc[str(_d)] = str(_bc)
+                                _bc_to_desc.setdefault(str(_bc), str(_d))
+        st.session_state[_DESC_LOOKUP_KEY] = _desc_to_bc
+        st.session_state[_BC_LOOKUP_KEY]   = _bc_to_desc
+    _desc_lookup: dict[str, str] = st.session_state[_DESC_LOOKUP_KEY]
+    _bc_to_desc:  dict[str, str] = st.session_state[_BC_LOOKUP_KEY]
+
     # ── Predicted Bug Scenarios by Module (NEW detail section) ────────────
     if pred_scenario_df is not None and not pred_scenario_df.empty:
         st.subheader("🔍 Predicted Bug Scenarios by Module")
@@ -3090,31 +3137,6 @@ python scripts/predict_defects.py data/ecl_parsed.csv \\
             "Expand each module to see all predicted scenarios with confidence levels, "
             "supporting categories, and source bug examples."
         )
-
-        # Build a description → (BugCode, BugCode_display) lookup once per session.
-        # source_bug_examples stores Short Description text joined with " | ".
-        # We reverse-map those descriptions back to BugCodes so we can link to ECL.
-        _DESC_LOOKUP_KEY = "__t9_desc_to_bugcode"
-        if _DESC_LOOKUP_KEY not in st.session_state:
-            _raw_fp = st.session_state.get("fp_bugs", "")
-            _desc_to_bc: dict[str, str] = {}
-            if _raw_fp and Path(_raw_fp).exists():
-                _raw_df = load_csv(_raw_fp)
-                _d_col = next(
-                    (c for c in ("Short Description", "parsed_description") if c in _raw_df.columns),
-                    None,
-                )
-                _bc_col = next(
-                    (c for c in _raw_df.columns if "bugcode" in c.lower()), None
-                )
-                if _d_col and _bc_col:
-                    _desc_to_bc = {
-                        str(d): str(bc)
-                        for d, bc in zip(_raw_df[_d_col], _raw_df[_bc_col])
-                        if pd.notna(d) and pd.notna(bc)
-                    }
-            st.session_state[_DESC_LOOKUP_KEY] = _desc_to_bc
-        _desc_lookup: dict[str, str] = st.session_state[_DESC_LOOKUP_KEY]
 
         _scenario_modules = pred_scenario_df["module"].unique()
         for _sc_mod in _scenario_modules:
@@ -3141,10 +3163,12 @@ python scripts/predict_defects.py data/ecl_parsed.csv \\
                     _sc_signal = str(_sc_row.get("leading_signal", ""))
                     _sc_type = str(_sc_row.get("scenario_type", ""))
                     _sc_expl = str(_sc_row.get("explanation", ""))
-                    _type_badge = {
+                    # Per-row type badge only when there's a mix; otherwise the
+                    # top-of-section legend already conveys the source.
+                    _type_badge = ({
                         "ai_synthesized":     "🧠 AI-synthesized",
                         "historical_pattern": "📎 Historical pattern",
-                    }.get(_sc_type, "")
+                    }.get(_sc_type, "") if (_any_synth and _any_hist) else "")
                     _badge_str = f" {_type_badge}" if _type_badge else ""
 
                     st.markdown(f"**#{_rank}** {_conf_badge}{_badge_str} — {_text}")
@@ -3158,8 +3182,28 @@ python scripts/predict_defects.py data/ecl_parsed.csv \\
                     if _sc_expl and _sc_expl not in ("nan", ""):
                         with st.expander("❓ Why this scenario?", expanded=False):
                             st.markdown(_sc_expl.replace("\n", "  \n"))
-                    # Source bugs — look up BugCodes from description text
-                    if _examples and _examples not in ("nan", ""):
+                    # Source bugs — prefer direct BugCodes when present (no fuzzy match needed).
+                    # Description for each BugCode is read from raw bugs via `_bc_to_desc`,
+                    # NOT from `source_bug_examples` — that field can be misaligned on
+                    # CSVs produced before the predict_defects.py alignment fix.
+                    _codes_field = str(_sc_row.get("source_bug_codes", "")).strip()
+                    if _codes_field and _codes_field not in ("nan", ""):
+                        _codes_list = [c.strip() for c in _codes_field.split(" | ") if c.strip()]
+                        _ex_descs = [d.strip() for d in _examples.split(" | ") if d.strip()] \
+                                    if _examples and _examples != "nan" else []
+                        _ex_rows = []
+                        for _i, _bc in enumerate(_codes_list):
+                            _ed = _bc_to_desc.get(_bc) or (
+                                _ex_descs[_i] if _i < len(_ex_descs) else ""
+                            )
+                            _ex_rows.append((_bc, _ed, ECL_BUG_URL.format(bug_code=_bc)))
+                        with st.expander(f"🐛 Source bugs — {len(_ex_rows)} linked", expanded=False):
+                            for _bc, _ed, _url in _ex_rows:
+                                if _ed:
+                                    st.markdown(f"- [{_bc}]({_url}) — {_ed}")
+                                else:
+                                    st.markdown(f"- [{_bc}]({_url})")
+                    elif _examples and _examples not in ("nan", ""):
                         _ex_descs = [d.strip() for d in _examples.split(" | ") if d.strip()]
                         if _ex_descs:
                             _ex_rows = []
@@ -3180,6 +3224,45 @@ python scripts/predict_defects.py data/ecl_parsed.csv \\
                                     else:
                                         st.markdown(f"- _{_ed}_")
                     st.markdown("")
+
+                # Bug Type Examples — per-category breakdown with example descriptions
+                if pred_category_df is not None and not pred_category_df.empty:
+                    _mod_cat_rows = pred_category_df[
+                        (pred_category_df["module"] == _sc_mod)
+                        & (pd.to_numeric(
+                            pred_category_df["expected_next_build"], errors="coerce"
+                        ).fillna(0) > 0)
+                    ].sort_values("expected_next_build", ascending=False)
+                    if not _mod_cat_rows.empty:
+                        with st.expander("🏷️ Predicted Bug Types with Examples", expanded=False):
+                            st.caption(
+                                "What types of bugs are expected and what they typically look like, "
+                                "based on historical patterns for this module."
+                            )
+                            for _, _cr in _mod_cat_rows.iterrows():
+                                _cat_name = str(_cr.get("category", ""))
+                                _exp_cnt  = float(_cr.get("expected_next_build", 0))
+                                _exs      = str(_cr.get("example_descriptions", "")).strip()
+                                _gen      = str(_cr.get("generated_description", "")).strip()
+                                st.markdown(f"**{_cat_name}** — ~{_exp_cnt:.1f} expected")
+                                if _exs and _exs not in ("nan", ""):
+                                    for _ex in _exs.split(" | ")[:3]:
+                                        _ex = _ex.strip()
+                                        if not _ex:
+                                            continue
+                                        _bc = _desc_lookup.get(_ex)
+                                        if _bc and _bc not in ("nan", ""):
+                                            _url = ECL_BUG_URL.format(bug_code=_bc)
+                                            st.markdown(f"- [{_bc}]({_url}) — {_ex}")
+                                        else:
+                                            st.markdown(f"- {_ex}")
+                                elif _gen and _gen not in ("nan", ""):
+                                    _gen_bc = str(_cr.get("generated_bug_code", "")).strip()
+                                    if _gen_bc and _gen_bc not in ("nan", ""):
+                                        _gen_url = ECL_BUG_URL.format(bug_code=_gen_bc)
+                                        st.markdown(f"- [{_gen_bc}]({_gen_url}) — {_gen} _(similar existing bug)_")
+                                    else:
+                                        st.markdown(f"- {_gen} _(similar existing bug)_")
         st.markdown("---")
 
     # ── Module forecast cards ─────────────────────────────────────────────
@@ -3290,11 +3373,51 @@ python scripts/predict_defects.py data/ecl_parsed.csv \\
                         pct_str = f"{cr['historical_pct'] * 100:.0f}%"
                         cat_name = str(cr.get("category", "Unknown"))
                         exp_cnt  = cr.get("expected_next_build", 0)
+                        _s1 = float(cr.get("expected_s1", 0) or 0)
+                        _s2 = float(cr.get("expected_s2", 0) or 0)
+                        _badge = ""
+                        if _s1 > 0:
+                            _badge += f" · 🚨 {_s1:.1f} S1"
+                        if _s2 > 0:
+                            _badge += f" · ⚠️ {_s2:.1f} S2"
                         st.markdown(
                             f"&nbsp;&nbsp;• **{cat_name}** — {pct_str} of recent bugs"
-                            + (f" (~{exp_cnt:.0f} expected)" if exp_cnt >= 1 else ""),
+                            + (f" (~{exp_cnt:.0f} expected)" if exp_cnt >= 1 else "")
+                            + _badge,
                             unsafe_allow_html=True,
                         )
+                        _exs = str(cr.get("example_descriptions", "")).strip()
+                        _gen = str(cr.get("generated_description", "")).strip()
+                        if _exs and _exs not in ("nan", ""):
+                            for _ex in _exs.split(" | ")[:2]:
+                                _ex = _ex.strip()
+                                if not _ex:
+                                    continue
+                                _bc = _desc_lookup.get(_ex)
+                                if _bc and _bc not in ("nan", ""):
+                                    _url = ECL_BUG_URL.format(bug_code=_bc)
+                                    st.caption(
+                                        f"&nbsp;&nbsp;&nbsp;&nbsp;↳ [{_bc}]({_url}) — {_ex}",
+                                        unsafe_allow_html=True,
+                                    )
+                                else:
+                                    st.caption(
+                                        f"&nbsp;&nbsp;&nbsp;&nbsp;↳ {_ex}",
+                                        unsafe_allow_html=True,
+                                    )
+                        elif _gen and _gen not in ("nan", ""):
+                            _gen_bc = str(cr.get("generated_bug_code", "")).strip()
+                            if _gen_bc and _gen_bc not in ("nan", ""):
+                                _gen_url = ECL_BUG_URL.format(bug_code=_gen_bc)
+                                st.caption(
+                                    f"&nbsp;&nbsp;&nbsp;&nbsp;↳ [{_gen_bc}]({_gen_url}) — {_gen} _(similar existing bug)_",
+                                    unsafe_allow_html=True,
+                                )
+                            else:
+                                st.caption(
+                                    f"&nbsp;&nbsp;&nbsp;&nbsp;↳ {_gen} _(similar existing bug)_",
+                                    unsafe_allow_html=True,
+                                )
 
             # Fall back to cluster breakdown if no categories
             if not _showed_categories and pred_cluster_df is not None and not pred_cluster_df.empty:
@@ -3692,10 +3815,28 @@ Modules with TRCreated bugs are boosted one tier — active implementation incre
     df_raw_pulse = load_csv(_pulse_fp)
     if "Create Date" in df_raw_pulse.columns:
         df_raw_pulse["Create Date"] = pd.to_datetime(df_raw_pulse["Create Date"], errors="coerce")
+    if "Closed Date" in df_raw_pulse.columns:
+        df_raw_pulse["Closed Date"] = pd.to_datetime(df_raw_pulse["Closed Date"], errors="coerce")
     if "parsed_module" in df_raw_pulse.columns:
         df_raw_pulse["parsed_module"] = df_raw_pulse["parsed_module"].apply(
             lambda x: normalise_module(x) if pd.notna(x) else x
         )
+
+    # BugCode → Short Description lookup, used everywhere on this tab to display
+    # the real bug description next to a BugCode (avoids relying on potentially
+    # misaligned `source_bug_examples` from older prediction CSVs).
+    _bc_col_pulse = next(
+        (c for c in df_raw_pulse.columns if "bugcode" in c.lower()), None
+    )
+    _desc_col_lookup = (
+        "Short Description" if "Short Description" in df_raw_pulse.columns
+        else ("parsed_description" if "parsed_description" in df_raw_pulse.columns else None)
+    )
+    _bc_to_desc_pulse: dict[str, str] = {}
+    if _bc_col_pulse and _desc_col_lookup:
+        for _bc, _d in zip(df_raw_pulse[_bc_col_pulse], df_raw_pulse[_desc_col_lookup]):
+            if pd.notna(_bc) and pd.notna(_d) and str(_bc).strip():
+                _bc_to_desc_pulse.setdefault(str(_bc).strip(), str(_d).strip())
 
     PULSE_STATUSES = {"TRCreated", "RDResolved"}
 
@@ -3713,15 +3854,143 @@ Modules with TRCreated bugs are boosted one tier — active implementation incre
         st.stop()
     newest_version = str(_ver_dates.idxmax())
 
+    # ── Close-date filter (default: yesterday) ─────────────────────────────
+    # Bugs that are created and immediately closed never appear in the
+    # TRCreated/RDResolved-only view. Adding "Closed Date == <date>" as a
+    # second inclusion branch surfaces those — usually the newest verified
+    # fixes. The pipeline runs at 3am, so "yesterday" captures the latest
+    # full day of in-build fix activity.
+    from datetime import date as _date, timedelta as _timedelta
+    _default_closed_on = _date.today() - _timedelta(days=1)
+    _has_closed_col = "Closed Date" in df_raw_pulse.columns
+    if _has_closed_col:
+        _closed_on = st.date_input(
+            "Include bugs closed on:",
+            value=_default_closed_on,
+            help="Bugs with this Closed Date are added to the TRCreated/RDResolved cohort. "
+                 "Defaults to yesterday — the newest day of fully-closed fixes when the "
+                 "pipeline runs at 3am.",
+            key="pulse_closed_on",
+        )
+    else:
+        _closed_on = None
+
+    # ── Time-travel: load the snapshot for the picked date, if one exists ──
+    # When `<picked_date>.json` exists in release_pulse_history/, the page
+    # renders the world as recorded that morning instead of live state:
+    #   • In-flight cohort  ← snapshot.inflight_bugcodes_by_module
+    #   • AI scenarios      ← snapshot.scenarios
+    # Snapshots written before inflight_bugcodes_by_module was added still
+    # supply scenarios but cannot override the in-flight cohort.
+    _pulse_snap: dict | None = None
+    _snap_inflight_bcs: set[str] = set()
+    if _has_closed_col and _closed_on is not None:
+        _pulse_snap_fp = (
+            Path(_product_dir) / "predictions" / "release_pulse_history"
+            / f"{_closed_on.isoformat()}.json"
+        )
+        if _pulse_snap_fp.exists():
+            try:
+                _pulse_snap = json.loads(_pulse_snap_fp.read_text())
+            except Exception as _snap_err:
+                st.warning(f"Could not read snapshot for {_closed_on.isoformat()}: {_snap_err}")
+                _pulse_snap = None
+            if _pulse_snap is not None:
+                for _bcs in (_pulse_snap.get("inflight_bugcodes_by_module") or {}).values():
+                    for _b in (_bcs or []):
+                        _b = str(_b).strip()
+                        if _b:
+                            _snap_inflight_bcs.add(_b)
+
+    # Pin to the snapshot's version when time-traveling, so the page reflects
+    # the release that was current on the picked date.
+    if _pulse_snap is not None:
+        _snap_v = str(_pulse_snap.get("version", "")).strip()
+        if _snap_v:
+            newest_version = _snap_v
+
+    if _pulse_snap is not None:
+        _snap_ver = str(_pulse_snap.get("version", "")) or "?"
+        _snap_gen = str(_pulse_snap.get("generated_at", ""))[:10] or _closed_on.isoformat()
+        _has_full_travel = bool(
+            _snap_inflight_bcs
+            and (_pulse_snap.get("risk_classifications_by_module") or {})
+        )
+        if _has_full_travel:
+            st.success(
+                f"📸 Showing snapshot from **{_snap_gen}** (version {_snap_ver}) — "
+                "cohort, metrics, risk levels, FMEA quadrants, and scenarios all reflect that day."
+            )
+        elif _snap_inflight_bcs:
+            st.info(
+                f"📸 Snapshot from **{_snap_gen}** (version {_snap_ver}) — cohort and scenarios "
+                "reflect that day, but **risk classifications** still come from live data "
+                "(snapshot pre-dates the risk-classification field)."
+            )
+        else:
+            st.info(
+                f"📸 Snapshot from **{_snap_gen}** (version {_snap_ver}) found but pre-dates the "
+                "in-flight-cohort field — showing snapshot scenarios with **live** in-flight metrics."
+            )
+    elif _closed_on is not None and _closed_on != _date.today():
+        st.caption(
+            f"_No snapshot saved for {_closed_on.isoformat()} — showing live state. "
+            "Snapshots are written daily by the 3am pipeline._"
+        )
+
     # ── Filter pulse bugs ──────────────────────────────────────────────────
     _desc_col = "Short Description" if "Short Description" in df_raw_pulse.columns else "parsed_description"
+    if _snap_inflight_bcs and "BugCode" in df_raw_pulse.columns:
+        # Time-travel: in-flight cohort comes from the snapshot.
+        _status_mask = (
+            df_raw_pulse["BugCode"].astype(str).str.strip().isin(_snap_inflight_bcs)
+        )
+    else:
+        _status_mask = df_raw_pulse["Status"].isin(PULSE_STATUSES)
+    if _has_closed_col and _closed_on is not None:
+        _closed_mask = df_raw_pulse["Closed Date"].dt.date == _closed_on
+        _include_mask = _status_mask | _closed_mask
+    else:
+        _closed_mask = pd.Series(False, index=df_raw_pulse.index)
+        _include_mask = _status_mask
     df_pulse = df_raw_pulse[
-        df_raw_pulse["Status"].isin(PULSE_STATUSES) &
+        _include_mask &
         (df_raw_pulse["parsed_version"] == newest_version)
     ].copy()
 
+    # Time-travel: restore each in-flight bug's Status as it was when the
+    # snapshot was taken (the live CSV has since updated it). Without this,
+    # bugs that have moved to Close/RDResolved since snapshot time would
+    # under-count the TRCreated metric.
+    if _pulse_snap is not None and "BugCode" in df_pulse.columns:
+        _status_map = _pulse_snap.get("inflight_status_by_bugcode") or {}
+        if _status_map:
+            _bc_series = df_pulse["BugCode"].astype(str).str.strip()
+            _hits = _bc_series.isin(_status_map)
+            df_pulse.loc[_hits, "Status"] = _bc_series[_hits].map(_status_map)
+
+    # Tag each row with its inclusion reason so per-module aggregation can
+    # report "closed on the chosen date" separately from TRCreated/RDResolved.
+    if _has_closed_col and _closed_on is not None:
+        df_pulse["_in_closed_cohort"] = (
+            df_pulse["Closed Date"].dt.date == _closed_on
+        ).fillna(False)
+    else:
+        df_pulse["_in_closed_cohort"] = False
+
     # ── Merge risk scores ──────────────────────────────────────────────────
-    if risk_available and "parsed_module" in df_pulse.columns:
+    # Time-travel: when the snapshot recorded per-module risk classifications,
+    # merge from those instead of the live risk register so quadrant + score
+    # reflect the picked date.
+    _snap_risk_cls = (_pulse_snap or {}).get("risk_classifications_by_module") if _pulse_snap else None
+    if _snap_risk_cls and "parsed_module" in df_pulse.columns:
+        _snap_risk_df = pd.DataFrame([
+            {"parsed_module": m, "quadrant": c.get("quadrant", "Unknown"),
+             "risk_score_final": c.get("risk_score", 0.0)}
+            for m, c in _snap_risk_cls.items()
+        ])
+        df_pulse = df_pulse.merge(_snap_risk_df, on="parsed_module", how="left")
+    elif risk_available and "parsed_module" in df_pulse.columns:
         _rc = [c for c in ["parsed_module", "quadrant", "risk_score_final",
                             "impact_score", "detectability_score"]
                if c in risk_df_dedup.columns]
@@ -3739,12 +4008,14 @@ Modules with TRCreated bugs are boosted one tier — active implementation incre
             risk_score     =("risk_score_final", "first"),
             trc_count      =("Status", lambda s: (s == "TRCreated").sum()),
             rdr_count      =("Status", lambda s: (s == "RDResolved").sum()),
+            closed_count   =("_in_closed_cohort", "sum"),
             total          =("Status",           "count"),
             sample_descs   =(_desc_col, lambda x: list(x.dropna().head(10))),
         )
         .reset_index()
         .sort_values(["risk_score", "total"], ascending=[False, False])
     )
+    _pulse_grp["closed_count"] = _pulse_grp["closed_count"].fillna(0).astype(int)
 
     # ── Derive risk level ──────────────────────────────────────────────────
     # Prefer ML predictions from pred_df (Tab 9 model); fall back to FMEA score.
@@ -3765,7 +4036,12 @@ Modules with TRCreated bugs are boosted one tier — active implementation incre
 
     _pred_rl_map: dict[str, str] = {}
     _pred_leading_map: dict[str, str] = {}
-    if pred_df is not None and "module" in pred_df.columns and "risk_level" in pred_df.columns:
+    # Time-travel: prefer the snapshot's recorded risk classifications.
+    if _snap_risk_cls:
+        for _m, _c in _snap_risk_cls.items():
+            _pred_rl_map[str(_m)] = str(_c.get("risk_level", "Low"))
+            _pred_leading_map[str(_m)] = str(_c.get("leading_signal", ""))
+    elif pred_df is not None and "module" in pred_df.columns and "risk_level" in pred_df.columns:
         for _, _pr in pred_df.iterrows():
             _pred_rl_map[str(_pr["module"])] = str(_pr["risk_level"])
             if "leading_signal" in pred_df.columns:
@@ -3787,31 +4063,47 @@ Modules with TRCreated bugs are boosted one tier — active implementation incre
     # ── Headline metrics ───────────────────────────────────────────────────
     _n_trc      = int(df_pulse["Status"].eq("TRCreated").sum())
     _n_rdr      = int(df_pulse["Status"].eq("RDResolved").sum())
+    _n_closed   = int(df_pulse["_in_closed_cohort"].sum())
     _n_mods     = int(_pulse_grp["parsed_module"].nunique())
     _n_critical = int((_pulse_grp["risk_level"] == "Critical").sum())
 
     st.markdown(f"#### Version **{newest_version}** — in-progress bugs")
-    _m1, _m2, _m3, _m4 = st.columns(4)
+    _m1, _m2, _m3, _m4, _m5 = st.columns(5)
     _m1.metric("TRCreated",        _n_trc,
                help="Bugs in Technical Review — actively being implemented")
     _m2.metric("RDResolved",       _n_rdr,
                help="Bugs resolved at RD level — fix applied, not yet QA-verified")
-    _m3.metric("Modules affected", _n_mods)
-    _m4.metric("🔴 Critical modules", _n_critical,
+    _m3.metric(
+        f"Closed {_closed_on.isoformat() if _closed_on else '—'}",
+        _n_closed,
+        help="Bugs whose Closed Date matches the date picker above. "
+             "Includes bugs that were created and closed in the same window.",
+    )
+    _m4.metric("Modules affected", _n_mods)
+    _m5.metric("🔴 Critical modules", _n_critical,
                help="Modules where risk_level=Critical (ML or FMEA) and/or active TRCreated bugs")
 
     if df_pulse.empty:
-        st.info(f"No TRCreated or RDResolved bugs found for version **{newest_version}**.")
+        st.info(
+            f"No bugs matched the filter for version **{newest_version}** "
+            f"(TRCreated/RDResolved or Closed on {_closed_on.isoformat() if _closed_on else '—'})."
+        )
         st.stop()
 
     # ── "What to Test Right Now" — primary section ─────────────────────────
     st.markdown("---")
     st.subheader("🎯 What to Test Right Now")
 
-    # Gather historical scenarios from pred_scenario_df for modules in pulse
+    # Gather historical scenarios. In time-travel mode, read from the
+    # snapshot's recorded history; otherwise from the live predictions CSV.
     _pulse_mods_set = set(_pulse_grp["parsed_module"])
     _hist_sc: dict[str, list[dict]] = {}   # module → list of scenario dicts
-    if pred_scenario_df is not None and not pred_scenario_df.empty:
+    _snap_hist_sc = (_pulse_snap or {}).get("historical_scenarios_by_module") if _pulse_snap else None
+    if _snap_hist_sc:
+        for _mod, _recs in _snap_hist_sc.items():
+            if _mod in _pulse_mods_set:
+                _hist_sc[str(_mod)] = list(_recs or [])
+    elif pred_scenario_df is not None and not pred_scenario_df.empty:
         _sc_mod_col = "module" if "module" in pred_scenario_df.columns else None
         if _sc_mod_col:
             for _mod, _msc in pred_scenario_df.groupby(_sc_mod_col):
@@ -3840,7 +4132,11 @@ Modules with TRCreated bugs are boosted one tier — active implementation incre
             _mod = _mr["parsed_module"]
             _trc = int(_mr["trc_count"])
             _rdr = int(_mr["rdr_count"])
-            _badge = f"TRCreated: {_trc} · RDResolved: {_rdr}"
+            _cls = int(_mr.get("closed_count", 0))
+            _badge_parts = [f"TRCreated: {_trc}", f"RDResolved: {_rdr}"]
+            if _cls > 0:
+                _badge_parts.append(f"Closed {_closed_on.isoformat()}: {_cls}")
+            _badge = " · ".join(_badge_parts)
             st.markdown(f"**{_mod}** — _{_badge}_")
             # Historical scenarios from ML model
             for _hs in _hist_sc.get(_mod, [])[:3]:
@@ -3848,6 +4144,21 @@ Modules with TRCreated bugs are boosted one tier — active implementation incre
                 _htext  = str(_hs.get("scenario_text", ""))
                 st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{_hconf} 📎 Historical — {_htext}",
                             unsafe_allow_html=True)
+                # Source BugCodes — clickable ECL links for traceability
+                _hs_codes = str(_hs.get("source_bug_codes", "")).strip()
+                if _hs_codes and _hs_codes not in ("nan", ""):
+                    _bc_links = []
+                    for _bc in _hs_codes.split(" | "):
+                        _bc = _bc.strip()
+                        if not _bc:
+                            continue
+                        _bc_links.append(f"[{_bc}]({ECL_BUG_URL.format(bug_code=_bc)})")
+                    if _bc_links:
+                        st.markdown(
+                            "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+                            f"_Source bugs:_ {' · '.join(_bc_links)}",
+                            unsafe_allow_html=True,
+                        )
             # In-flight preview: top bug description as a stub until AI runs
             _samples = _mr["sample_descs"][:2]
             for _sd in _samples:
@@ -3858,11 +4169,15 @@ Modules with TRCreated bugs are boosted one tier — active implementation incre
     # ── Module breakdown table ─────────────────────────────────────────────
     st.markdown("---")
     st.markdown("#### Module Breakdown")
+    _closed_label = (
+        f"Closed {_closed_on.isoformat()}" if _closed_on else "Closed"
+    )
     _display_grp = _pulse_grp[["parsed_module", "risk_level", "quadrant", "risk_score",
-                                "trc_count", "rdr_count", "total"]].rename(columns={
+                                "trc_count", "rdr_count", "closed_count", "total"]].rename(columns={
         "parsed_module": "Module", "risk_level": "Risk Level",
         "quadrant": "FMEA Quadrant", "risk_score": "Risk Score",
-        "trc_count": "TRCreated", "rdr_count": "RDResolved", "total": "Total",
+        "trc_count": "TRCreated", "rdr_count": "RDResolved",
+        "closed_count": _closed_label, "total": "Total",
     })
     st.dataframe(
         _display_grp,
@@ -3873,16 +4188,25 @@ Modules with TRCreated bugs are boosted one tier — active implementation incre
 
     # ── Raw bug list ───────────────────────────────────────────────────────
     _show_cols = [c for c in ["BugCode", "Status", _desc_col, "severity_label",
-                               "Handler", "parsed_module", "quadrant"]
+                               "Handler", "parsed_module", "quadrant", "Closed Date"]
                   if c in df_pulse.columns]
-    with st.expander(f"📋 All {len(df_pulse)} in-progress bugs", expanded=False):
+    with st.expander(
+        f"📋 All {len(df_pulse)} bugs in cohort "
+        f"(TRCreated/RDResolved or Closed on {_closed_on.isoformat() if _closed_on else '—'})",
+        expanded=False,
+    ):
         st.dataframe(df_pulse[_show_cols], hide_index=True, width="stretch")
 
     # ── Ollama synthesis ───────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("🤖 AI-Synthesized Test Scenarios")
 
-    _cache_key = f"pulse_ai_scenarios_{newest_version}"
+    # Scope cache by date when time-traveling so snapshot scenarios don't
+    # leak into the live cache when the user navigates back to today.
+    if _pulse_snap is not None and _closed_on is not None:
+        _cache_key = f"pulse_ai_scenarios_{newest_version}_{_closed_on.isoformat()}"
+    else:
+        _cache_key = f"pulse_ai_scenarios_{newest_version}"
 
     def _ollama_reachable() -> bool:
         try:
@@ -3956,106 +4280,160 @@ Modules with TRCreated bugs are boosted one tier — active implementation incre
                 pass
             return []
 
+    # In time-travel mode the snapshot's scenarios are the source of truth —
+    # they cannot be regenerated and they pin the dashboard to that day.
+    _snap_scenarios_dict = (
+        (_pulse_snap or {}).get("scenarios") if _pulse_snap else None
+    )
+    _in_snapshot_mode = bool(_snap_scenarios_dict)
+
+    if _in_snapshot_mode:
+        # Bypass the session cache entirely so navigating between snapshot
+        # dates always re-reads the file (cheap; the JSON is small).
+        st.session_state[_cache_key] = _snap_scenarios_dict
+    else:
+        # Hydrate the in-memory cache from the pre-generated pipeline output
+        # if one exists for this version. This is what makes the section
+        # render immediately after a fresh `refresh_pipeline.sh` run.
+        _pulse_pregen_fp = Path(_product_dir) / "predictions" / "release_pulse_scenarios.json"
+        if _pulse_pregen_fp.exists() and not st.session_state.get(_cache_key):
+            try:
+                _pregen = json.loads(_pulse_pregen_fp.read_text())
+                if str(_pregen.get("version", "")) == str(newest_version):
+                    _pregen_scenarios = _pregen.get("scenarios", {}) or {}
+                    if _pregen_scenarios:
+                        st.session_state[_cache_key] = _pregen_scenarios
+            except Exception:
+                pass
+
     _ollama_up = _ollama_reachable()
 
-    if _ollama_up:
-        if not st.session_state.get(_cache_key):
-            _top_mods = _pulse_grp.head(10)
-            _ai_sc: dict[str, list[dict]] = {}
-            _prog = st.progress(0, text="Generating scenarios…")
-            for _i, (_idx, _mr) in enumerate((_top_mods.iterrows()), 1):
-                _mod = _mr["parsed_module"]
-                _hist_txts = [str(s.get("scenario_text", ""))
-                              for s in _hist_sc.get(_mod, [])]
-                _ai_sc[_mod] = _call_ollama_pulse_scenarios(
-                    module=_mod,
-                    quadrant=str(_mr["quadrant"]),
-                    risk_level=str(_mr["risk_level"]),
-                    risk_score=float(_mr["risk_score"]),
-                    leading_signal=_pred_leading_map.get(_mod, ""),
-                    inflight_descs=list(_mr["sample_descs"]),
-                    hist_scenarios=_hist_txts,
-                    version=newest_version,
-                )
-                _prog.progress(_i / len(_top_mods),
-                               text=f"Processing {_mod} ({_i}/{len(_top_mods)})…")
-            _prog.empty()
-            st.session_state[_cache_key] = _ai_sc
+    # Generate live only when we have no cache AND Ollama is reachable AND
+    # we are not viewing a historical snapshot (regenerating in snapshot mode
+    # would defeat the point of time-travel).
+    if not _in_snapshot_mode and not st.session_state.get(_cache_key) and _ollama_up:
+        _top_mods = _pulse_grp.head(10)
+        _ai_sc: dict[str, list[dict]] = {}
+        _prog = st.progress(0, text="Generating scenarios…")
+        for _i, (_idx, _mr) in enumerate((_top_mods.iterrows()), 1):
+            _mod = _mr["parsed_module"]
+            _hist_txts = [str(s.get("scenario_text", ""))
+                          for s in _hist_sc.get(_mod, [])]
+            _ai_sc[_mod] = _call_ollama_pulse_scenarios(
+                module=_mod,
+                quadrant=str(_mr["quadrant"]),
+                risk_level=str(_mr["risk_level"]),
+                risk_score=float(_mr["risk_score"]),
+                leading_signal=_pred_leading_map.get(_mod, ""),
+                inflight_descs=list(_mr["sample_descs"]),
+                hist_scenarios=_hist_txts,
+                version=newest_version,
+            )
+            _prog.progress(_i / len(_top_mods),
+                           text=f"Processing {_mod} ({_i}/{len(_top_mods)})…")
+        _prog.empty()
+        st.session_state[_cache_key] = _ai_sc
 
-        _ai_cached = st.session_state.get(_cache_key, {})
-        if _ai_cached:
+    _ai_cached = st.session_state.get(_cache_key, {})
+
+    if _ai_cached:
+        if _in_snapshot_mode:
+            st.caption(
+                "AI scenarios loaded from the snapshot — pick today's date in the filter "
+                "above to switch back to the live cache."
+            )
+        else:
             st.caption("AI scenarios cached for this version — click **Clear cache** to regenerate.")
             if st.button("🗑️ Clear cache", key="pulse_clear_cache"):
                 st.session_state.pop(_cache_key, None)
                 st.rerun()
-            st.markdown("---")
-            # Display per-module cards (matching Tab 9 expanded card style)
-            for _rl in ["Critical", "High", "Medium", "Low"]:
-                _rl_mods = _pulse_grp[_pulse_grp["risk_level"] == _rl]
-                for _, _mr in _rl_mods.iterrows():
-                    _mod = _mr["parsed_module"]
-                    if _mod not in _ai_cached:
-                        continue
-                    _rl_icon   = _P_RISK_ICONS.get(_rl, "⚪")
-                    _scenarios = _ai_cached[_mod]
-                    _trc       = int(_mr["trc_count"])
-                    _rdr       = int(_mr["rdr_count"])
-                    _leading   = _pred_leading_map.get(_mod, "")
-                    with st.expander(
-                        f"{_rl_icon} **{_mod}** — {_rl} risk · "
-                        f"TRCreated: {_trc} · RDResolved: {_rdr} · "
-                        f"{len(_scenarios)} scenario(s)",
-                        expanded=_rl in ("Critical", "High"),
-                    ):
-                        _c1, _c2, _c3 = st.columns(3)
-                        _c1.metric("FMEA Quadrant",  str(_mr["quadrant"]))
-                        _c2.metric("Risk Score",     f"{_mr['risk_score']:.3f}")
-                        _c3.metric("In-flight bugs", _trc + _rdr)
-                        if _leading:
-                            st.caption(f"**Strongest signal:** {_leading}")
+        st.markdown("---")
+        # Display per-module cards (matching Tab 9 expanded card style)
+        for _rl in ["Critical", "High", "Medium", "Low"]:
+            _rl_mods = _pulse_grp[_pulse_grp["risk_level"] == _rl]
+            for _, _mr in _rl_mods.iterrows():
+                _mod = _mr["parsed_module"]
+                if _mod not in _ai_cached:
+                    continue
+                _rl_icon   = _P_RISK_ICONS.get(_rl, "⚪")
+                _scenarios = _ai_cached[_mod]
+                _trc       = int(_mr["trc_count"])
+                _rdr       = int(_mr["rdr_count"])
+                _leading   = _pred_leading_map.get(_mod, "")
+                with st.expander(
+                    f"{_rl_icon} **{_mod}** — {_rl} risk · "
+                    f"TRCreated: {_trc} · RDResolved: {_rdr} · "
+                    f"{len(_scenarios)} scenario(s)",
+                    expanded=_rl in ("Critical", "High"),
+                ):
+                    _c1, _c2, _c3 = st.columns(3)
+                    _c1.metric("FMEA Quadrant",  str(_mr["quadrant"]))
+                    _c2.metric("Risk Score",     f"{_mr['risk_score']:.3f}")
+                    _c3.metric("In-flight bugs", _trc + _rdr)
+                    if _leading:
+                        st.caption(f"**Strongest signal:** {_leading}")
 
-                        if _scenarios:
-                            st.markdown("**Predicted scenarios:**")
-                            for _sc_i, _sc in enumerate(_scenarios, 1):
-                                _conf_badge = _P_CONF_BADGES.get(
-                                    str(_sc.get("confidence", "medium")), "⬇️ Low conf."
-                                )
-                                _based_on   = str(_sc.get("based_on", ""))
-                                _src_badge  = {
-                                    "in_flight":  "🔄 In-flight",
-                                    "historical": "📎 Historical",
-                                    "both":       "🔄📎 Combined",
-                                }.get(_based_on, "🔄 In-flight")
-                                _stext      = str(_sc.get("scenario", ""))
-                                _expl       = str(_sc.get("explanation", ""))
-                                st.markdown(
-                                    f"&nbsp;&nbsp;**#{_sc_i}** {_conf_badge} {_src_badge} — {_stext}",
-                                    unsafe_allow_html=True,
-                                )
-                                if _expl:
-                                    with st.expander("❓ Why this scenario?", expanded=False):
-                                        st.markdown(_expl)
-                        else:
-                            st.caption("No structured scenarios returned for this module.")
+                    if _scenarios:
+                        st.markdown("**Predicted scenarios:**")
+                        for _sc_i, _sc in enumerate(_scenarios, 1):
+                            _conf_badge = _P_CONF_BADGES.get(
+                                str(_sc.get("confidence", "medium")), "⬇️ Low conf."
+                            )
+                            _based_on   = str(_sc.get("based_on", ""))
+                            _src_badge  = {
+                                "in_flight":  "🔄 In-flight",
+                                "historical": "📎 Historical",
+                                "both":       "🔄📎 Combined",
+                            }.get(_based_on, "🔄 In-flight")
+                            _stext      = str(_sc.get("scenario", ""))
+                            _expl       = str(_sc.get("explanation", ""))
+                            st.markdown(
+                                f"&nbsp;&nbsp;**#{_sc_i}** {_conf_badge} {_src_badge} — {_stext}",
+                                unsafe_allow_html=True,
+                            )
+                            if _expl:
+                                with st.expander("❓ Why this scenario?", expanded=False):
+                                    st.markdown(_expl)
+                    else:
+                        st.caption("No structured scenarios returned for this module.")
 
-                        # Show historical ML scenarios alongside for comparison
-                        _hs_list = _hist_sc.get(_mod, [])
-                        if _hs_list:
-                            st.markdown("**Historical risk patterns (from Defect Forecast ML):**")
-                            for _hs in _hs_list[:3]:
-                                _hc = _P_CONF_BADGES.get(
-                                    str(_hs.get("confidence", "medium")), "⬇️ Low conf."
-                                )
-                                st.markdown(
-                                    f"&nbsp;&nbsp;{_hc} 📎 — {_hs.get('scenario_text', '')}",
-                                    unsafe_allow_html=True,
-                                )
+                    # Show historical ML scenarios alongside for comparison
+                    _hs_list = _hist_sc.get(_mod, [])
+                    if _hs_list:
+                        st.markdown("**Historical risk patterns (from Defect Forecast ML):**")
+                        for _hs in _hs_list[:3]:
+                            _hc = _P_CONF_BADGES.get(
+                                str(_hs.get("confidence", "medium")), "⬇️ Low conf."
+                            )
+                            st.markdown(
+                                f"&nbsp;&nbsp;{_hc} 📎 — {_hs.get('scenario_text', '')}",
+                                unsafe_allow_html=True,
+                            )
+                            _hs_codes = str(_hs.get("source_bug_codes", "")).strip()
+                            if _hs_codes and _hs_codes not in ("nan", ""):
+                                _bc_links = [
+                                    f"[{_bc.strip()}]({ECL_BUG_URL.format(bug_code=_bc.strip())})"
+                                    for _bc in _hs_codes.split(" | ") if _bc.strip()
+                                ]
+                                if _bc_links:
+                                    st.markdown(
+                                        "&nbsp;&nbsp;&nbsp;&nbsp;"
+                                        f"_Source bugs:_ {' · '.join(_bc_links)}",
+                                        unsafe_allow_html=True,
+                                    )
     else:
         # ── Heuristic fallback ─────────────────────────────────────────────
-        st.caption(
-            "Ollama is not reachable — showing heuristic summary. "
-            "Start Ollama (`ollama serve`) and refresh to enable AI scenario generation."
-        )
+        if _ollama_up:
+            st.caption(
+                "No AI scenarios cached yet — re-run `./refresh_pipeline.sh` "
+                "to populate the cache, or refresh this page to generate live."
+            )
+        else:
+            st.caption(
+                "Ollama is not reachable and no pre-generated cache was found. "
+                "Start Ollama (`ollama serve`) and refresh, or run "
+                "`./refresh_pipeline.sh` to pre-generate scenarios."
+            )
         for _, _mr in _pulse_grp.head(10).iterrows():
             _mod   = _mr["parsed_module"]
             _rl    = str(_mr["risk_level"])
@@ -4077,7 +4455,337 @@ Modules with TRCreated bugs are boosted one tier — active implementation incre
                     for _hs in _hs_list[:3]:
                         _hc = _P_CONF_BADGES.get(str(_hs.get("confidence", "medium")), "⬇️ Low conf.")
                         st.markdown(f"- {_hc} — {_hs.get('scenario_text', '')}")
+                        _hs_codes = str(_hs.get("source_bug_codes", "")).strip()
+                        if _hs_codes and _hs_codes not in ("nan", ""):
+                            _bc_links = [
+                                f"[{_bc.strip()}]({ECL_BUG_URL.format(bug_code=_bc.strip())})"
+                                for _bc in _hs_codes.split(" | ") if _bc.strip()
+                            ]
+                            if _bc_links:
+                                st.markdown(f"  _Source bugs:_ {' · '.join(_bc_links)}")
                 st.caption(
                     f"Risk: **{_rl}** ({_q}, score {_rs:.3f}) — "
                     f"{'prioritise every sprint' if _rl in ('Critical', 'High') else 'include in regression pass'}."
                 )
+
+    # ── Prediction effectiveness panel ─────────────────────────────────────
+    # Browses any saved snapshot in release_pulse_history/ and evaluates it
+    # against bugs whose Closed Date matches the snapshot date. A scenario
+    # "matches" a bug if the bug's BugCode appears in the scenario's source
+    # set OR if the scenario_text shares ≥ 3 meaningful tokens with the
+    # bug's Short Description.
+    st.markdown("---")
+    _hist_dir = Path(_product_dir) / "predictions" / "release_pulse_history"
+    _yesterday = _date.today() - _timedelta(days=1)
+
+    _available_dates: list = []
+    if _hist_dir.is_dir():
+        for _f in _hist_dir.glob("*.json"):
+            try:
+                _available_dates.append(_date.fromisoformat(_f.stem))
+            except ValueError:
+                continue
+        _available_dates.sort(reverse=True)
+
+    with st.expander("📊 Did predictions catch any bugs? (browse snapshots)", expanded=False):
+        if not _available_dates:
+            st.info(
+                f"No saved snapshots yet — effectiveness becomes available after the next "
+                f"pipeline run. Snapshots will be written to `{_hist_dir}`."
+            )
+        else:
+            _sel_date = st.selectbox(
+                "Evaluate snapshot from:",
+                options=_available_dates,
+                index=0,
+                format_func=lambda d: (
+                    d.isoformat() + (" (yesterday)" if d == _yesterday else "")
+                ),
+                key="pulse_snapshot_date",
+                help=f"{len(_available_dates)} snapshot(s) available in release_pulse_history/.",
+            )
+            _hist_fp = _hist_dir / f"{_sel_date.isoformat()}.json"
+
+            st.caption(
+                f"Evaluates the snapshot from **{_sel_date.isoformat()}** against bugs whose "
+                f"`Closed Date` is **{_sel_date.isoformat()}**. A scenario is marked ✅ matched when "
+                "a closed bug's BugCode appears in the historical source set, OR when the scenario "
+                "text shares **5+** meaningful tokens with the bug's Short Description **and** the "
+                "bug's `parsed_module` matches the scenario's module. Bugs whose BugCode was already "
+                "in the snapshot's input window (closed-on cohort or in-flight) are excluded so the "
+                "snapshot can't be graded on bugs it was shown."
+            )
+
+            try:
+                _yday_snapshot = json.loads(_hist_fp.read_text())
+            except Exception as _e:
+                st.warning(f"Could not read snapshot {_hist_fp.name}: {_e}")
+                _yday_snapshot = None
+
+            # Bugs closed on the evaluation date (independent of cohort filter above).
+            if "Closed Date" in df_raw_pulse.columns:
+                _closed_yday_df = df_raw_pulse[
+                    df_raw_pulse["Closed Date"].dt.date == _sel_date
+                ].copy()
+            else:
+                _closed_yday_df = df_raw_pulse.iloc[0:0].copy()
+
+            if _yday_snapshot is None:
+                pass
+            elif not _yday_snapshot.get("scenarios"):
+                st.info(f"Snapshot for {_sel_date.isoformat()} contains no predicted scenarios.")
+            else:
+                if _closed_yday_df.empty:
+                    st.info(
+                        f"No bugs closed on {_sel_date.isoformat()} — showing snapshot scenarios "
+                        "with 0 matches."
+                    )
+                _STOPWORDS = {
+                    "the","a","an","and","or","of","to","in","on","at","is","it","for",
+                    "with","by","be","not","this","that","when","while","from","as","but",
+                    "if","then","else","do","does","did","has","have","had","can","will",
+                    "would","should","could","may","might","must","shall","i","you","we",
+                    "they","he","she","its","their","our","my","your","cannot","cant",
+                    "wont","arent","isnt","wasnt","werent",
+                }
+                def _tokens(s: str) -> set[str]:
+                    return {
+                        t for t in _re.findall(r"[a-z0-9]+", s.lower())
+                        if len(t) >= 3 and t not in _STOPWORDS
+                    }
+
+                # BugCodes the snapshot already saw — excluded from evaluation so
+                # a bug can't both inform a scenario and be counted as a match.
+                # Falls back to closed_bugcodes only on snapshots written before
+                # inflight_bugcodes_by_module was added.
+                _seen_bcs: set[str] = {
+                    str(b).strip() for b in (_yday_snapshot.get("closed_bugcodes") or [])
+                    if str(b).strip()
+                }
+                _inflight_by_mod_snap: dict = (
+                    _yday_snapshot.get("inflight_bugcodes_by_module") or {}
+                )
+                for _bcs in _inflight_by_mod_snap.values():
+                    for _b in (_bcs or []):
+                        _b = str(_b).strip()
+                        if _b:
+                            _seen_bcs.add(_b)
+
+                # Closed bug rows — ensure BugCode/Short Description columns exist.
+                _bc_col_eval = next(
+                    (c for c in _closed_yday_df.columns if "bugcode" in c.lower()), None
+                )
+                _desc_col_eval = (
+                    "Short Description" if "Short Description" in _closed_yday_df.columns
+                    else "parsed_description"
+                )
+                _has_module_col = "parsed_module" in _closed_yday_df.columns
+                _closed_records = []
+                _excluded_seen = 0
+                for _, _r in _closed_yday_df.iterrows():
+                    _bc_val = str(_r.get(_bc_col_eval, "")).strip() if _bc_col_eval else ""
+                    _desc_val = str(_r.get(_desc_col_eval, "")).strip()
+                    if _bc_val and _bc_val in _seen_bcs:
+                        _excluded_seen += 1
+                        continue
+                    _mod_val = str(_r.get("parsed_module", "")).strip() if _has_module_col else ""
+                    if _bc_val or _desc_val:
+                        _closed_records.append({
+                            "bugcode": _bc_val,
+                            "desc":    _desc_val,
+                            "tokens":  _tokens(_desc_val),
+                            "module":  _mod_val,
+                        })
+
+                _scenarios_by_mod = _yday_snapshot.get("scenarios", {}) or {}
+                _src_codes_by_mod = _yday_snapshot.get("source_bug_codes_by_module", {}) or {}
+
+                _total_predicted = 0
+                _total_matched   = 0
+                _matched_rows: list[dict] = []
+                _miss_rows:    list[dict] = []
+                _KEYWORD_MIN = 5
+
+                for _mod, _scn_list in _scenarios_by_mod.items():
+                    _src_codes = set(_src_codes_by_mod.get(_mod, []))
+                    for _scn in (_scn_list or []):
+                        _scn_text = str(_scn.get("scenario", "")).strip()
+                        if not _scn_text:
+                            continue
+                        _total_predicted += 1
+                        _scn_tokens = _tokens(_scn_text)
+                        _hits = []
+                        for _cr in _closed_records:
+                            _direct = bool(_cr["bugcode"]) and _cr["bugcode"] in _src_codes
+                            _same_module = bool(_cr["module"]) and _cr["module"] == _mod
+                            _overlap = len(_scn_tokens & _cr["tokens"])
+                            _keyword_hit = _same_module and _overlap >= _KEYWORD_MIN
+                            if _direct or _keyword_hit:
+                                _hits.append({
+                                    **_cr,
+                                    "method": "BugCode" if _direct else f"keyword ×{_overlap} (same module)",
+                                })
+                        row = {
+                            "module":    _mod,
+                            "scenario":  _scn_text,
+                            "confidence": str(_scn.get("confidence", "")),
+                            "based_on":  str(_scn.get("based_on", "")).strip().lower(),
+                            "hits":      _hits,
+                        }
+                        if _hits:
+                            _total_matched += 1
+                            _matched_rows.append(row)
+                        else:
+                            _miss_rows.append(row)
+
+                _excl_note = (
+                    f" · excluded {_excluded_seen} bug(s) the snapshot already saw"
+                    if _excluded_seen else ""
+                )
+                st.markdown(
+                    f"**{_sel_date.isoformat()}: {_total_matched} / {_total_predicted} predicted "
+                    f"scenarios matched a closed bug · {len(_closed_records)} bugs closed that day"
+                    f"{_excl_note}.**"
+                )
+
+                # ── Per-scenario manual annotations ────────────────────────
+                # Two flags per scenario, persisted to <date>.annotations.json
+                # alongside the snapshot. The snapshot file itself stays
+                # immutable so scenarios can't drift between annotation runs.
+                import hashlib as _hashlib
+                from datetime import datetime as _datetime
+                _anno_fp = _hist_dir / f"{_sel_date.isoformat()}.annotations.json"
+
+                def _scn_key(module: str, scenario_text: str) -> str:
+                    _h = _hashlib.sha1(
+                        scenario_text.encode("utf-8", errors="replace")
+                    ).hexdigest()[:10]
+                    return f"{module}::{_h}"
+
+                def _load_annotations() -> dict:
+                    if not _anno_fp.exists():
+                        return {}
+                    try:
+                        return dict(json.loads(_anno_fp.read_text()).get("annotations", {}))
+                    except Exception:
+                        return {}
+
+                def _save_annotations(annos: dict) -> None:
+                    _anno_fp.parent.mkdir(parents=True, exist_ok=True)
+                    _anno_fp.write_text(json.dumps({
+                        "last_updated": _datetime.now().isoformat(timespec="seconds"),
+                        "snapshot_date": _sel_date.isoformat(),
+                        "annotations": annos,
+                    }, indent=2))
+
+                _annotations = _load_annotations()
+
+                def _on_anno_toggle(sk, module, scenario, field):
+                    widget_key = (
+                        f"pulse_anno_{_sel_date.isoformat()}_{sk}_{field}"
+                    )
+                    val = bool(st.session_state.get(widget_key, False))
+                    cur = _annotations.setdefault(sk, {})
+                    cur["module"] = module
+                    cur["scenario"] = scenario
+                    cur[field] = val
+                    cur["updated_at"] = _datetime.now().isoformat(timespec="seconds")
+                    _save_annotations(_annotations)
+
+                # Scenarios derived from in-flight bugs (or "both") describe
+                # already-known active problems — annotation adds no signal.
+                _ANNO_SKIP_SOURCES = {"in_flight", "both"}
+
+                def _render_anno_controls(module: str, scenario: str, based_on: str = "") -> None:
+                    if based_on in _ANNO_SKIP_SOURCES:
+                        st.caption(
+                            "&nbsp;&nbsp;&nbsp;&nbsp;_🔄 In-flight scenario — already a "
+                            "known problem; no annotation needed._",
+                            unsafe_allow_html=True,
+                        )
+                        return
+                    sk = _scn_key(module, scenario)
+                    cur = _annotations.get(sk, {})
+                    _ac1, _ac2 = st.columns(2)
+                    _ac1.toggle(
+                        "✋ Findable manually",
+                        value=bool(cur.get("findable_manually", False)),
+                        key=f"pulse_anno_{_sel_date.isoformat()}_{sk}_findable_manually",
+                        on_change=_on_anno_toggle,
+                        args=(sk, module, scenario, "findable_manually"),
+                        help="Tick if the feature/scenario can be exercised through the live app UI.",
+                    )
+                    _ac2.toggle(
+                        "🐛 Actual problem",
+                        value=bool(cur.get("has_actual_problems", False)),
+                        key=f"pulse_anno_{_sel_date.isoformat()}_{sk}_has_actual_problems",
+                        on_change=_on_anno_toggle,
+                        args=(sk, module, scenario, "has_actual_problems"),
+                        help="Tick if manual testing actually surfaced a bug.",
+                    )
+
+                _n_annotatable = sum(
+                    1 for r in (_matched_rows + _miss_rows)
+                    if r["based_on"] not in _ANNO_SKIP_SOURCES
+                )
+                _n_anno     = len(_annotations)
+                _n_findable = sum(1 for a in _annotations.values() if a.get("findable_manually"))
+                _n_problem  = sum(1 for a in _annotations.values() if a.get("has_actual_problems"))
+                st.caption(
+                    f"📝 Annotated: **{_n_anno} / {_n_annotatable}** annotatable · "
+                    f"✋ Findable: **{_n_findable}** · 🐛 Actual problems: **{_n_problem}** · "
+                    f"_in-flight scenarios skipped (always real); saved to `{_anno_fp.name}`_"
+                )
+
+                if _matched_rows:
+                    st.markdown(f"#### ✅ Matched ({len(_matched_rows)})")
+                    for _row in _matched_rows:
+                        st.markdown(f"**{_row['module']}** — {_row['scenario']}")
+                        for _h in _row["hits"]:
+                            _bc = _h["bugcode"]
+                            _desc = _bc_to_desc_pulse.get(_bc, _h["desc"]) if _bc else _h["desc"]
+                            if _bc:
+                                _url = ECL_BUG_URL.format(bug_code=_bc)
+                                st.markdown(
+                                    f"&nbsp;&nbsp;&nbsp;&nbsp;✅ [{_bc}]({_url}) — {_desc} "
+                                    f"_(matched by {_h['method']})_",
+                                    unsafe_allow_html=True,
+                                )
+                            else:
+                                st.markdown(
+                                    f"&nbsp;&nbsp;&nbsp;&nbsp;✅ {_desc} _(matched by {_h['method']})_",
+                                    unsafe_allow_html=True,
+                                )
+                        _render_anno_controls(_row["module"], _row["scenario"], _row.get("based_on", ""))
+
+                if _miss_rows:
+                    # Bucket by Ollama's `based_on` field so the user can see
+                    # whether unmatched scenarios came from in-flight bugs vs
+                    # historical risk patterns vs both.
+                    _BUCKETS = [
+                        ("in_flight",  "🔄 In-flight"),
+                        ("both",       "🔀 Both (in-flight + historical)"),
+                        ("historical", "📎 Historical pattern"),
+                    ]
+                    _known = {k for k, _ in _BUCKETS}
+                    _grouped: dict[str, list[dict]] = {k: [] for k, _ in _BUCKETS}
+                    _grouped["other"] = []
+                    for _row in _miss_rows:
+                        _key = _row["based_on"] if _row["based_on"] in _known else "other"
+                        _grouped[_key].append(_row)
+
+                    with st.expander(f"❌ Not matched ({len(_miss_rows)})", expanded=False):
+                        for _k, _label in _BUCKETS:
+                            _bucket = _grouped[_k]
+                            if not _bucket:
+                                continue
+                            st.markdown(f"##### {_label} ({len(_bucket)})")
+                            for _row in _bucket:
+                                st.markdown(f"- **{_row['module']}** — {_row['scenario']}")
+                                _render_anno_controls(_row["module"], _row["scenario"], _row.get("based_on", ""))
+                        if _grouped["other"]:
+                            st.markdown(f"##### 🧪 Other / unspecified ({len(_grouped['other'])})")
+                            for _row in _grouped["other"]:
+                                _src = _row["based_on"] or "—"
+                                st.markdown(f"- **{_row['module']}** — {_row['scenario']}  _(based_on: {_src})_")
+                                _render_anno_controls(_row["module"], _row["scenario"], _row.get("based_on", ""))

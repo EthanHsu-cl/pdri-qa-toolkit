@@ -22,6 +22,7 @@
 #   ./refresh_pipeline.sh --skip-ollama                  # use heuristic scorer
 #   ./refresh_pipeline.sh --skip-cluster                 # skip clustering
 #   ./refresh_pipeline.sh --skip-predict                 # skip predictions
+#   ./refresh_pipeline.sh --skip-pulse-scenarios         # skip Release Pulse AI synthesis
 #   ./refresh_pipeline.sh --force-relabel                # re-run cluster labels only (no re-embedding)
 #   ./refresh_pipeline.sh --ollama-model gemma4:e2b-it-q4_K_M     # AI risk scorer model
 #   ./refresh_pipeline.sh --embed-model nomic-embed-text           # default embed model
@@ -62,6 +63,7 @@ SKIP_OLLAMA_MATCHER=false
 SKIP_EMBEDDING_MATCHER=false
 SKIP_CLUSTER=false
 SKIP_PREDICT=false
+SKIP_PULSE_SCENARIOS=false
 FORCE_RELABEL=false
 OVERRIDE_PRODUCTS=""
 OVERRIDE_DURATION=""
@@ -76,6 +78,7 @@ for arg in "$@"; do
     --skip-embedding-matcher)   SKIP_EMBEDDING_MATCHER=true ;;
     --skip-cluster)             SKIP_CLUSTER=true ;;
     --skip-predict)             SKIP_PREDICT=true ;;
+    --skip-pulse-scenarios)     SKIP_PULSE_SCENARIOS=true ;;
     --force-relabel)            FORCE_RELABEL=true ;;
     --weekday)                  FORCE_SCHEDULE=weekday ;;
     --weekend|--full)           FORCE_SCHEDULE=weekend ;;
@@ -463,6 +466,60 @@ run_product_pipeline() {
     log "[$SLUG] Stage 6 complete."
   fi
 
+  # ── Stage 7: Release Pulse AI Scenarios ────────────────────────────────
+  # Pre-generates the dashboard's "AI-Synthesized Test Scenarios" cache so
+  # the Release Pulse tab renders immediately on first load. Skipped when
+  # Ollama is disabled (the dashboard's heuristic fallback view does not
+  # consume this cache).
+  if $SKIP_OLLAMA || $SKIP_PULSE_SCENARIOS; then
+    log ""
+    log "── [$SLUG] Stage 7: Release Pulse Scenarios SKIPPED ────"
+  else
+    log ""
+    log "── [$SLUG] Stage 7: Release Pulse Scenarios ────────────"
+
+    PULSE_STAGING="$STAGING_PRODUCT/predictions"
+    PULSE_HISTORY_STAGING="$PULSE_STAGING/release_pulse_history"
+    PULSE_HISTORY_LIVE="$DATA_PRODUCT/predictions/release_pulse_history"
+    mkdir -p "$PULSE_STAGING" "$PULSE_HISTORY_STAGING"
+
+    run "python scripts/generate_release_pulse_scenarios.py \
+      '$DATA_PRODUCT' \
+      '$PULSE_STAGING/release_pulse_scenarios.json' \
+      --provider ollama \
+      --model '$OLLAMA_MODEL' \
+      --history-dir '$PULSE_HISTORY_STAGING'"
+
+    if [ -f "$PULSE_STAGING/release_pulse_scenarios.json" ]; then
+      promote "$PULSE_STAGING/release_pulse_scenarios.json" \
+        "$DATA_PRODUCT/predictions/release_pulse_scenarios.json"
+    fi
+
+    # Promote the dated history snapshot (today's run). Same-day reruns
+    # overwrite the live file via mv. The Python script always writes exactly
+    # one dated file per invocation.
+    if $DRY_RUN; then
+      log "  [DRY-RUN] promote dated snapshot from $PULSE_HISTORY_STAGING/ to $PULSE_HISTORY_LIVE/"
+    else
+      mkdir -p "$PULSE_HISTORY_LIVE"
+      for snap in "$PULSE_HISTORY_STAGING"/*.json; do
+        [ -f "$snap" ] || continue
+        promote "$snap" "$PULSE_HISTORY_LIVE/$(basename "$snap")"
+      done
+    fi
+
+    # Prune history files older than 90 days. Keeps the directory bounded
+    # while preserving enough history for trend inspection.
+    if $DRY_RUN; then
+      log "  [DRY-RUN] prune $PULSE_HISTORY_LIVE/*.json older than 90 days"
+    elif [ -d "$PULSE_HISTORY_LIVE" ]; then
+      find "$PULSE_HISTORY_LIVE" -maxdepth 1 -type f -name '*.json' -mtime +90 -delete \
+        2>/dev/null || true
+    fi
+
+    log "[$SLUG] Stage 7 complete."
+  fi
+
   log ""
   log "═══ [$SLUG] All stages complete ═════════════════════════"
 }
@@ -507,7 +564,7 @@ resolve_product_schedule() {
 
 log "======================================================"
 log "QA Daily Refresh  $(date '+%Y-%m-%d %H:%M:%S')"
-log "dry_run=$DRY_RUN  skip_ollama=$SKIP_OLLAMA  skip_ollama_matcher=$SKIP_OLLAMA_MATCHER  skip_cluster=$SKIP_CLUSTER  skip_predict=$SKIP_PREDICT  force_relabel=$FORCE_RELABEL  force_schedule=$FORCE_SCHEDULE  ollama_model=$OLLAMA_MODEL  ollama_matcher_model=${OLLAMA_MATCHER_MODEL:-<inherit>}  embed_model=$EMBED_MODEL  cluster_label_model=$CLUSTER_LABEL_MODEL"
+log "dry_run=$DRY_RUN  skip_ollama=$SKIP_OLLAMA  skip_ollama_matcher=$SKIP_OLLAMA_MATCHER  skip_cluster=$SKIP_CLUSTER  skip_predict=$SKIP_PREDICT  skip_pulse_scenarios=$SKIP_PULSE_SCENARIOS  force_relabel=$FORCE_RELABEL  force_schedule=$FORCE_SCHEDULE  ollama_model=$OLLAMA_MODEL  ollama_matcher_model=${OLLAMA_MATCHER_MODEL:-<inherit>}  embed_model=$EMBED_MODEL  cluster_label_model=$CLUSTER_LABEL_MODEL"
 log "======================================================"
 
 # 1. Make sure Streamlit is up before we do anything
