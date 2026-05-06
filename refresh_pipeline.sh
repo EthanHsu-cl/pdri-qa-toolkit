@@ -634,11 +634,18 @@ if [ -n "$STREAMLIT_PIDS" ]; then
       for _pid in $REMAINING; do
         kill -9 "$_pid" 2>/dev/null || true
       done
-      sleep 2
+      # Kill orphaned child processes by name (survive parent SIGKILL on macOS)
+      pkill -9 -f "streamlit run" 2>/dev/null || true
+      pkill -9 -f "bug_heatmap_dashboard" 2>/dev/null || true
+      # Poll up to 15s for OS to release the port — fixed sleep is unreliable
+      for _i in $(seq 1 15); do
+        sleep 1
+        lsof -ti tcp:"$STREAMLIT_PORT" >/dev/null 2>&1 || break
+      done
     fi
     # Final verification
     if lsof -ti tcp:"$STREAMLIT_PORT" >/dev/null 2>&1; then
-      log "  ERROR: port $STREAMLIT_PORT still in use — cannot restart Streamlit"
+      log "  ERROR: port $STREAMLIT_PORT still in use after SIGKILL — cannot restart Streamlit"
     else
       log "  Stopped Streamlit (PIDs: $(echo $STREAMLIT_PIDS | tr '\n' ' '))"
     fi
@@ -653,8 +660,10 @@ if [ -d "$SCRIPT_DIR/.streamlit/cache" ]; then
   log "  Cleared .streamlit/cache"
 fi
 
+STREAMLIT_OK=false
 if $DRY_RUN; then
   log "  [DRY-RUN] streamlit run scripts/bug_heatmap_dashboard.py"
+  STREAMLIT_OK=true
 else
   # Only start if the port is actually free
   if lsof -ti tcp:"$STREAMLIT_PORT" >/dev/null 2>&1; then
@@ -673,10 +682,11 @@ else
       sleep 1
       if lsof -ti tcp:"$STREAMLIT_PORT" >/dev/null 2>&1; then
         log "  Streamlit restarted (PID $NEW_PID) on :$STREAMLIT_PORT — ready after ${_i}s"
+        STREAMLIT_OK=true
         break
       fi
     done
-    if ! lsof -ti tcp:"$STREAMLIT_PORT" >/dev/null 2>&1; then
+    if ! $STREAMLIT_OK; then
       log "  WARNING: Streamlit process started but not yet listening on :$STREAMLIT_PORT after 15s"
       log "  Check $LOGS/streamlit.log for errors"
     fi
@@ -687,7 +697,12 @@ fi
 log ""
 log "======================================================"
 log "Refresh complete  $(date '+%Y-%m-%d %H:%M:%S')"
-log "Streamlit restarted fresh — no stale cache."
+# Re-verify actual port state — STREAMLIT_OK can be stale if kill/start raced
+if lsof -ti tcp:"$STREAMLIT_PORT" >/dev/null 2>&1; then
+  log "Streamlit running on :$STREAMLIT_PORT — fresh data loaded."
+else
+  log "WARNING: Streamlit is NOT running on :$STREAMLIT_PORT — dashboard unavailable."
+fi
 log "Log: $LOG_FILE"
 log "======================================================"
 

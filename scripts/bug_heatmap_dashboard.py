@@ -3854,22 +3854,20 @@ Modules with TRCreated bugs are boosted one tier — active implementation incre
         st.stop()
     newest_version = str(_ver_dates.idxmax())
 
-    # ── Close-date filter (default: yesterday) ─────────────────────────────
+    # ── Close-date filter (default: today) ─────────────────────────────────
     # Bugs that are created and immediately closed never appear in the
     # TRCreated/RDResolved-only view. Adding "Closed Date == <date>" as a
     # second inclusion branch surfaces those — usually the newest verified
-    # fixes. The pipeline runs at 3am, so "yesterday" captures the latest
-    # full day of in-build fix activity.
+    # fixes.
     from datetime import date as _date, timedelta as _timedelta
-    _default_closed_on = _date.today() - _timedelta(days=1)
+    _default_closed_on = _date.today()
     _has_closed_col = "Closed Date" in df_raw_pulse.columns
     if _has_closed_col:
         _closed_on = st.date_input(
             "Include bugs closed on:",
             value=_default_closed_on,
             help="Bugs with this Closed Date are added to the TRCreated/RDResolved cohort. "
-                 "Defaults to yesterday — the newest day of fully-closed fixes when the "
-                 "pipeline runs at 3am.",
+                 "Defaults to today.",
             key="pulse_closed_on",
         )
     else:
@@ -4051,9 +4049,14 @@ Modules with TRCreated bugs are boosted one tier — active implementation incre
         base = _pred_rl_map.get(mod, _score_to_risk(score))
         return _boost_risk(base, trc)
 
-    _pulse_grp["risk_level"] = _pulse_grp.apply(
-        lambda r: _module_risk(r["parsed_module"], r["risk_score"], int(r["trc_count"])), axis=1
-    )
+    # Guard against empty DataFrame: df.apply(axis=1) on empty df returns the
+    # empty DataFrame itself, which can't be assigned to a single column.
+    if _pulse_grp.empty:
+        _pulse_grp["risk_level"] = pd.Series(dtype=str)
+    else:
+        _pulse_grp["risk_level"] = _pulse_grp.apply(
+            lambda r: _module_risk(r["parsed_module"], r["risk_score"], int(r["trc_count"])), axis=1
+        )
     _pulse_grp = _pulse_grp.sort_values(
         ["risk_level", "risk_score", "total"],
         key=lambda c: c.map(_RISK_ORDER.index) if c.name == "risk_level" else c,
@@ -4364,7 +4367,7 @@ Modules with TRCreated bugs are boosted one tier — active implementation incre
                     f"{_rl_icon} **{_mod}** — {_rl} risk · "
                     f"TRCreated: {_trc} · RDResolved: {_rdr} · "
                     f"{len(_scenarios)} scenario(s)",
-                    expanded=_rl in ("Critical", "High"),
+                    expanded=False,
                 ):
                     _c1, _c2, _c3 = st.columns(3)
                     _c1.metric("FMEA Quadrant",  str(_mr["quadrant"]))
