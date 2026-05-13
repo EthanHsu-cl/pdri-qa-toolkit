@@ -4490,6 +4490,15 @@ Modules with TRCreated bugs are boosted one tier — active implementation incre
                 continue
         _available_dates.sort(reverse=True)
 
+    # Mirror the top "Include bugs closed on:" date into the snapshot selectbox
+    # whenever it changes, so the two controls stay in sync. Session state must
+    # be written before the selectbox is instantiated below.
+    if _closed_on is not None and _available_dates:
+        _prev_top_date = st.session_state.get("_pulse_prev_top_date")
+        if _prev_top_date != _closed_on and _closed_on in _available_dates:
+            st.session_state["pulse_snapshot_date"] = _closed_on
+        st.session_state["_pulse_prev_top_date"] = _closed_on
+
     with st.expander("📊 Did predictions catch any bugs? (browse snapshots)", expanded=False):
         if not _available_dates:
             st.info(
